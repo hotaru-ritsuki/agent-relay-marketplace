@@ -33,6 +33,13 @@ impact, or requires substantial verification.
 The task involves cross-cutting decisions, hard-to-reverse consequences,
 complex dependencies, or exceptional verification.
 
+### Exceptionally complex
+
+The task combines several architectural-class characteristics at once, such as
+a broad cross-cutting redesign together with hard-to-reverse consequences,
+deep ambiguity, and exceptional verification, or is otherwise among the most
+difficult work the repository could require.
+
 ## Uncertainty
 
 A boundary ambiguity means the available facts support two adjacent classes;

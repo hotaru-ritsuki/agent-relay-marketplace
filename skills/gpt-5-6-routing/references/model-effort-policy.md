@@ -1,7 +1,7 @@
 # Model and Effort Policy
 
 This is the authoritative policy for Fable-owned routing of fresh
-`/codex-relay:rescue` work. Apply it only in the main Claude/Fable context.
+`/cdx-relay:rescue` work. Apply it only in the main Claude/Fable context.
 Never apply it to a resume, including `--resume`, `--resume-last`, or
 `--resume-id`; preserve the thread's original model and effort defaults and
 forward only explicit user overrides.
@@ -19,10 +19,11 @@ forward only explicit user overrides.
 
 | Classification | Model | Effort |
 | --- | --- | --- |
-| Small and bounded | gpt-5.6-luna | low |
-| Normal and bounded | gpt-5.6-terra | medium |
-| Broad, ambiguous, or high-value | gpt-5.6-sol | high |
-| Architectural, high-risk, or unusually difficult | gpt-5.6-sol | xhigh |
+| Small and bounded | gpt-5.6-luna | medium |
+| Normal and bounded | gpt-5.6-terra | high |
+| Broad, ambiguous, or high-value | gpt-5.6-sol | medium |
+| Architectural, high-risk, or unusually difficult | gpt-5.6-sol | high |
+| Exceptionally complex | gpt-5.6-sol | xhigh |
 
 When the available facts place a task on a boundary between two adjacent
 classifications, select the higher tier.

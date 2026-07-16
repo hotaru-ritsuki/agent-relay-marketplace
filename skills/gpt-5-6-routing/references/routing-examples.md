@@ -9,7 +9,7 @@ unchanged.
 Task: Correct a known typo in one configuration file and run its focused test.
 
 - Classification: small and bounded.
-- Missing values filled: model `gpt-5.6-luna`; effort `low`.
+- Missing values filled: model `gpt-5.6-luna`; effort `medium`.
 - Values left unset: none.
 
 ## 2. Normal
@@ -18,7 +18,7 @@ Task: Diagnose and fix a bounded validation bug across three known files, then
 run the standard test suite.
 
 - Classification: normal and bounded.
-- Missing values filled: model `gpt-5.6-terra`; effort `medium`.
+- Missing values filled: model `gpt-5.6-terra`; effort `high`.
 - Values left unset: none.
 
 ## 3. Broad
@@ -27,7 +27,7 @@ Task: Trace a state-management issue across the API, UI, and persistence layer
 with meaningful repository exploration and substantial regression testing.
 
 - Classification: broad, ambiguous, or high-value.
-- Missing values filled: model `gpt-5.6-sol`; effort `high`.
+- Missing values filled: model `gpt-5.6-sol`; effort `medium`.
 - Values left unset: none.
 
 ## 4. Architectural
@@ -36,19 +36,29 @@ Task: Choose and implement a cross-cutting authentication architecture with
 hard-to-reverse compatibility and migration consequences.
 
 - Classification: architectural, high-risk, or unusually difficult.
+- Missing values filled: model `gpt-5.6-sol`; effort `high`.
+- Values left unset: none.
+
+## 5. Exceptionally complex
+
+Task: Redesign the persistence and synchronization architecture across every
+service at once, with deep ambiguity, hard-to-reverse migration consequences,
+and exceptional verification demands.
+
+- Classification: exceptionally complex.
 - Missing values filled: model `gpt-5.6-sol`; effort `xhigh`.
 - Values left unset: none.
 
-## 5. Model-only partial override
+## 6. Model-only partial override
 
 Task: The normal bounded validation task above, with model `custom-model`
 explicitly supplied by the user.
 
 - Classification: normal and bounded, for the missing effort only.
-- Missing values filled: effort `medium`.
+- Missing values filled: effort `high`.
 - Values left unset: none; model `custom-model` is preserved, not filled.
 
-## 6. Effort-only partial override
+## 7. Effort-only partial override
 
 Task: The broad cross-component task above, with effort `low` explicitly
 supplied by the user.
@@ -57,7 +67,7 @@ supplied by the user.
 - Missing values filled: model `gpt-5.6-sol`.
 - Values left unset: none; effort `low` is preserved, not filled.
 
-## 7. Resume
+## 8. Resume
 
 Task: Continue an existing thread with no new model or effort flags.
 
@@ -66,17 +76,17 @@ Task: Continue an existing thread with no new model or effort flags.
 - Values left unset: model and effort, preserving the thread's original
   defaults. Any explicit resume override would be forwarded unchanged.
 
-## 8. Ambiguous boundary
+## 9. Ambiguous boundary
 
 Task: A fresh change spans several coordinated files and may require either
 standard or substantial verification; the facts support the normal and broad
 classes equally.
 
 - Classification: broad, ambiguous, or high-value, the higher adjacent class.
-- Missing values filled: model `gpt-5.6-sol`; effort `high`.
+- Missing values filled: model `gpt-5.6-sol`; effort `medium`.
 - Values left unset: none.
 
-## 9. Insufficient context
+## 10. Insufficient context
 
 Task: "Fix it," with no repository, symptom, scope, or expected outcome.
 

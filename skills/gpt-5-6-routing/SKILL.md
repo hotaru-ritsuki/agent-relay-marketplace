@@ -7,7 +7,7 @@ user-invocable: false
 # GPT-5.6 Routing
 
 Apply this procedure only in the main Claude/Fable context for fresh
-`/codex-relay:rescue` work. Never route resumed work.
+`/cdx-relay:rescue` work. Never route resumed work.
 
 1. Read `references/complexity-rubric.md` and
    `references/model-effort-policy.md` before routing.
