@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { listFiles } from "./lib/fs-walk.mjs";
 import { isDirectInvocation } from "./sync-contracts.mjs";
 
-const IMPORT = /\bimport\s*(?:\(\s*["']([^"']+)["']\s*\)|(?:[^"'();]*?\s+from\s+)?["']([^"']+)["'])/g;
+const MODULE_REFERENCE = /\b(?:import\s*(?:\(\s*["']([^"']+)["']\s*\)|(?:[^"'();]*?\s+from\s+)?["']([^"']+)["'])|export\s+(?:\*|\{[^}]*\})\s+from\s+["']([^"']+)["']|require\s*\(\s*["']([^"']+)["']\s*\))/g;
 
 export function checkPluginIsolation(pluginDir) {
   const root = path.resolve(pluginDir);
@@ -17,8 +17,8 @@ export function checkPluginIsolation(pluginDir) {
       && !relative.startsWith("tooling/");
   })) {
     const source = fs.readFileSync(file, "utf8");
-    for (const match of source.matchAll(IMPORT)) {
-      const specifier = match[1] ?? match[2];
+    for (const match of source.matchAll(MODULE_REFERENCE)) {
+      const specifier = match.slice(1).find(Boolean);
       if (!specifier.startsWith(".")) continue;
 
       const resolved = path.resolve(path.dirname(file), specifier);
@@ -34,11 +34,12 @@ export function checkPluginIsolation(pluginDir) {
   return violations;
 }
 
-if (isDirectInvocation()) {
+if (isDirectInvocation({ moduleUrl: import.meta.url })) {
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-  const violations = ["cdx-relay", "cursor-relay"].flatMap((name) =>
-    checkPluginIsolation(path.join(root, "plugins", name))
-  );
+  const pluginDirs = process.argv.length > 2
+    ? process.argv.slice(2)
+    : ["cdx-relay", "cursor-relay"].map((name) => path.join(root, "plugins", name));
+  const violations = pluginDirs.flatMap(checkPluginIsolation);
 
   if (violations.length) {
     for (const violation of violations) {

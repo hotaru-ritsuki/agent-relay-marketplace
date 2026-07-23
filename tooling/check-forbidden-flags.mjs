@@ -11,6 +11,7 @@ const FORBIDDEN = [
   "--approve-mcps",
   "--dangerously-bypass-approvals-and-sandbox",
 ];
+const DISABLED_SANDBOX = /--sandbox\s*=\s*disabled|["'`]--sandbox["'`]\s*,\s*["'`]disabled["'`]/;
 
 export function checkForbiddenFlags(pluginDir) {
   const root = path.resolve(pluginDir);
@@ -24,9 +25,8 @@ export function checkForbiddenFlags(pluginDir) {
       && !["CHANGELOG.md", "NOTICE", "PROVENANCE.md"].includes(relative);
   })) {
     const source = fs.readFileSync(file, "utf8");
-    const found = FORBIDDEN.filter((flag) =>
-      source.includes(`"${flag}"`) || source.includes(`'${flag}'`)
-    );
+    const found = FORBIDDEN.filter((flag) => source.includes(flag));
+    if (DISABLED_SANDBOX.test(source)) found.push("--sandbox=disabled");
 
     if (found.length) {
       violations.push({
@@ -39,11 +39,12 @@ export function checkForbiddenFlags(pluginDir) {
   return violations;
 }
 
-if (isDirectInvocation()) {
+if (isDirectInvocation({ moduleUrl: import.meta.url })) {
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-  const violations = ["cdx-relay", "cursor-relay"].flatMap((name) =>
-    checkForbiddenFlags(path.join(root, "plugins", name))
-  );
+  const pluginDirs = process.argv.length > 2
+    ? process.argv.slice(2)
+    : ["cdx-relay", "cursor-relay"].map((name) => path.join(root, "plugins", name));
+  const violations = pluginDirs.flatMap(checkForbiddenFlags);
 
   if (violations.length) {
     for (const violation of violations) {
