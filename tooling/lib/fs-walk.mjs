@@ -8,5 +8,5 @@ export function listFiles(rootDir) {
     if (entry.isDirectory()) files.push(...listFiles(absolute));
     else if (entry.isFile()) files.push(absolute);
   }
-  return files.sort((left, right) => left.localeCompare(right));
+  return files.sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
 }

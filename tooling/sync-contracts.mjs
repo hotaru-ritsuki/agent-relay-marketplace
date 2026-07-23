@@ -3,6 +3,28 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { listFiles } from "./lib/fs-walk.mjs";
 
+function canonicalPath(filePath) {
+  const resolved = path.resolve(filePath);
+  try {
+    return fs.realpathSync.native(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+export function isDirectInvocation({
+  argvPath = process.argv[1],
+  moduleUrl = import.meta.url,
+  platform = process.platform
+} = {}) {
+  if (!argvPath) return false;
+  const invokedPath = canonicalPath(argvPath);
+  const modulePath = canonicalPath(fileURLToPath(moduleUrl));
+  return platform === "win32"
+    ? invokedPath.toLowerCase() === modulePath.toLowerCase()
+    : invokedPath === modulePath;
+}
+
 export function syncContracts({ rootDir, pluginDirs }) {
   const schemaRoot = path.join(rootDir, "contracts", "schemas");
   const typeFile = path.join(rootDir, "contracts", "types", "relay.d.ts");
@@ -18,7 +40,7 @@ export function syncContracts({ rootDir, pluginDirs }) {
   }
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+if (isDirectInvocation()) {
   const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   syncContracts({
     rootDir,
