@@ -58,6 +58,7 @@ const MODULE_REFERENCE_FORMS = [
   ["dynamic import", (specifier) => `await import("${specifier}");`, "runtime.cjs"],
   ["named re-export", (specifier) => `export { value } from "${specifier}";`, "runtime.mjs"],
   ["star re-export", (specifier) => `export * from "${specifier}";`, "runtime.js"],
+  ["namespace re-export", (specifier) => `export * as relay from "${specifier}";`, "runtime.mjs"],
   ["CommonJS require", (specifier) => `require("${specifier}");`, "runtime.cjs"],
 ];
 const APPROVED_UNSAFE_FLAGS = [

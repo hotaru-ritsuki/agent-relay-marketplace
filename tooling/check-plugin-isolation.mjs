@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { listFiles } from "./lib/fs-walk.mjs";
 import { isDirectInvocation } from "./sync-contracts.mjs";
 
-const MODULE_REFERENCE = /\b(?:import\s*(?:\(\s*["']([^"']+)["']\s*\)|(?:[^"'();]*?\s+from\s+)?["']([^"']+)["'])|export\s+(?:\*|\{[^}]*\})\s+from\s+["']([^"']+)["']|require\s*\(\s*["']([^"']+)["']\s*\))/g;
+const MODULE_REFERENCE = /\b(?:import\s*(?:\(\s*["']([^"']+)["']\s*\)|(?:[^"'();]*?\s+from\s+)?["']([^"']+)["'])|export\s+(?:\*(?:\s+as\s+[A-Za-z_$][\w$]*)?|\{[^}]*\})\s+from\s+["']([^"']+)["']|require\s*\(\s*["']([^"']+)["']\s*\))/g;
 
 export function checkPluginIsolation(pluginDir) {
   const root = path.resolve(pluginDir);
