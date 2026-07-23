@@ -1,10 +1,54 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 import { listFiles } from "./lib/fs-walk.mjs";
 import { isDirectInvocation } from "./sync-contracts.mjs";
 
-const MODULE_REFERENCE = /\b(?:import\s*(?:\(\s*["']([^"']+)["']\s*\)|(?:[^"'();]*?\s+from\s+)?["']([^"']+)["'])|export\s+(?:\*(?:\s+as\s+[A-Za-z_$][\w$]*)?|\{[^}]*\})\s+from\s+["']([^"']+)["']|require\s*\(\s*["']([^"']+)["']\s*\))/g;
+function moduleSpecifierText(node) {
+  return node && ts.isStringLiteralLike(node) ? node.text : undefined;
+}
+
+function collectModuleSpecifiers(sourceFile) {
+  const specifiers = [];
+
+  function visit(node) {
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+      const specifier = moduleSpecifierText(node.moduleSpecifier);
+      if (specifier !== undefined) specifiers.push(specifier);
+    } else if (ts.isCallExpression(node)) {
+      const isDynamicImport = node.expression.kind === ts.SyntaxKind.ImportKeyword;
+      const isRequire = ts.isIdentifier(node.expression)
+        && node.expression.text === "require";
+      if (isDynamicImport || isRequire) {
+        const specifier = moduleSpecifierText(node.arguments[0]);
+        if (specifier !== undefined) specifiers.push(specifier);
+      }
+    }
+
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+  return specifiers;
+}
+
+function syntaxErrorViolation(file, sourceFile) {
+  const diagnostic = sourceFile.parseDiagnostics[0];
+  if (!diagnostic) return undefined;
+
+  const message = ts.flattenDiagnosticMessageText(diagnostic.messageText, " ");
+  const position = diagnostic.start === undefined
+    ? ""
+    : (() => {
+        const { line, character } = sourceFile.getLineAndCharacterOfPosition(diagnostic.start);
+        return ` at ${line + 1}:${character + 1}`;
+      })();
+  return {
+    file,
+    message: `JavaScript syntax error prevents isolation scan: ${message}${position}`,
+  };
+}
 
 export function checkPluginIsolation(pluginDir) {
   const root = path.resolve(pluginDir);
@@ -17,8 +61,20 @@ export function checkPluginIsolation(pluginDir) {
       && !relative.startsWith("tooling/");
   })) {
     const source = fs.readFileSync(file, "utf8");
-    for (const match of source.matchAll(MODULE_REFERENCE)) {
-      const specifier = match.slice(1).find(Boolean);
+    const sourceFile = ts.createSourceFile(
+      file,
+      source,
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.JS,
+    );
+    const syntaxError = syntaxErrorViolation(file, sourceFile);
+    if (syntaxError) {
+      violations.push(syntaxError);
+      continue;
+    }
+
+    for (const specifier of collectModuleSpecifiers(sourceFile)) {
       if (!specifier.startsWith(".")) continue;
 
       const resolved = path.resolve(path.dirname(file), specifier);

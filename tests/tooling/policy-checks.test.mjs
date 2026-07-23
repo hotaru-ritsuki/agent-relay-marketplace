@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -11,9 +11,18 @@ import { checkForbiddenFlags } from "../../tooling/check-forbidden-flags.mjs";
 const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ISOLATION_CLI = path.resolve(TEST_DIR, "../../tooling/check-plugin-isolation.mjs");
 const SAFETY_CLI = path.resolve(TEST_DIR, "../../tooling/check-forbidden-flags.mjs");
+const fixtureRoots = new Set();
+
+afterEach(() => {
+  for (const root of fixtureRoots) {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+  fixtureRoots.clear();
+});
 
 function fixture(source, filename = "runtime.mjs") {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "relay-policy-"));
+  fixtureRoots.add(root);
   const scripts = path.join(root, "scripts");
   fs.mkdirSync(scripts);
   fs.writeFileSync(path.join(scripts, filename), source);
@@ -61,6 +70,32 @@ const MODULE_REFERENCE_FORMS = [
   ["namespace re-export", (specifier) => `export * as relay from "${specifier}";`, "runtime.mjs"],
   ["CommonJS require", (specifier) => `require("${specifier}");`, "runtime.cjs"],
 ];
+const PARSER_MODULE_REFERENCE_FORMS = [
+  [
+    "dynamic import with comment and options",
+    (specifier) => `await import(/* comment */ "${specifier}", { with: { type: "json" } });`,
+    "runtime.mjs",
+    "../../outside.json",
+  ],
+  [
+    "CommonJS require with comment",
+    (specifier) => `require(/* comment */ "${specifier}");`,
+    "runtime.cjs",
+    "../../outside.cjs",
+  ],
+  [
+    "Unicode namespace re-export",
+    (specifier) => `export * as π from "${specifier}";`,
+    "runtime.mjs",
+    "../../outside.mjs",
+  ],
+  [
+    "no-substitution template dynamic import",
+    (specifier) => `await import(\`${specifier}\`);`,
+    "runtime.mjs",
+    "../../outside.mjs",
+  ],
+];
 const APPROVED_UNSAFE_FLAGS = [
   "--force",
   "--yolo",
@@ -83,6 +118,45 @@ for (const [name, sourceFor, filename] of MODULE_REFERENCE_FORMS) {
     assert.deepEqual(checkPluginIsolation(fixture(sourceFor("./local.mjs"), filename)), []);
   });
 }
+
+for (const [name, sourceFor, filename, outsideSpecifier] of PARSER_MODULE_REFERENCE_FORMS) {
+  test(`isolation rejects outside-plugin ${name}`, () => {
+    const violations = checkPluginIsolation(
+      fixture(sourceFor(outsideSpecifier), filename),
+    );
+    assert.deepEqual(
+      violations.map(({ message }) => message),
+      [`relative import resolves outside plugin: ${outsideSpecifier}`],
+    );
+  });
+
+  test(`isolation accepts in-plugin ${name}`, () => {
+    assert.deepEqual(
+      checkPluginIsolation(fixture(sourceFor("./local.mjs"), filename)),
+      [],
+    );
+  });
+}
+
+test("isolation fails closed for malformed JavaScript", () => {
+  const root = fixture("const broken = ;", "runtime.js");
+  const file = path.join(root, "scripts", "runtime.js");
+  let violations;
+
+  assert.doesNotThrow(() => {
+    violations = checkPluginIsolation(root);
+  });
+  assert.deepEqual(
+    violations.map((violation) => ({
+      file: violation.file,
+      message: violation.message.replace(/ at \d+:\d+$/, ""),
+    })),
+    [{
+      file,
+      message: "JavaScript syntax error prevents isolation scan: Expression expected.",
+    }],
+  );
+});
 
 for (const [quoteName, source, flag] of [
   ["single-quoted", "const args = ['--force'];", "--force"],
