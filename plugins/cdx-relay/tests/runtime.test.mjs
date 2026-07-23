@@ -1,21 +1,29 @@
 import fs from "node:fs";
 import path from "node:path";
-import test from "node:test";
+import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import {
+  cleanupTrackedChildren,
+  initGitRepo,
+  makeTempDir,
+  run,
+  trackChild
+} from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../scripts/lib/broker-lifecycle.mjs";
 import { DEFAULT_CONTINUE_PROMPT } from "../scripts/lib/codex.mjs";
-import { resolveStateDir } from "../scripts/lib/state.mjs";
+import { resolveStateDir, upsertJob, writeJobFile } from "../scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = ROOT;
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
+
+afterEach(cleanupTrackedChildren);
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   const start = Date.now();
@@ -1210,6 +1218,109 @@ test("task --resume-id background round-trip preserves the exact thread", () => 
   assert.equal(finishedJob.request.resumeId, "thr_exact");
 });
 
+test("task worker waits for its queued record to be published", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  seedFakeCodexThread(statePath, repo);
+
+  const jobId = "task-delayed-publication";
+  const stateDir = resolveStateDir(repo);
+  const logFile = path.join(stateDir, "jobs", `${jobId}.log`);
+  fs.mkdirSync(path.dirname(logFile), { recursive: true });
+  fs.writeFileSync(logFile, "", "utf8");
+  const child = trackChild(spawn(
+    process.execPath,
+    [SCRIPT, "task-worker", "--cwd", repo, "--job-id", jobId],
+    {
+      cwd: repo,
+      env: buildEnv(binDir),
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true
+    }
+  ));
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const exitPromise = new Promise((resolve) => child.once("exit", resolve));
+
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  const queuedRecord = {
+    id: jobId,
+    kind: "task",
+    kindLabel: "rescue",
+    title: "Codex Resume",
+    workspaceRoot: repo,
+    jobClass: "task",
+    summary: "continue exact thread",
+    write: false,
+    createdAt: new Date().toISOString(),
+    status: "queued",
+    phase: "queued",
+    pid: child.pid,
+    logFile,
+    request: {
+      cwd: repo,
+      model: null,
+      effort: null,
+      prompt: "continue exact thread",
+      write: false,
+      resumeLast: false,
+      resumeId: "thr_exact",
+      jobId
+    }
+  };
+  writeJobFile(repo, jobId, queuedRecord);
+  upsertJob(repo, queuedRecord);
+
+  const exitCode = await exitPromise;
+  assert.equal(exitCode, 0, stderr);
+  const status = run("node", [SCRIPT, "status", jobId, "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(status.status, 0, status.stderr);
+  const finishedJob = JSON.parse(
+    fs.readFileSync(path.join(stateDir, "jobs", `${jobId}.json`), "utf8")
+  );
+  assert.equal(finishedJob.status, "completed");
+  assert.equal(finishedJob.threadId, "thr_exact");
+});
+
+test("task worker rejects a published job record with a mismatched id", async () => {
+  const repo = makeTempDir();
+  const jobId = "task-requested-id";
+  const stateDir = resolveStateDir(repo);
+  const logFile = path.join(stateDir, "jobs", `${jobId}.log`);
+  const queuedRecord = {
+    id: "task-different-id",
+    workspaceRoot: repo,
+    status: "queued",
+    phase: "queued",
+    logFile,
+    request: {
+      cwd: repo,
+      prompt: "continue exact thread",
+      jobId
+    }
+  };
+  fs.mkdirSync(path.dirname(logFile), { recursive: true });
+  fs.writeFileSync(logFile, "", "utf8");
+  writeJobFile(repo, jobId, queuedRecord);
+  upsertJob(repo, { ...queuedRecord, id: jobId });
+
+  const worker = run("node", [SCRIPT, "task-worker", "--cwd", repo, "--job-id", jobId], {
+    cwd: repo
+  });
+
+  assert.equal(worker.status, 1);
+  assert.match(worker.stderr, /Stored job task-different-id does not match requested job task-requested-id/);
+});
+
 test("task --resume-id background without a prompt uses the default continue prompt", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -1814,7 +1925,7 @@ test("result for a finished write-capable task returns the raw Codex final respo
   assert.match(result.stdout, /Resume in Codex: codex resume thr_[a-z0-9]+/i);
 });
 
-test("cancel stops an active background job and marks it cancelled", async (t) => {
+test("cancel stops an active background job and marks it cancelled", async () => {
   const workspace = makeTempDir();
   const binDir = makeTempDir();
   installTaskkillFixture(binDir);
@@ -1822,24 +1933,12 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
   const jobsDir = path.join(stateDir, "jobs");
   fs.mkdirSync(jobsDir, { recursive: true });
 
-  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  const sleeper = trackChild(spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
     cwd: workspace,
     detached: true,
     stdio: "ignore"
-  });
+  }));
   sleeper.unref();
-
-  t.after(() => {
-    try {
-      process.kill(-sleeper.pid, "SIGTERM");
-    } catch {
-      try {
-        process.kill(sleeper.pid, "SIGTERM");
-      } catch {
-        // Ignore missing process.
-      }
-    }
-  });
 
   const logFile = path.join(jobsDir, "task-live.log");
   const jobFile = path.join(jobsDir, "task-live.json");
@@ -2085,7 +2184,7 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
-test("session end fully cleans up jobs for the ending session", async (t) => {
+test("session end fully cleans up jobs for the ending session", async () => {
   const repo = makeTempDir();
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
@@ -2108,25 +2207,13 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   fs.writeFileSync(completedJobFile, JSON.stringify({ id: "review-completed" }, null, 2), "utf8");
   fs.writeFileSync(otherJobFile, JSON.stringify({ id: "review-other" }, null, 2), "utf8");
 
-  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  const sleeper = trackChild(spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
     cwd: repo,
     detached: true,
     stdio: "ignore"
-  });
+  }));
   sleeper.unref();
   fs.writeFileSync(runningJobFile, JSON.stringify({ id: "review-running" }, null, 2), "utf8");
-
-  t.after(() => {
-    try {
-      process.kill(-sleeper.pid, "SIGTERM");
-    } catch {
-      try {
-        process.kill(sleeper.pid, "SIGTERM");
-      } catch {
-        // Ignore missing process.
-      }
-    }
-  });
 
   fs.writeFileSync(
     path.join(stateDir, "state.json"),

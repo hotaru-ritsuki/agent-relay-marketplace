@@ -872,14 +872,34 @@ async function handleTaskWorker(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
+  const jobId = options["job-id"];
+  const publicationDeadline = Date.now() + 5000;
+  let storedJob = null;
+  let indexedJob = null;
+  while (Date.now() < publicationDeadline) {
+    storedJob = readStoredJob(workspaceRoot, jobId);
+    indexedJob = listJobs(workspaceRoot).find((job) => job.id === jobId) ?? null;
+    if (storedJob && indexedJob) {
+      break;
+    }
+    await sleep(50);
+  }
   if (!storedJob) {
-    throw new Error(`No stored job found for ${options["job-id"]}.`);
+    throw new Error(`No stored job found for ${jobId} before the publication deadline.`);
+  }
+  if (!indexedJob) {
+    throw new Error(`No state index entry found for ${jobId} before the publication deadline.`);
+  }
+  if (storedJob.id !== jobId) {
+    throw new Error(`Stored job ${storedJob.id ?? "<missing id>"} does not match requested job ${jobId}.`);
   }
 
   const request = storedJob.request;
   if (!request || typeof request !== "object") {
-    throw new Error(`Stored job ${options["job-id"]} is missing its task request payload.`);
+    throw new Error(`Stored job ${jobId} is missing its task request payload.`);
+  }
+  if (request.jobId && request.jobId !== jobId) {
+    throw new Error(`Stored task request ${request.jobId} does not match requested job ${jobId}.`);
   }
 
   const { logFile, progress } = createTrackedProgress(
