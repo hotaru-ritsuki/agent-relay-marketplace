@@ -22,40 +22,18 @@ function makeVersionFixture() {
   const root = makeTempDir();
 
   writeJson(path.join(root, "package.json"), {
-    name: "@hotaru-ritsuki/codex-cc-relay-plugin",
+    name: "@hotaru-ritsuki/cdx-relay",
     version: "1.0.2"
   });
-  writeJson(path.join(root, "package-lock.json"), {
-    name: "@hotaru-ritsuki/codex-cc-relay-plugin",
-    version: "1.0.2",
-    lockfileVersion: 3,
-    packages: {
-      "": {
-        name: "@hotaru-ritsuki/codex-cc-relay-plugin",
-        version: "1.0.2"
-      }
-    }
-  });
-  writeJson(path.join(root, "plugins", "codex", ".claude-plugin", "plugin.json"), {
+  writeJson(path.join(root, ".claude-plugin", "plugin.json"), {
     name: "cdx-relay",
     version: "1.0.2"
-  });
-  writeJson(path.join(root, ".claude-plugin", "marketplace.json"), {
-    metadata: {
-      version: "1.0.2"
-    },
-    plugins: [
-      {
-        name: "cdx-relay",
-        version: "1.0.2"
-      }
-    ]
   });
 
   return root;
 }
 
-test("bump-version updates every release manifest", () => {
+test("bump-version updates the independent package manifests", () => {
   const root = makeVersionFixture();
 
   const result = run("node", [SCRIPT, "--root", root, "1.2.3"], {
@@ -64,17 +42,17 @@ test("bump-version updates every release manifest", () => {
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(readJson(path.join(root, "package.json")).version, "1.2.3");
-  assert.equal(readJson(path.join(root, "package-lock.json")).version, "1.2.3");
-  assert.equal(readJson(path.join(root, "package-lock.json")).packages[""].version, "1.2.3");
-  assert.equal(readJson(path.join(root, "plugins", "codex", ".claude-plugin", "plugin.json")).version, "1.2.3");
-  assert.equal(readJson(path.join(root, ".claude-plugin", "marketplace.json")).metadata.version, "1.2.3");
-  assert.equal(readJson(path.join(root, ".claude-plugin", "marketplace.json")).plugins[0].version, "1.2.3");
+  assert.equal(readJson(path.join(root, ".claude-plugin", "plugin.json")).version, "1.2.3");
+  assert.deepEqual(
+    fs.readdirSync(root).sort(),
+    [".claude-plugin", "package.json"]
+  );
 });
 
 test("bump-version check mode reports stale metadata", () => {
   const root = makeVersionFixture();
   writeJson(path.join(root, "package.json"), {
-    name: "@hotaru-ritsuki/codex-cc-relay-plugin",
+    name: "@hotaru-ritsuki/cdx-relay",
     version: "1.0.3"
   });
 
@@ -83,6 +61,5 @@ test("bump-version check mode reports stale metadata", () => {
   });
 
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /plugins\/codex\/\.claude-plugin\/plugin\.json version/);
-  assert.match(result.stderr, /\.claude-plugin\/marketplace\.json metadata\.version/);
+  assert.match(result.stderr, /\.claude-plugin\/plugin\.json version/);
 });

@@ -29,6 +29,32 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   throw new Error("Timed out waiting for condition.");
 }
 
+function installTaskkillFixture(binDir) {
+  if (process.platform !== "win32") {
+    return;
+  }
+
+  const fixture = path.join(binDir, "fake-taskkill.mjs");
+  fs.writeFileSync(
+    fixture,
+    [
+      'const pidIndex = process.argv.indexOf("/PID");',
+      "const pid = Number(process.argv[pidIndex + 1]);",
+      "try {",
+      '  process.kill(pid, "SIGTERM");',
+      "} catch (error) {",
+      '  if (error?.code !== "ESRCH") throw error;',
+      "}"
+    ].join("\n"),
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(binDir, "taskkill.cmd"),
+    `@"${process.execPath}" "${fixture}" %*\r\n`,
+    "utf8"
+  );
+}
+
 function seedFakeCodexThread(statePath, cwd, threadId = "thr_exact") {
   fs.writeFileSync(
     statePath,
@@ -1790,6 +1816,8 @@ test("result for a finished write-capable task returns the raw Codex final respo
 
 test("cancel stops an active background job and marks it cancelled", async (t) => {
   const workspace = makeTempDir();
+  const binDir = makeTempDir();
+  installTaskkillFixture(binDir);
   const stateDir = resolveStateDir(workspace);
   const jobsDir = path.join(stateDir, "jobs");
   fs.mkdirSync(jobsDir, { recursive: true });
@@ -1858,7 +1886,11 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
   );
 
   const cancelResult = run("node", [SCRIPT, "cancel", "task-live", "--json"], {
-    cwd: workspace
+    cwd: workspace,
+    env: {
+      ...process.env,
+      PATH: `${binDir}${path.delimiter}${process.env.PATH}`
+    }
   });
 
   assert.equal(cancelResult.status, 0, cancelResult.stderr);

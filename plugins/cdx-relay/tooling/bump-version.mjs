@@ -19,53 +19,13 @@ const TARGETS = [
     ]
   },
   {
-    file: "package-lock.json",
+    file: ".claude-plugin/plugin.json",
     values: [
       {
         label: "version",
         get: (json) => json.version,
         set: (json, version) => {
           json.version = version;
-        }
-      },
-      {
-        label: "packages[\"\"].version",
-        get: (json) => json.packages?.[""]?.version,
-        set: (json, version) => {
-          requireObject(json.packages?.[""], "package-lock.json packages[\"\"]");
-          json.packages[""].version = version;
-        }
-      }
-    ]
-  },
-  {
-    file: "plugins/codex/.claude-plugin/plugin.json",
-    values: [
-      {
-        label: "version",
-        get: (json) => json.version,
-        set: (json, version) => {
-          json.version = version;
-        }
-      }
-    ]
-  },
-  {
-    file: ".claude-plugin/marketplace.json",
-    values: [
-      {
-        label: "metadata.version",
-        get: (json) => json.metadata?.version,
-        set: (json, version) => {
-          requireObject(json.metadata, ".claude-plugin/marketplace.json metadata");
-          json.metadata.version = version;
-        }
-      },
-      {
-        label: "plugins[cdx-relay].version",
-        get: (json) => findMarketplacePlugin(json).version,
-        set: (json, version) => {
-          findMarketplacePlugin(json).version = version;
         }
       }
     ]
@@ -75,8 +35,8 @@ const TARGETS = [
 function usage() {
   return [
     "Usage:",
-    "  node scripts/bump-version.mjs <version>",
-    "  node scripts/bump-version.mjs --check [version]",
+    "  node tooling/bump-version.mjs <version>",
+    "  node tooling/bump-version.mjs --check [version]",
     "",
     "Options:",
     "  --check       Verify manifest versions. Uses package.json when version is omitted.",
@@ -123,18 +83,6 @@ function validateVersion(version) {
   if (!VERSION_PATTERN.test(version)) {
     throw new Error(`Expected a semver-like version such as 1.0.3, got: ${version}`);
   }
-}
-
-function requireObject(value, label) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`Expected ${label} to be an object.`);
-  }
-}
-
-function findMarketplacePlugin(json) {
-  const plugin = json.plugins?.find((entry) => entry?.name === "cdx-relay");
-  requireObject(plugin, ".claude-plugin/marketplace.json plugins[cdx-relay]");
-  return plugin;
 }
 
 function readJson(root, file) {
