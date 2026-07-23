@@ -1,0 +1,31 @@
+{
+  "$id": "https://agent-relay.dev/schemas/v1/common",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "provider": { "enum": ["codex", "cursor"] },
+    "status": {
+      "enum": ["queued", "starting", "running", "waiting", "completed", "failed", "cancelled", "timed_out", "interrupted", "partial"]
+    },
+    "retrySafety": { "enum": ["safe", "unsafe", "unknown"] },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "nullableTimestamp": {
+      "oneOf": [
+        { "$ref": "#/$defs/timestamp" },
+        { "type": "null" }
+      ]
+    },
+    "safety": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sandbox", "readOnly", "network", "mcp", "approvals", "allowConcurrentWrites"],
+      "properties": {
+        "sandbox": { "type": "string", "minLength": 1 },
+        "readOnly": { "type": "boolean" },
+        "network": { "type": "boolean" },
+        "mcp": { "type": "boolean" },
+        "approvals": { "enum": ["deny", "prompt", "explicit-policy"] },
+        "allowConcurrentWrites": { "type": "boolean" }
+      }
+    }
+  }
+}

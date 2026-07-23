@@ -1,0 +1,24 @@
+{
+  "$id": "https://agent-relay.dev/schemas/v1/job",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schemaVersion", "provider", "pluginVersion", "jobId", "claudeSessionId", "workspaceHash", "transport", "model", "safety", "status", "providerStatus", "createdAt", "updatedAt", "startedAt", "finishedAt"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "provider": { "$ref": "https://agent-relay.dev/schemas/v1/common#/$defs/provider" },
+    "pluginVersion": { "type": "string", "minLength": 1 },
+    "jobId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{7,127}$" },
+    "claudeSessionId": { "type": ["string", "null"] },
+    "workspaceHash": { "type": "string", "pattern": "^[a-f0-9]{16}$" },
+    "transport": { "type": "string", "minLength": 1 },
+    "model": { "type": "string", "minLength": 1 },
+    "safety": { "$ref": "https://agent-relay.dev/schemas/v1/common#/$defs/safety" },
+    "status": { "$ref": "https://agent-relay.dev/schemas/v1/common#/$defs/status" },
+    "providerStatus": { "type": ["string", "null"] },
+    "createdAt": { "$ref": "https://agent-relay.dev/schemas/v1/common#/$defs/timestamp" },
+    "updatedAt": { "$ref": "https://agent-relay.dev/schemas/v1/common#/$defs/timestamp" },
+    "startedAt": { "$ref": "https://agent-relay.dev/schemas/v1/common#/$defs/nullableTimestamp" },
+    "finishedAt": { "$ref": "https://agent-relay.dev/schemas/v1/common#/$defs/nullableTimestamp" }
+  }
+}

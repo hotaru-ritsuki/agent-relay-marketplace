@@ -1,0 +1,32 @@
+{
+  "$id": "https://agent-relay.dev/schemas/v1/result",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schemaVersion", "provider", "pluginVersion", "jobId", "status", "retrySafety", "summary", "finalOutput", "changedFiles", "error"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "provider": { "$ref": "https://agent-relay.dev/schemas/v1/common#/$defs/provider" },
+    "pluginVersion": { "type": "string", "minLength": 1 },
+    "jobId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{7,127}$" },
+    "status": { "$ref": "https://agent-relay.dev/schemas/v1/common#/$defs/status" },
+    "retrySafety": { "$ref": "https://agent-relay.dev/schemas/v1/common#/$defs/retrySafety" },
+    "summary": { "type": "string" },
+    "finalOutput": { "type": "string" },
+    "changedFiles": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "error": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "message"],
+          "properties": {
+            "code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]+$" },
+            "message": { "type": "string" }
+          }
+        }
+      ]
+    }
+  }
+}
