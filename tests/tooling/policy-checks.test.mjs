@@ -47,6 +47,29 @@ test("isolation rejects imports that leave the plugin", () => {
   assert.match(violations[0].message, /outside plugin/);
 });
 
+test("isolation accepts Windows-equivalent path casing inside the plugin", {
+  skip: process.platform !== "win32",
+}, () => {
+  const root = fixture("");
+  const casedRootName = path.basename(root).toUpperCase();
+  const specifier = `../../${casedRootName}/local.mjs`;
+
+  writeFixtureFile(root, "scripts/runtime.mjs", `import "${specifier}";`);
+  assert.deepEqual(checkPluginIsolation(root), []);
+});
+
+test("isolation rejects a sibling whose name starts with the plugin name", () => {
+  const root = fixture("");
+  const siblingName = `${path.basename(root)}-other`;
+  const specifier = `../../${siblingName}/local.mjs`;
+
+  writeFixtureFile(root, "scripts/runtime.mjs", `import "${specifier}";`);
+  assert.deepEqual(
+    checkPluginIsolation(root).map(({ message }) => message),
+    [`relative import resolves outside plugin: ${specifier}`],
+  );
+});
+
 test("safety scan rejects unsafe default flags", () => {
   const violations = checkForbiddenFlags(fixture('const defaults = ["--force", "--trust"];'));
   assert.equal(violations.length, 1);
@@ -143,6 +166,7 @@ test("isolation fails closed for malformed JavaScript", () => {
   const file = path.join(root, "scripts", "runtime.js");
   let violations;
 
+  assert.doesNotMatch(fs.readFileSync(ISOLATION_CLI, "utf8"), /\.parseDiagnostics\b/);
   assert.doesNotThrow(() => {
     violations = checkPluginIsolation(root);
   });

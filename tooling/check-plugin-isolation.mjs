@@ -33,15 +33,35 @@ function collectModuleSpecifiers(sourceFile) {
   return specifiers;
 }
 
-function syntaxErrorViolation(file, sourceFile) {
-  const diagnostic = sourceFile.parseDiagnostics[0];
+function isPathInside(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative === ""
+    || (!path.isAbsolute(relative)
+      && relative !== ".."
+      && !relative.startsWith(`..${path.sep}`));
+}
+
+function syntaxErrorViolation(file, source) {
+  const { diagnostics = [] } = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.ESNext,
+      target: ts.ScriptTarget.Latest,
+    },
+    fileName: file,
+    reportDiagnostics: true,
+  });
+  const diagnostic = diagnostics.find((item) =>
+    item.category === ts.DiagnosticCategory.Error && item.file
+  );
   if (!diagnostic) return undefined;
 
   const message = ts.flattenDiagnosticMessageText(diagnostic.messageText, " ");
   const position = diagnostic.start === undefined
     ? ""
     : (() => {
-        const { line, character } = sourceFile.getLineAndCharacterOfPosition(diagnostic.start);
+        const { line, character } = diagnostic.file.getLineAndCharacterOfPosition(
+          diagnostic.start,
+        );
         return ` at ${line + 1}:${character + 1}`;
       })();
   return {
@@ -68,7 +88,7 @@ export function checkPluginIsolation(pluginDir) {
       true,
       ts.ScriptKind.JS,
     );
-    const syntaxError = syntaxErrorViolation(file, sourceFile);
+    const syntaxError = syntaxErrorViolation(file, source);
     if (syntaxError) {
       violations.push(syntaxError);
       continue;
@@ -78,7 +98,7 @@ export function checkPluginIsolation(pluginDir) {
       if (!specifier.startsWith(".")) continue;
 
       const resolved = path.resolve(path.dirname(file), specifier);
-      if (resolved !== root && !resolved.startsWith(`${root}${path.sep}`)) {
+      if (!isPathInside(root, resolved)) {
         violations.push({
           file,
           message: `relative import resolves outside plugin: ${specifier}`,
