@@ -1,2 +1,12 @@
 .worktrees/
 .superpowers/
+node_modules/
+.scratch/
+.tmp/
+coverage/
+dist/
+*.log
+*.tmp
+*.pid
+.DS_Store
+Thumbs.db
