@@ -2,8 +2,17 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 
 import { SupervisorInfrastructureError } from "./errors.mjs";
-import { assertBoundedFrame } from "./protocol.mjs";
+import {
+  PROTOCOL_VERSION,
+  assertBoundedFrame,
+  validateCleanup,
+  validateLaunch,
+  validateProof,
+  validateRoot,
+  validateStop
+} from "./protocol.mjs";
 import { assertCleanupProven, createTerminalResult } from "./result.mjs";
+import { runSynchronous } from "./worker.mjs";
 
 export const defaultBackendFactories = [];
 
@@ -16,16 +25,77 @@ function infrastructureError(error, fallbackCode = "SUPERVISOR_FAILURE") {
   );
 }
 
+function validateSpec(spec) {
+  if (!spec || typeof spec !== "object" || Array.isArray(spec) ||
+      typeof spec.command !== "string" || spec.command.length === 0 ||
+      !Array.isArray(spec.args) ||
+      spec.args.some((argument) => typeof argument !== "string")) {
+    throw new SupervisorInfrastructureError(
+      "INVALID_LAUNCH_SPEC",
+      "A command and string argument array are required."
+    );
+  }
+  if (spec.shell !== undefined && spec.shell !== false) {
+    throw new SupervisorInfrastructureError(
+      "SHELL_UNSAFE",
+      "Supervised processes require shell: false."
+    );
+  }
+  return { ...spec, shell: false };
+}
+
+function validateCapabilities(value, {
+  platform,
+  mode,
+  minimumGuarantee,
+  requiresDetached = false
+}) {
+  const modes = new Set(["cooperative", "host-strict"]);
+  const containments = new Set(["cooperative", "kernel"]);
+  const proofs = new Set(["registered-drained", "kernel-drained"]);
+  if (!value || typeof value !== "object" ||
+      value.platform !== platform ||
+      typeof value.backend !== "string" || !value.backend ||
+      !modes.has(value.mode) ||
+      !containments.has(value.containment) ||
+      !proofs.has(value.cleanupProof) ||
+      typeof value.supportsDetachedDescendants !== "boolean" ||
+      (value.mode === "host-strict" &&
+        (value.containment !== "kernel" ||
+         value.cleanupProof !== "kernel-drained")) ||
+      (requiresDetached && !value.supportsDetachedDescendants)) {
+    throw new SupervisorInfrastructureError(
+      "CAPABILITY_INVALID",
+      "Backend capabilities are inconsistent with the requested guarantee."
+    );
+  }
+  return value;
+}
+
+function envelope(type, identity, payload) {
+  return {
+    ...payload,
+    version: PROTOCOL_VERSION,
+    type,
+    epoch: identity.epoch,
+    runId: identity.runId,
+    nonce: identity.nonce,
+    backend: payload?.backend
+  };
+}
+
 export function createProcessSupervisor({
   mode = "auto",
   minimumGuarantee = "cooperative",
   platform = process.platform,
   backendFactories = defaultBackendFactories,
   discoverRecordedProcesses = async () => [],
-  syncBridge = (runAsync, spec) => runAsync(spec)
+  syncBridge = runSynchronous,
+  syncBackendSelection = { type: "child-process" }
 } = {}) {
   const epoch = randomUUID();
   const leases = new Map();
+  const completedSyncRuns = new Map();
   let backend;
   let backendCapabilities;
   let cleanupInFlight;
@@ -40,24 +110,32 @@ export function createProcessSupervisor({
   };
 
   const capabilities = (async () => {
-    for (const factory of backendFactories) {
-      const candidate = await factory({ platform, mode, minimumGuarantee });
-      if (!candidate) continue;
-      const probe = await candidate.probe();
-      if (!probe?.available) continue;
-      const candidateCapabilities = probe.capabilities;
-      const strictEnough = mode !== "host-strict" &&
-          minimumGuarantee !== "host-strict" ||
-        candidateCapabilities?.mode === "host-strict";
-      if (!strictEnough) continue;
-      backend = candidate;
-      backendCapabilities = candidateCapabilities;
-      return candidateCapabilities;
+    try {
+      for (const factory of backendFactories) {
+        const candidate = await factory({ platform, mode, minimumGuarantee });
+        if (!candidate) continue;
+        const probe = await candidate.probe();
+        if (!probe?.available) continue;
+        const candidateCapabilities = validateCapabilities(probe.capabilities, {
+          platform,
+          mode,
+          minimumGuarantee
+        });
+        if ((mode === "host-strict" || minimumGuarantee === "host-strict") &&
+            candidateCapabilities.mode !== "host-strict") {
+          continue;
+        }
+        backend = candidate;
+        backendCapabilities = candidateCapabilities;
+        return candidateCapabilities;
+      }
+      throw new SupervisorInfrastructureError(
+        "CAPABILITY_UNAVAILABLE",
+        `No ${minimumGuarantee} process supervisor backend is available for ${platform}.`
+      );
+    } catch (error) {
+      throw latch(error, "CAPABILITY_PROBE_FAILED");
     }
-    throw latch(new SupervisorInfrastructureError(
-      "CAPABILITY_UNAVAILABLE",
-      `No ${minimumGuarantee} process supervisor backend is available for ${platform}.`
-    ));
   })();
 
   function assertCanLaunch() {
@@ -70,15 +148,56 @@ export function createProcessSupervisor({
     if (latchedFailure) throw latchedFailure;
   }
 
+  function validateTerminal(identity, rootPayload, proofPayload, capabilitiesValue) {
+    const root = validateRoot(envelope("root", identity, rootPayload), identity);
+    validateCleanup(
+      envelope("cleanup", identity, proofPayload),
+      identity
+    );
+    const cleanup = validateProof(
+      envelope("proof", identity, proofPayload),
+      identity
+    );
+    const result = createTerminalResult({
+      root,
+      backend: capabilitiesValue,
+      cleanup,
+      requestedSignal: identity.requestedSignal ?? null,
+      terminationCause: identity.requestedSignal
+        ? "requested-signal"
+        : "root-exit"
+    });
+    assertCleanupProven(result, minimumGuarantee);
+    if (root.error) {
+      throw new SupervisorInfrastructureError(
+        "ROOT_PROCESS_ERROR",
+        root.error.message ?? "The root process failed to launch.",
+        { cause: root.error, result }
+      );
+    }
+    return result;
+  }
+
   async function cleanupLease(lease) {
     if (!lease.cleanupPromise) {
       lease.cleanupPromise = (async () => {
         try {
-          const cleanup = typeof lease.launch.cleanup === "function"
+          const raw = typeof lease.launch.cleanup === "function"
             ? await lease.launch.cleanup()
             : lease.launch.cleanup;
-          lease.cleanup = cleanup;
-          return cleanup;
+          validateCleanup(envelope("cleanup", lease, raw), lease);
+          const proof = validateProof(
+            envelope("proof", lease, raw),
+            lease
+          );
+          const provisional = createTerminalResult({
+            root: { status: null, signal: null },
+            backend: backendCapabilities,
+            cleanup: proof
+          });
+          assertCleanupProven(provisional, minimumGuarantee);
+          lease.cleanup = proof;
+          return proof;
         } catch (error) {
           throw latch(error, "CLEANUP_FAILED");
         }
@@ -87,52 +206,70 @@ export function createProcessSupervisor({
     return lease.cleanupPromise;
   }
 
-  function createFakeLaunch({ root, cleanup, pid = 1 } = {}) {
+  function createFakeLaunch({ root, cleanup, pid = 1 } = {}, identity) {
+    const addBackend = (value) => value && typeof value === "object"
+      ? { ...value, backend: value.backend ?? identity.backend }
+      : value;
     return {
       pid,
-      root: new Promise((resolve) => setImmediate(() => resolve(root))),
-      cleanup,
+      root: Promise.resolve(root).then((value) =>
+        new Promise((resolve) => setImmediate(() => resolve(addBackend(value))))),
+      cleanup: typeof cleanup === "function"
+        ? async () => addBackend(await cleanup())
+        : addBackend(cleanup),
       kill() {
-        return true;
+        return { backend: identity.backend, stopped: true };
       }
     };
   }
 
-  async function launch(spec) {
+  async function launch(inputSpec) {
     assertCanLaunch();
-    await capabilities;
+    const spec = validateSpec(inputSpec);
+    const selected = await capabilities;
+    validateCapabilities(selected, {
+      platform,
+      mode,
+      minimumGuarantee,
+      requiresDetached: spec.detached === true
+    });
     assertCanLaunch();
-    const runId = randomUUID();
-    const nonce = randomUUID();
+    const identity = {
+      epoch,
+      runId: randomUUID(),
+      nonce: randomUUID(),
+      backend: selected.backend
+    };
+    validateLaunch(envelope("launch", identity, {
+      backend: selected.backend,
+      command: spec.command,
+      args: spec.args
+    }), identity);
     let launched;
     try {
       launched = await backend.launch(
-        { ...spec, epoch, runId, nonce },
+        { ...spec, ...identity },
         {
-          epoch,
-          runId,
-          nonce,
+          ...identity,
           assertFrame: assertBoundedFrame,
-          createFakeLaunch
+          createFakeLaunch: (values) => createFakeLaunch(values, identity)
         }
       );
     } catch (error) {
       throw latch(error, "LAUNCH_FAILED");
     }
-    if (!launched || !launched.root) {
+    if (!launched || !launched.root || !launched.cleanup) {
       throw latch(new SupervisorInfrastructureError(
         "INVALID_BACKEND_LAUNCH",
-        "The backend did not return a root completion."
+        "The backend did not return root completion and cleanup proof sources."
       ));
     }
     const lease = {
-      epoch,
-      runId,
-      nonce,
+      ...identity,
       launch: launched,
       requestedSignal: null
     };
-    leases.set(runId, lease);
+    leases.set(identity.runId, lease);
     return lease;
   }
 
@@ -140,64 +277,101 @@ export function createProcessSupervisor({
     let root;
     try {
       root = completedRoot ?? await lease.launch.root;
+      root = validateRoot(envelope("root", lease, root), lease);
+      const cleanup = await cleanupLease(lease);
+      return validateTerminal(
+        lease,
+        root,
+        cleanup,
+        backendCapabilities
+      );
     } catch (error) {
-      throw latch(error, "TRANSPORT_FAILED");
-    }
-    const cleanup = await cleanupLease(lease);
-    const result = createTerminalResult({
-      root,
-      backend: backendCapabilities,
-      cleanup,
-      requestedSignal: lease.requestedSignal,
-      terminationCause: lease.requestedSignal ? "requested-signal" : "root-exit"
-    });
-    try {
-      return assertCleanupProven(result, minimumGuarantee);
-    } catch (error) {
-      throw latch(error);
+      throw latch(error, root?.error ? "ROOT_PROCESS_ERROR" : "TRANSPORT_FAILED");
     } finally {
       leases.delete(lease.runId);
     }
   }
 
-  async function runAsync(spec) {
-    const lease = await launch(spec);
-    return settleLease(lease);
-  }
-
-  function run(spec) {
+  function run(inputSpec) {
     assertCanLaunch();
-    return syncBridge(runAsync, spec);
+    const spec = validateSpec(inputSpec);
+    const identity = {
+      epoch,
+      runId: randomUUID(),
+      nonce: randomUUID()
+    };
+    try {
+      const response = syncBridge({
+        spec,
+        backendSelection: syncBackendSelection,
+        platform,
+        mode,
+        minimumGuarantee,
+        ...identity
+      });
+      const selected = validateCapabilities(response.capabilities, {
+        platform,
+        mode,
+        minimumGuarantee,
+        requiresDetached: spec.detached === true
+      });
+      identity.backend = selected.backend;
+      const result = validateTerminal(
+        identity,
+        response.root,
+        response.cleanup,
+        selected
+      );
+      completedSyncRuns.set(identity.runId, {
+        identity: { ...identity },
+        proof: response.cleanup,
+        capabilities: selected
+      });
+      return result;
+    } catch (error) {
+      throw latch(error, "SYNC_BRIDGE_FAILED");
+    }
   }
 
-  async function spawnTracked(spec) {
-    const lease = await launch(spec);
-    const exposedChild = lease.launch.child;
-    const child = exposedChild ?? new EventEmitter();
-    child.pid = lease.launch.pid;
-    child.stdout ??= lease.launch.stdout ?? null;
-    child.stderr ??= lease.launch.stderr ?? null;
-    child.exitCode ??= null;
-    child.signalCode ??= null;
+  async function spawnTracked(inputSpec) {
+    const lease = await launch(inputSpec);
+    const child = new EventEmitter();
+    child.pid = lease.launch.pid ?? lease.launch.child?.pid;
+    child.stdout = lease.launch.stdout ?? lease.launch.child?.stdout ?? null;
+    child.stderr = lease.launch.stderr ?? lease.launch.child?.stderr ?? null;
+    child.exitCode = null;
+    child.signalCode = null;
     child.ref = () => {
-      lease.launch.ref?.();
+      (lease.launch.ref ?? lease.launch.child?.ref)?.call(
+        lease.launch.child ?? lease.launch
+      );
       return child;
     };
     child.unref = () => {
-      lease.launch.unref?.();
+      (lease.launch.unref ?? lease.launch.child?.unref)?.call(
+        lease.launch.child ?? lease.launch
+      );
       return child;
     };
     let killRequested = false;
-    const launchKill = exposedChild
-      ? exposedChild.kill.bind(exposedChild)
-      : lease.launch.kill?.bind(lease.launch);
+    const rawKill = lease.launch.kill ?? lease.launch.child?.kill;
     child.kill = (signal = "SIGTERM") => {
       if (killRequested || child.exitCode !== null || child.signalCode !== null) {
         return false;
       }
       killRequested = true;
       lease.requestedSignal = signal;
-      return launchKill?.(signal) !== false;
+      try {
+        const stopped = rawKill?.call(
+          lease.launch.child ?? lease.launch,
+          signal
+        );
+        validateStop(envelope("stop", lease, stopped), lease);
+        return true;
+      } catch (error) {
+        latch(error, "STOP_FAILED");
+        return false;
+      }
     };
 
     let resolveCompletion;
@@ -208,22 +382,20 @@ export function createProcessSupervisor({
     });
     void (async () => {
       try {
-        const root = await lease.launch.root;
-        child.exitCode = root.status ?? null;
-        child.signalCode = root.signal ?? null;
-        if (!exposedChild) child.emit("exit", child.exitCode, child.signalCode);
+        const rawRoot = await lease.launch.root;
+        const root = validateRoot(envelope("root", lease, rawRoot), lease);
+        child.exitCode = root.status;
+        child.signalCode = root.signal;
+        child.emit("exit", child.exitCode, child.signalCode);
         const result = await settleLease(lease, root);
         resolveCompletion(result);
-        if (!exposedChild) {
-          queueMicrotask(() => child.emit(
-            "close",
-            child.exitCode,
-            child.signalCode
-          ));
-        }
+        queueMicrotask(() =>
+          child.emit("close", child.exitCode, child.signalCode));
       } catch (error) {
-        rejectCompletion(error);
-        if (!exposedChild) queueMicrotask(() => child.emit("close", null, null));
+        const normalized = latch(error, "TRANSPORT_FAILED");
+        rejectCompletion(normalized);
+        queueMicrotask(() =>
+          child.emit("close", child.exitCode, child.signalCode));
       }
     })();
     return child;
@@ -243,10 +415,11 @@ export function createProcessSupervisor({
         const matching = leases.get(processRecord.runId);
         if (!matching ||
             matching.epoch !== processRecord.epoch ||
-            matching.nonce !== processRecord.nonce) {
+            matching.nonce !== processRecord.nonce ||
+            matching.backend !== processRecord.backend) {
           failures.push(latch(new SupervisorInfrastructureError(
             "UNREGISTERED_RECORDED_PROCESS",
-            "Discovered process state has no live matching lease.",
+            "Discovered process state has no live matching lease and backend.",
             { result: processRecord }
           )));
         }
@@ -258,9 +431,51 @@ export function createProcessSupervisor({
           failures.push(error);
         }
       }));
+      for (const completed of completedSyncRuns.values()) {
+        try {
+          validateCleanup(
+            envelope("cleanup", completed.identity, completed.proof),
+            completed.identity
+          );
+          const proof = validateProof(
+            envelope("proof", completed.identity, completed.proof),
+            completed.identity
+          );
+          const result = createTerminalResult({
+            root: { status: null, signal: null },
+            backend: completed.capabilities,
+            cleanup: proof
+          });
+          assertCleanupProven(result, minimumGuarantee);
+        } catch (error) {
+          failures.push(latch(error, "CLEANUP_FAILED"));
+        }
+      }
       try {
         await capabilities;
-        await backend.cleanupAll?.();
+        if (backend.cleanupAll) {
+          const raw = await backend.cleanupAll();
+          const aggregateIdentity = {
+            epoch,
+            runId: "aggregate",
+            nonce: "aggregate",
+            backend: backendCapabilities.backend
+          };
+          validateCleanup(
+            envelope("cleanup", aggregateIdentity, raw),
+            aggregateIdentity
+          );
+          const proof = validateProof(
+            envelope("proof", aggregateIdentity, raw),
+            aggregateIdentity
+          );
+          const result = createTerminalResult({
+            root: { status: null, signal: null },
+            backend: backendCapabilities,
+            cleanup: proof
+          });
+          assertCleanupProven(result, minimumGuarantee);
+        }
       } catch (error) {
         failures.push(latch(error, "CLEANUP_FAILED"));
       }
@@ -286,7 +501,13 @@ export function createProcessSupervisor({
       }
       try {
         await capabilities;
-        await backend.shutdown();
+        const evidence = await backend.shutdown();
+        if (evidence?.stopped !== true) {
+          throw new SupervisorInfrastructureError(
+            "SHUTDOWN_UNPROVEN",
+            "The backend did not prove that it stopped."
+          );
+        }
       } catch (error) {
         latch(error, "SHUTDOWN_FAILED");
       }
@@ -303,7 +524,6 @@ export function createProcessSupervisor({
   return {
     capabilities,
     run,
-    runAsync,
     spawnTracked,
     cleanupAll,
     shutdown,

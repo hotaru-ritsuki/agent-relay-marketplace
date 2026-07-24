@@ -149,16 +149,38 @@ function legacyRun(command, args, options = {}) {
 
 function normalizeRunArgs(command, args = [], options = {}) {
   if (command && typeof command === "object" && !Array.isArray(command)) {
-    return command;
+    return { ...command, shell: false };
   }
-  return { command, args, ...options };
+  const invocation = resolveTestCommand(command);
+  if (invocation.shell !== false) {
+    throw new TypeError(
+      `Supervised test command ${command} must resolve without a shell.`
+    );
+  }
+  return {
+    ...options,
+    command: invocation.command,
+    args,
+    shell: false
+  };
 }
 
 function normalizeSpawnArgs(command, args = [], options = {}) {
   if (command && typeof command === "object" && !Array.isArray(command)) {
-    return command;
+    return { ...command, shell: false };
   }
-  return { command, args, ...options };
+  const invocation = resolveTestCommand(command);
+  if (invocation.shell !== false) {
+    throw new TypeError(
+      `Supervised test command ${command} must resolve without a shell.`
+    );
+  }
+  return {
+    ...options,
+    command: invocation.command,
+    args,
+    shell: false
+  };
 }
 
 function compatibilityBackend() {
@@ -189,6 +211,7 @@ function compatibilityBackend() {
         });
         child.once("exit", (status, signal) => {
           resolve({
+            backend: "child-process",
             status,
             signal,
             stdout: undefined,
@@ -199,6 +222,7 @@ function compatibilityBackend() {
         child.once("close", (status, signal) => {
           if (spawnError) {
             resolve({
+              backend: "child-process",
               status,
               signal,
               stdout: undefined,
@@ -212,13 +236,26 @@ function compatibilityBackend() {
         child,
         pid: child.pid,
         root,
+        kill(signal) {
+          child.kill(signal);
+          return { backend: "child-process", stopped: true };
+        },
         cleanup: async () => {
           await legacyCleanupTrackedChildren();
-          return { level: "registered-drained" };
+          return {
+            backend: "child-process",
+            level: "registered-drained"
+          };
         }
       };
     },
-    cleanupAll: () => legacyCleanupTrackedChildren(),
+    async cleanupAll() {
+      await legacyCleanupTrackedChildren();
+      return {
+        backend: "child-process",
+        level: "registered-drained"
+      };
+    },
     async shutdown() {
       await legacyCleanupTrackedChildren();
       return { stopped: true };
@@ -228,12 +265,15 @@ function compatibilityBackend() {
 
 const testSupervisor = createProcessSupervisor({
   minimumGuarantee: "cooperative",
-  backendFactories: [compatibilityBackend],
-  syncBridge: (_runAsync, spec) =>
-    legacyRun(spec.command, spec.args ?? [], spec)
+  backendFactories: [compatibilityBackend]
 });
 
-export const run = (...args) => testSupervisor.run(normalizeRunArgs(...args));
+export const run = (...args) => {
+  const spec = normalizeRunArgs(...args);
+  const result = testSupervisor.run(spec);
+  registerRecordedChildren(spec.cwd);
+  return result;
+};
 export const spawnTracked = (...args) =>
   testSupervisor.spawnTracked(normalizeSpawnArgs(...args));
 export const cleanupTrackedChildren = () => testSupervisor.cleanupAll();

@@ -1,10 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import { EventEmitter } from "node:events";
 
 import {
   MAX_FRAME_BYTES,
   SupervisorInfrastructureError,
-  createProcessSupervisor
+  createProcessSupervisor,
+  runSynchronous
 } from "./process-supervisor/index.mjs";
 
 function fakeBackend({
@@ -28,7 +32,9 @@ function fakeBackend({
           backend: "fake",
           mode,
           containment: mode === "host-strict" ? "kernel" : "cooperative",
-          cleanupProof: cleanup.level,
+          cleanupProof: mode === "host-strict"
+            ? "kernel-drained"
+            : "registered-drained",
           supportsDetachedDescendants: true
         }
       };
@@ -45,10 +51,30 @@ function fakeBackend({
 }
 
 function createFakeSupervisor(backendOptions = {}, supervisorOptions = {}) {
+  const root = backendOptions.root ?? {
+    status: 0,
+    signal: null,
+    stdout: Buffer.from("ok"),
+    stderr: Buffer.alloc(0)
+  };
+  const cleanup = backendOptions.cleanup ?? { level: "registered-drained" };
   return createProcessSupervisor({
     platform: "test",
     backendFactories: [() => fakeBackend(backendOptions)],
-    syncBridge: (runAsync, spec) => runAsync(spec),
+    syncBridge(request) {
+      return {
+        capabilities: {
+          platform: "test",
+          backend: "fake",
+          mode: "cooperative",
+          containment: "cooperative",
+          cleanupProof: "registered-drained",
+          supportsDetachedDescendants: true
+        },
+        root: { backend: "fake", ...root },
+        cleanup: { backend: "fake", ...cleanup }
+      };
+    },
     ...supervisorOptions
   });
 }
@@ -66,7 +92,7 @@ test("host-strict rejects a cooperative backend", async () => {
   );
 });
 
-test("run returns a nonzero target status without throwing", async () => {
+test("run is synchronous and returns a nonzero target status without throwing", () => {
   const supervisor = createFakeSupervisor({
     root: {
       status: 17,
@@ -76,18 +102,19 @@ test("run returns a nonzero target status without throwing", async () => {
     }
   });
 
-  const result = await supervisor.run({ command: "tool", args: [] });
+  const result = supervisor.run({ command: "tool", args: [] });
 
+  assert.equal(result instanceof Promise, false);
   assert.equal(result.status, 17);
   assert.equal(result.stdout.toString(), "out");
   assert.equal(result.stderr.toString(), "err");
 });
 
-test("run throws when cleanup proof is missing", async () => {
+test("run throws when cleanup proof is missing", () => {
   const supervisor = createFakeSupervisor({ cleanup: { level: "missing" } });
 
-  await assert.rejects(
-    supervisor.run({ command: "tool", args: [] }),
+  assert.throws(
+    () => supervisor.run({ command: "tool", args: [] }),
     (error) => error instanceof SupervisorInfrastructureError &&
       error.code === "CLEANUP_UNPROVEN" &&
       error.result?.status === 0
@@ -178,12 +205,320 @@ test("shutdown refuses later launches", async () => {
 
 test("ignored operation failure is rethrown by assertHealthy", async () => {
   const supervisor = createFakeSupervisor({ cleanup: { level: "missing" } });
-  await assert.rejects(supervisor.run({ command: "tool", args: [] }));
+  assert.throws(() => supervisor.run({ command: "tool", args: [] }));
 
   assert.throws(
     () => supervisor.assertHealthy(),
     (error) => error.code === "CLEANUP_UNPROVEN"
   );
+});
+
+test("cleanupAll validates active lease proof before returning", async () => {
+  const supervisor = createFakeSupervisor({
+    cleanup: { level: "missing" },
+    root: new Promise(() => {})
+  });
+  const child = await supervisor.spawnTracked({ command: "tool", args: [] });
+  child.completion.catch(() => {});
+
+  await assert.rejects(
+    supervisor.cleanupAll(),
+    (error) => error.code === "CLEANUP_UNPROVEN"
+  );
+  assert.throws(
+    () => supervisor.assertHealthy(),
+    (error) => error.code === "CLEANUP_UNPROVEN"
+  );
+});
+
+test("shutdown rejects invalid backend stop evidence", async () => {
+  const supervisor = createFakeSupervisor({}, {
+    backendFactories: [() => fakeBackend({
+      shutdown: async () => ({ stopped: false })
+    })]
+  });
+
+  await assert.rejects(
+    supervisor.shutdown(),
+    (error) => error.code === "SHUTDOWN_UNPROVEN"
+  );
+});
+
+test("root errors reject completion with a structured result and latch", async () => {
+  const spawnError = Object.assign(new Error("missing executable"), {
+    code: "ENOENT"
+  });
+  const supervisor = createFakeSupervisor({
+    root: {
+      status: null,
+      signal: null,
+      stdout: undefined,
+      stderr: undefined,
+      error: spawnError
+    }
+  });
+  const child = await supervisor.spawnTracked({ command: "missing", args: [] });
+
+  await assert.rejects(
+    child.completion,
+    (error) => error.code === "ROOT_PROCESS_ERROR" &&
+      error.result?.error === spawnError
+  );
+  assert.throws(
+    () => supervisor.assertHealthy(),
+    (error) => error.code === "ROOT_PROCESS_ERROR"
+  );
+});
+
+test("spawnTracked always returns a coordinator-owned facade", async () => {
+  const rawChild = new EventEmitter();
+  rawChild.kill = () => true;
+  const supervisor = createFakeSupervisor({
+    launch(spec, context) {
+      return {
+        ...context.createFakeLaunch({
+          spec,
+          root: {
+            status: 3,
+            signal: null,
+            stdout: Buffer.alloc(0),
+            stderr: Buffer.alloc(0)
+          },
+          cleanup: { level: "registered-drained" }
+        }),
+        child: rawChild
+      };
+    }
+  });
+  const child = await supervisor.spawnTracked({ command: "tool", args: [] });
+  const events = [];
+  child.on("exit", () => events.push("exit"));
+  child.completion.finally(() => events.push("completion"));
+  child.on("close", () => events.push("close"));
+
+  assert.notEqual(child, rawChild);
+  await child.completion;
+  await new Promise((resolve) => child.once("close", resolve));
+  assert.deepEqual(events, ["exit", "completion", "close"]);
+});
+
+test("backend identity mismatch rejects proof and recorded-state correlation", async () => {
+  const supervisor = createFakeSupervisor({
+    cleanup: { level: "registered-drained", backend: "impostor" }
+  });
+
+  assert.throws(
+    () => supervisor.run({ command: "tool", args: [] }),
+    (error) => error.code === "BACKEND_IDENTITY_MISMATCH"
+  );
+});
+
+test("recorded state with a mismatched backend never correlates to a live lease", async () => {
+  let recorded;
+  const supervisor = createProcessSupervisor({
+    platform: "test",
+    backendFactories: [() => fakeBackend({
+      root: new Promise(() => {}),
+      launch(spec, context) {
+        recorded = {
+          epoch: spec.epoch,
+          runId: spec.runId,
+          nonce: spec.nonce,
+          backend: "impostor",
+          pid: 1234
+        };
+        return context.createFakeLaunch({
+          spec,
+          root: new Promise(() => {}),
+          cleanup: { level: "registered-drained" }
+        });
+      }
+    })],
+    discoverRecordedProcesses: async () => recorded ? [recorded] : [],
+    syncBridge() {
+      throw new Error("not used");
+    }
+  });
+  const child = await supervisor.spawnTracked({ command: "tool", args: [] });
+  child.completion.catch(() => {});
+
+  await assert.rejects(
+    supervisor.cleanupAll(),
+    (error) => error.code === "UNREGISTERED_RECORDED_PROCESS"
+  );
+});
+
+test("capability inconsistency latches selection failure", async () => {
+  const supervisor = createFakeSupervisor({}, {
+    backendFactories: [() => ({
+      ...fakeBackend(),
+      async probe() {
+        return {
+          available: true,
+          capabilities: {
+            platform: "wrong",
+            backend: "fake",
+            mode: "cooperative",
+            containment: "cooperative",
+            cleanupProof: "registered-drained",
+            supportsDetachedDescendants: true
+          }
+        };
+      }
+    })]
+  });
+
+  await assert.rejects(
+    supervisor.capabilities,
+    (error) => error.code === "CAPABILITY_INVALID"
+  );
+  assert.throws(
+    () => supervisor.assertHealthy(),
+    (error) => error.code === "CAPABILITY_INVALID"
+  );
+});
+
+test("probe failures latch the first infrastructure error", async () => {
+  const supervisor = createFakeSupervisor({}, {
+    backendFactories: [() => ({
+      async probe() {
+        throw new Error("probe transport lost");
+      }
+    })]
+  });
+  await assert.rejects(
+    supervisor.capabilities,
+    (error) => error.code === "CAPABILITY_PROBE_FAILED"
+  );
+  assert.throws(
+    () => supervisor.assertHealthy(),
+    (error) => error.code === "CAPABILITY_PROBE_FAILED"
+  );
+});
+
+test("public run and spawn reject shell-enabled specifications", async () => {
+  const supervisor = createFakeSupervisor();
+  assert.throws(
+    () => supervisor.run({ command: "tool", args: [], shell: true }),
+    (error) => error.code === "SHELL_UNSAFE"
+  );
+  await assert.rejects(
+    supervisor.spawnTracked({ command: "tool", args: [], shell: true }),
+    (error) => error.code === "SHELL_UNSAFE"
+  );
+});
+
+test("coordinator centrally rejects malformed root and proof payloads", async () => {
+  const malformedRoot = createFakeSupervisor({
+    root: {
+      status: "zero",
+      signal: null,
+      stdout: Buffer.alloc(0),
+      stderr: Buffer.alloc(0)
+    }
+  });
+  await assert.rejects(
+    (await malformedRoot.spawnTracked({ command: "tool", args: [] })).completion,
+    (error) => error.code === "PROTOCOL_INVALID_MESSAGE"
+  );
+
+  const oversizedOutput = createFakeSupervisor({
+    root: {
+      status: 0,
+      signal: null,
+      stdout: Buffer.alloc(MAX_FRAME_BYTES + 1),
+      stderr: Buffer.alloc(0)
+    }
+  });
+  assert.throws(
+    () => oversizedOutput.run({ command: "tool", args: [] }),
+    (error) => error.code === "PROTOCOL_FRAME_TOO_LARGE"
+  );
+});
+
+test("bounded synchronous worker removes secret files and exits", () => {
+  const before = new Set(
+    fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith("process-supervisor-"))
+  );
+  const result = runSynchronous({
+    spec: {
+      command: process.execPath,
+      args: ["-e", "process.stdout.write('worker-ok')"],
+      shell: false,
+      encoding: "utf8"
+    },
+    backendSelection: { type: "child-process" },
+    platform: process.platform,
+    mode: "auto",
+    minimumGuarantee: "cooperative",
+    epoch: "epoch",
+    runId: "run",
+    nonce: "nonce"
+  });
+  assert.equal(result.root.stdout, "worker-ok");
+
+  assert.throws(
+    () => runSynchronous({
+      spec: {
+        command: process.execPath,
+        args: [],
+        shell: false,
+        env: { SECRET: "x".repeat(MAX_FRAME_BYTES) }
+      },
+      backendSelection: { type: "child-process" },
+      platform: process.platform,
+      mode: "auto",
+      minimumGuarantee: "cooperative",
+      epoch: "epoch",
+      runId: "oversized",
+      nonce: "nonce"
+    }),
+    (error) => error.code === "PROTOCOL_FRAME_TOO_LARGE"
+  );
+
+  const after = fs.readdirSync(os.tmpdir())
+    .filter((name) => name.startsWith("process-supervisor-"));
+  assert.deepEqual(after.filter((name) => !before.has(name)), []);
+});
+
+test("parent teardown revalidates every synchronous terminal proof", async () => {
+  const proof = { backend: "fake", level: "registered-drained" };
+  const supervisor = createProcessSupervisor({
+    platform: "test",
+    backendFactories: [() => fakeBackend()],
+    syncBridge() {
+      return {
+        capabilities: {
+          platform: "test",
+          backend: "fake",
+          mode: "cooperative",
+          containment: "cooperative",
+          cleanupProof: "registered-drained",
+          supportsDetachedDescendants: true
+        },
+        root: {
+          backend: "fake",
+          status: 0,
+          signal: null,
+          stdout: Buffer.alloc(0),
+          stderr: Buffer.alloc(0)
+        },
+        cleanup: proof
+      };
+    }
+  });
+  assert.equal(supervisor.run({ command: "tool", args: [] }).status, 0);
+  proof.level = "missing";
+
+  await assert.rejects(
+    supervisor.cleanupAll(),
+    (error) => error.code === "CLEANUP_UNPROVEN"
+  );
+});
+
+test("undocumented runAsync is not exposed", () => {
+  const supervisor = createFakeSupervisor();
+  assert.equal("runAsync" in supervisor, false);
 });
 
 test("protocol messages over the byte cap poison the epoch", async () => {
@@ -199,7 +534,7 @@ test("protocol messages over the byte cap poison the epoch", async () => {
   });
 
   await assert.rejects(
-    supervisor.run({ command: "tool", args: [] }),
+    supervisor.spawnTracked({ command: "tool", args: [] }),
     (error) => error.code === "PROTOCOL_FRAME_TOO_LARGE"
   );
   assert.throws(
@@ -244,6 +579,13 @@ test("helpers expose explicit health and suite teardown wrappers", async () => {
   assert.equal(typeof helpers.cleanupTrackedChildren, "function");
   assert.equal(typeof helpers.assertSupervisorHealthy, "function");
   assert.equal(typeof helpers.installSupervisorTeardown, "function");
+  const normalizedShell = helpers.run(
+    process.execPath,
+    ["-e", ""],
+    { shell: true }
+  );
+  assert.equal(normalizedShell.status, 0);
+  assert.equal(normalizedShell.supervisor.backend, "child-process");
 
   let teardown;
   helpers.installSupervisorTeardown((callback) => {
