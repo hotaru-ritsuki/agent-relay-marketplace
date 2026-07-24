@@ -2,9 +2,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 import { resolveStateDir } from "../scripts/lib/state.mjs";
+import { createProcessSupervisor } from "./process-supervisor/index.mjs";
 
 process.env.CLAUDE_PLUGIN_DATA = fs.mkdtempSync(
   path.join(os.tmpdir(), "codex-plugin-cc-tests-"),
@@ -80,13 +81,23 @@ function terminateProcessTree(pid) {
   }
 }
 
-export function trackChild(child) {
+/**
+ * @deprecated Use spawnTracked. This compatibility seam provides only the
+ * cooperative minimum guarantee.
+ */
+export function trackChild(
+  child,
+  { minimumGuarantee = "cooperative" } = {}
+) {
+  if (minimumGuarantee !== "cooperative") {
+    throw new TypeError("trackChild supports only the cooperative guarantee.");
+  }
   trackedChildren.add(child);
   child.once("exit", () => trackedChildren.delete(child));
   return child;
 }
 
-export async function cleanupTrackedChildren() {
+async function legacyCleanupTrackedChildren() {
   for (const child of trackedChildren) {
     if (child.exitCode === null) {
       child.kill();
@@ -120,7 +131,7 @@ export function resolveTestCommand(command) {
   return { command, shell: true };
 }
 
-export function run(command, args, options = {}) {
+function legacyRun(command, args, options = {}) {
   const invocation = options.shell === undefined
     ? resolveTestCommand(command)
     : { command, shell: options.shell };
@@ -134,6 +145,111 @@ export function run(command, args, options = {}) {
   });
   registerRecordedChildren(options.cwd);
   return result;
+}
+
+function normalizeRunArgs(command, args = [], options = {}) {
+  if (command && typeof command === "object" && !Array.isArray(command)) {
+    return command;
+  }
+  return { command, args, ...options };
+}
+
+function normalizeSpawnArgs(command, args = [], options = {}) {
+  if (command && typeof command === "object" && !Array.isArray(command)) {
+    return command;
+  }
+  return { command, args, ...options };
+}
+
+function compatibilityBackend() {
+  return {
+    async probe() {
+      return {
+        available: true,
+        capabilities: {
+          platform: process.platform,
+          backend: "child-process",
+          mode: "cooperative",
+          containment: "cooperative",
+          cleanupProof: "registered-drained",
+          supportsDetachedDescendants: false
+        }
+      };
+    },
+    async launch(spec) {
+      const child = trackChild(spawn(
+        spec.command,
+        spec.args ?? [],
+        spec
+      ));
+      let spawnError;
+      const root = new Promise((resolve) => {
+        child.once("error", (error) => {
+          spawnError = error;
+        });
+        child.once("exit", (status, signal) => {
+          resolve({
+            status,
+            signal,
+            stdout: undefined,
+            stderr: undefined,
+            error: spawnError
+          });
+        });
+        child.once("close", (status, signal) => {
+          if (spawnError) {
+            resolve({
+              status,
+              signal,
+              stdout: undefined,
+              stderr: undefined,
+              error: spawnError
+            });
+          }
+        });
+      });
+      return {
+        child,
+        pid: child.pid,
+        root,
+        cleanup: async () => {
+          await legacyCleanupTrackedChildren();
+          return { level: "registered-drained" };
+        }
+      };
+    },
+    cleanupAll: () => legacyCleanupTrackedChildren(),
+    async shutdown() {
+      await legacyCleanupTrackedChildren();
+      return { stopped: true };
+    }
+  };
+}
+
+const testSupervisor = createProcessSupervisor({
+  minimumGuarantee: "cooperative",
+  backendFactories: [compatibilityBackend],
+  syncBridge: (_runAsync, spec) =>
+    legacyRun(spec.command, spec.args ?? [], spec)
+});
+
+export const run = (...args) => testSupervisor.run(normalizeRunArgs(...args));
+export const spawnTracked = (...args) =>
+  testSupervisor.spawnTracked(normalizeSpawnArgs(...args));
+export const cleanupTrackedChildren = () => testSupervisor.cleanupAll();
+export const assertSupervisorHealthy = () => testSupervisor.assertHealthy();
+
+export function installSupervisorTeardown(afterHook) {
+  afterHook(async () => {
+    let shutdownError;
+    try {
+      await testSupervisor.shutdown();
+    } catch (error) {
+      shutdownError = error;
+    }
+    testSupervisor.assertHealthy();
+    if (shutdownError) throw shutdownError;
+  });
 }
 
 export function initGitRepo(cwd) {
