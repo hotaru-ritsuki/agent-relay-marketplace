@@ -83,7 +83,8 @@ test("state index and job JSON publish atomically while a concurrent reader poll
     });
   `;
   const child = spawn(process.execPath, ["--input-type=module", "-e", source], {
-    stdio: ["ignore", "ignore", "pipe"]
+    stdio: ["ignore", "ignore", "pipe"],
+    shell: false
   });
   let stderr = "";
   child.stderr.setEncoding("utf8");
@@ -110,8 +111,14 @@ test("state index and job JSON publish atomically while a concurrent reader poll
     assert.equal(exitCode, 0, stderr);
     assert.equal(readJobFile(jobFile).generation, "new");
     assert.deepEqual(
-      fs.readdirSync(path.dirname(resolveStateFile(workspace)))
-        .filter((entry) => entry.endsWith(".tmp")),
+      [
+        path.dirname(resolveStateFile(workspace)),
+        path.dirname(jobFile)
+      ].flatMap((directory) =>
+        fs.readdirSync(directory)
+          .filter((entry) => entry.endsWith(".tmp"))
+          .map((entry) => path.join(directory, entry))
+      ),
       []
     );
   } finally {
@@ -138,6 +145,48 @@ test("atomic state and job replacement preserves existing permission bits", () =
   saveState(workspace, { jobs: [{ id: jobId, generation: 2 }] });
   writeJobFile(workspace, jobId, { id: jobId, generation: 2 });
 
+  assert.equal(fs.statSync(stateFile).mode & 0o777, stateMode);
+  assert.equal(fs.statSync(jobFile).mode & 0o777, jobMode);
+});
+
+test("atomic replacement preserves exact permission bits under a restrictive umask", async () => {
+  const workspace = makeTempDir();
+  const jobId = "restrictive-umask";
+  saveState(workspace, { jobs: [{ id: jobId, generation: 1 }] });
+  const stateFile = resolveStateFile(workspace);
+  const jobFile = writeJobFile(workspace, jobId, { id: jobId, generation: 1 });
+  fs.chmodSync(stateFile, 0o666);
+  fs.chmodSync(jobFile, 0o666);
+  const stateMode = fs.statSync(stateFile).mode & 0o777;
+  const jobMode = fs.statSync(jobFile).mode & 0o777;
+  const stateModule = new URL("../scripts/lib/state.mjs", import.meta.url).href;
+  const source = `
+    import fs from "node:fs";
+    process.umask(0o222);
+    const originalOpenSync = fs.openSync;
+    fs.openSync = (filePath, flags, mode) =>
+      originalOpenSync(filePath, flags, mode & ~process.umask());
+    const { saveState, writeJobFile } = await import(${JSON.stringify(stateModule)});
+    saveState(${JSON.stringify(workspace)}, {
+      jobs: [{ id: ${JSON.stringify(jobId)}, generation: 2 }]
+    });
+    writeJobFile(${JSON.stringify(workspace)}, ${JSON.stringify(jobId)}, {
+      id: ${JSON.stringify(jobId)}, generation: 2
+    });
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", source], {
+    stdio: ["ignore", "ignore", "pipe"],
+    shell: false
+  });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+
+  const exitCode = await new Promise((resolve) => child.once("exit", resolve));
+
+  assert.equal(exitCode, 0, stderr);
   assert.equal(fs.statSync(stateFile).mode & 0o777, stateMode);
   assert.equal(fs.statSync(jobFile).mode & 0o777, jobMode);
 });

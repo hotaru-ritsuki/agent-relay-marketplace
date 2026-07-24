@@ -1238,7 +1238,8 @@ test("task worker waits for both job-file and index publication", async () => {
       cwd: repo,
       env: buildEnv(binDir),
       stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true
+      windowsHide: true,
+      shell: false
     }
   ));
   let stderr = "";
@@ -1311,7 +1312,8 @@ test("task worker rejects stale index identity", async () => {
       cwd: repo,
       env: buildEnv(binDir),
       stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true
+      windowsHide: true,
+      shell: false
     }
   ));
   let stderr = "";
@@ -1392,7 +1394,8 @@ test("task worker rejects malformed index state", async () => {
       cwd: repo,
       env: buildEnv(binDir),
       stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true
+      windowsHide: true,
+      shell: false
     }
   ));
   let stderr = "";
@@ -1453,7 +1456,8 @@ test("task worker rejects mismatched stored request identity", async () => {
       cwd: repo,
       env: buildEnv(binDir),
       stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true
+      windowsHide: true,
+      shell: false
     }
   ));
   let stderr = "";

@@ -191,6 +191,7 @@ function atomicWriteJson(filePath, payload) {
       }
     }
     descriptor = fs.openSync(temporaryFile, "wx", mode);
+    fs.fchmodSync(descriptor, mode);
     fs.writeFileSync(descriptor, contents, "utf8");
     fs.fsyncSync(descriptor);
     fs.closeSync(descriptor);
