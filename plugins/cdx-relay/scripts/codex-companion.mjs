@@ -30,8 +30,10 @@ import {
   generateJobId,
   getConfig,
   listJobs,
+  readStateIndexStrict,
   setConfig,
   upsertJob,
+  validateStateIndexPublicationCandidate,
   writeJobFile
 } from "./lib/state.mjs";
 import {
@@ -878,8 +880,33 @@ async function handleTaskWorker(argv) {
   let indexedJob = null;
   while (Date.now() < publicationDeadline) {
     storedJob = readStoredJob(workspaceRoot, jobId);
-    indexedJob = listJobs(workspaceRoot).find((job) => job.id === jobId) ?? null;
-    if (storedJob && indexedJob) {
+    if (storedJob && storedJob.id !== jobId) {
+      throw new Error(`Stored job ${storedJob.id ?? "<missing id>"} does not match requested job ${jobId}.`);
+    }
+    if (storedJob) {
+      const request = storedJob.request;
+      if (!request || typeof request !== "object") {
+        throw new Error(`Stored job ${jobId} is missing its task request payload.`);
+      }
+      if (!request.jobId) {
+        throw new Error(`Stored task request is missing its job id for ${jobId}.`);
+      }
+      if (request.jobId !== jobId) {
+        throw new Error(`Stored task request ${request.jobId} does not match requested job ${jobId}.`);
+      }
+    }
+    indexedJob = readStateIndexStrict(workspaceRoot)?.jobs.find((job) => job.id === jobId) ?? null;
+    if (indexedJob) {
+      validateStateIndexPublicationCandidate(workspaceRoot, indexedJob);
+    }
+    const publicationMatches =
+      storedJob?.id === jobId &&
+      storedJob.pid === process.pid &&
+      storedJob.request?.jobId === jobId &&
+      indexedJob?.id === jobId &&
+      indexedJob.pid === process.pid &&
+      indexedJob.request?.jobId === jobId;
+    if (publicationMatches) {
       break;
     }
     await sleep(50);
@@ -887,20 +914,18 @@ async function handleTaskWorker(argv) {
   if (!storedJob) {
     throw new Error(`No stored job found for ${jobId} before the publication deadline.`);
   }
-  if (!indexedJob) {
-    throw new Error(`No state index entry found for ${jobId} before the publication deadline.`);
+  if (storedJob.pid !== process.pid) {
+    throw new Error(`No stored job publication for current worker ${process.pid} found for ${jobId} before the publication deadline.`);
   }
-  if (storedJob.id !== jobId) {
-    throw new Error(`Stored job ${storedJob.id ?? "<missing id>"} does not match requested job ${jobId}.`);
+  if (
+    !indexedJob ||
+    indexedJob.pid !== process.pid ||
+    indexedJob.request?.jobId !== jobId
+  ) {
+    throw new Error(`No state index publication for current worker ${process.pid} found for ${jobId} before the publication deadline.`);
   }
 
   const request = storedJob.request;
-  if (!request || typeof request !== "object") {
-    throw new Error(`Stored job ${jobId} is missing its task request payload.`);
-  }
-  if (request.jobId && request.jobId !== jobId) {
-    throw new Error(`Stored task request ${request.jobId} does not match requested job ${jobId}.`);
-  }
 
   const { logFile, progress } = createTrackedProgress(
     {

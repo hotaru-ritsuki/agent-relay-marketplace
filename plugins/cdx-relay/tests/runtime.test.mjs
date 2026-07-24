@@ -1218,7 +1218,7 @@ test("task --resume-id background round-trip preserves the exact thread", () => 
   assert.equal(finishedJob.request.resumeId, "thr_exact");
 });
 
-test("task worker waits for its queued record to be published", async () => {
+test("task worker waits for both job-file and index publication", async () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   const statePath = path.join(binDir, "fake-codex-state.json");
@@ -1289,6 +1289,212 @@ test("task worker waits for its queued record to be published", async () => {
   );
   assert.equal(finishedJob.status, "completed");
   assert.equal(finishedJob.threadId, "thr_exact");
+});
+
+test("task worker rejects stale index identity", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  seedFakeCodexThread(statePath, repo);
+
+  const jobId = "task-stale-index";
+  const stateDir = resolveStateDir(repo);
+  const logFile = path.join(stateDir, "jobs", `${jobId}.log`);
+  fs.mkdirSync(path.dirname(logFile), { recursive: true });
+  fs.writeFileSync(logFile, "", "utf8");
+  const child = trackChild(spawn(
+    process.execPath,
+    [SCRIPT, "task-worker", "--cwd", repo, "--job-id", jobId],
+    {
+      cwd: repo,
+      env: buildEnv(binDir),
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true
+    }
+  ));
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const exitPromise = new Promise((resolve) => child.once("exit", resolve));
+  const queuedRecord = {
+    id: jobId,
+    kind: "task",
+    kindLabel: "rescue",
+    title: "Codex Resume",
+    workspaceRoot: repo,
+    jobClass: "task",
+    summary: "continue exact thread",
+    write: false,
+    createdAt: new Date().toISOString(),
+    status: "queued",
+    phase: "queued",
+    pid: child.pid,
+    logFile,
+    request: {
+      cwd: repo,
+      model: null,
+      effort: null,
+      prompt: "continue exact thread",
+      write: false,
+      resumeLast: false,
+      resumeId: "thr_exact",
+      jobId
+    }
+  };
+  writeJobFile(repo, jobId, queuedRecord);
+  upsertJob(repo, {
+    ...queuedRecord,
+    pid: child.pid + 1,
+    request: { ...queuedRecord.request, jobId: "task-stale-publication" }
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  const beforeCurrentIndex = JSON.parse(
+    fs.readFileSync(path.join(stateDir, "jobs", `${jobId}.json`), "utf8")
+  );
+  assert.equal(beforeCurrentIndex.status, "queued");
+
+  upsertJob(repo, queuedRecord);
+  const exitCode = await exitPromise;
+  assert.equal(exitCode, 0, stderr);
+  const status = run("node", [SCRIPT, "status", jobId, "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(status.status, 0, status.stderr);
+  const finishedJob = JSON.parse(
+    fs.readFileSync(path.join(stateDir, "jobs", `${jobId}.json`), "utf8")
+  );
+  assert.equal(finishedJob.status, "completed");
+  assert.equal(finishedJob.threadId, "thr_exact");
+});
+
+test("task worker rejects malformed index state", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const jobId = "task-corrupt-state-index";
+  const stateDir = resolveStateDir(repo);
+  const logFile = path.join(stateDir, "jobs", `${jobId}.log`);
+  fs.mkdirSync(path.dirname(logFile), { recursive: true });
+  fs.writeFileSync(logFile, "", "utf8");
+  const startedAt = Date.now();
+  const child = trackChild(spawn(
+    process.execPath,
+    [SCRIPT, "task-worker", "--cwd", repo, "--job-id", jobId],
+    {
+      cwd: repo,
+      env: buildEnv(binDir),
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true
+    }
+  ));
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const queuedRecord = {
+    id: jobId,
+    kind: "task",
+    title: "Codex Task",
+    workspaceRoot: repo,
+    jobClass: "task",
+    summary: "reject corrupt state",
+    write: false,
+    createdAt: new Date().toISOString(),
+    status: "queued",
+    phase: "queued",
+    pid: child.pid,
+    logFile,
+    request: {
+      cwd: repo,
+      model: null,
+      effort: null,
+      prompt: "reject corrupt state",
+      write: false,
+      resumeLast: false,
+      resumeId: null,
+      jobId
+    }
+  };
+  writeJobFile(repo, jobId, queuedRecord);
+  fs.writeFileSync(path.join(stateDir, "state.json"), "{ malformed", "utf8");
+
+  const exitCode = await new Promise((resolve) => child.once("exit", resolve));
+
+  assert.equal(exitCode, 1);
+  assert.ok(Date.now() - startedAt < 2000, "corruption must bypass the publication timeout");
+  assert.match(stderr, /ERR_STATE_INDEX_CORRUPT/);
+  assert.match(stderr, /malformed JSON/);
+});
+
+test("task worker rejects mismatched stored request identity", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const jobId = "task-mismatched-request-id";
+  const stateDir = resolveStateDir(repo);
+  const logFile = path.join(stateDir, "jobs", `${jobId}.log`);
+  fs.mkdirSync(path.dirname(logFile), { recursive: true });
+  fs.writeFileSync(logFile, "", "utf8");
+  const child = trackChild(spawn(
+    process.execPath,
+    [SCRIPT, "task-worker", "--cwd", repo, "--job-id", jobId],
+    {
+      cwd: repo,
+      env: buildEnv(binDir),
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true
+    }
+  ));
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const exitPromise = new Promise((resolve) => child.once("exit", resolve));
+  const queuedRecord = {
+    id: jobId,
+    kind: "task",
+    title: "Codex Task",
+    workspaceRoot: repo,
+    jobClass: "task",
+    summary: "test immutable request identity",
+    write: false,
+    createdAt: new Date().toISOString(),
+    status: "queued",
+    phase: "queued",
+    pid: child.pid,
+    logFile,
+    request: {
+      cwd: repo,
+      model: null,
+      effort: null,
+      prompt: "test immutable request identity",
+      write: false,
+      resumeLast: false,
+      resumeId: null,
+      jobId: "task-other-request-id"
+    }
+  };
+  writeJobFile(repo, jobId, queuedRecord);
+  upsertJob(repo, queuedRecord);
+
+  const exitCode = await exitPromise;
+  assert.equal(exitCode, 1);
+  assert.match(
+    stderr,
+    /Stored task request task-other-request-id does not match requested job task-mismatched-request-id/
+  );
 });
 
 test("task worker rejects a published job record with a mismatched id", async () => {

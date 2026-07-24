@@ -1,11 +1,220 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import test from "node:test";
 import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
-import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../scripts/lib/state.mjs";
+import {
+  readStateIndexStrict,
+  readJobFile,
+  resolveJobFile,
+  resolveJobLogFile,
+  resolveStateDir,
+  resolveStateFile,
+  saveState,
+  validateStateIndexPublicationCandidate,
+  writeJobFile
+} from "../scripts/lib/state.mjs";
+
+async function waitForFile(filePath) {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(filePath)) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${filePath}`);
+}
+
+test("strict state-index reads distinguish absence from malformed content", () => {
+  const workspace = makeTempDir();
+  const stateFile = resolveStateFile(workspace);
+
+  assert.equal(readStateIndexStrict(workspace), null);
+
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+  fs.writeFileSync(stateFile, "{ definitely-not-json", "utf8");
+
+  assert.throws(
+    () => readStateIndexStrict(workspace),
+    (error) =>
+      error?.code === "ERR_STATE_INDEX_CORRUPT" &&
+      error?.stateFile === stateFile &&
+      /malformed JSON/.test(error.message)
+  );
+});
+
+test("state index and job JSON publish atomically while a concurrent reader polls", async () => {
+  const workspace = makeTempDir();
+  const jobId = "atomic-publication";
+  saveState(workspace, {
+    jobs: [{ id: jobId, status: "queued", generation: "old" }]
+  });
+  const jobFile = writeJobFile(workspace, jobId, {
+    id: jobId,
+    status: "queued",
+    generation: "old"
+  });
+  const markerBase = path.join(workspace, "rename-ready");
+  const releaseBase = path.join(workspace, "rename-release");
+  const stateModule = new URL("../scripts/lib/state.mjs", import.meta.url).href;
+  const source = `
+    import fs from "node:fs";
+    const originalRename = fs.renameSync;
+    let renameCount = 0;
+    fs.renameSync = (from, to) => {
+      renameCount += 1;
+      fs.writeFileSync(${JSON.stringify(markerBase)} + "." + renameCount, "ready");
+      const release = ${JSON.stringify(releaseBase)} + "." + renameCount;
+      while (!fs.existsSync(release)) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+      }
+      return originalRename(from, to);
+    };
+    const { saveState, writeJobFile } = await import(${JSON.stringify(stateModule)});
+    saveState(${JSON.stringify(workspace)}, {
+      jobs: [{ id: ${JSON.stringify(jobId)}, status: "running", generation: "new" }]
+    });
+    writeJobFile(${JSON.stringify(workspace)}, ${JSON.stringify(jobId)}, {
+      id: ${JSON.stringify(jobId)}, status: "running", generation: "new"
+    });
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", source], {
+    stdio: ["ignore", "ignore", "pipe"]
+  });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  let exited = false;
+  child.once("exit", () => {
+    exited = true;
+  });
+
+  try {
+    await waitForFile(`${markerBase}.1`);
+    assert.equal(readStateIndexStrict(workspace).jobs[0].generation, "old");
+    assert.equal(readJobFile(jobFile).generation, "old");
+    fs.writeFileSync(`${releaseBase}.1`, "release");
+
+    await waitForFile(`${markerBase}.2`);
+    assert.equal(readStateIndexStrict(workspace).jobs[0].generation, "new");
+    assert.equal(readJobFile(jobFile).generation, "old");
+    fs.writeFileSync(`${releaseBase}.2`, "release");
+
+    const exitCode = await new Promise((resolve) => child.once("exit", resolve));
+    assert.equal(exitCode, 0, stderr);
+    assert.equal(readJobFile(jobFile).generation, "new");
+    assert.deepEqual(
+      fs.readdirSync(path.dirname(resolveStateFile(workspace)))
+        .filter((entry) => entry.endsWith(".tmp")),
+      []
+    );
+  } finally {
+    fs.writeFileSync(`${releaseBase}.1`, "release");
+    fs.writeFileSync(`${releaseBase}.2`, "release");
+    if (!exited) {
+      child.kill("SIGKILL");
+      await new Promise((resolve) => child.once("exit", resolve));
+    }
+  }
+});
+
+test("atomic state and job replacement preserves existing permission bits", () => {
+  const workspace = makeTempDir();
+  const jobId = "permission-preservation";
+  saveState(workspace, { jobs: [{ id: jobId, generation: 1 }] });
+  const stateFile = resolveStateFile(workspace);
+  const jobFile = writeJobFile(workspace, jobId, { id: jobId, generation: 1 });
+  fs.chmodSync(stateFile, 0o640);
+  fs.chmodSync(jobFile, 0o640);
+  const stateMode = fs.statSync(stateFile).mode & 0o777;
+  const jobMode = fs.statSync(jobFile).mode & 0o777;
+
+  saveState(workspace, { jobs: [{ id: jobId, generation: 2 }] });
+  writeJobFile(workspace, jobId, { id: jobId, generation: 2 });
+
+  assert.equal(fs.statSync(stateFile).mode & 0o777, stateMode);
+  assert.equal(fs.statSync(jobFile).mode & 0o777, jobMode);
+});
+
+test("strict state-index reads reject corrupt job entry schemas", () => {
+  const invalidStates = [
+    null,
+    {},
+    { jobs: [null] },
+    { jobs: [{}] },
+    { jobs: [{ id: "", request: { jobId: "task" } }] },
+    { jobs: [{ id: "task", request: { jobId: "" } }] },
+    { jobs: [{ id: "task", pid: 0, request: { jobId: "task" } }] },
+    { jobs: [{ id: "task", pid: "123", request: { jobId: "task" } }] }
+  ];
+
+  for (const [index, state] of invalidStates.entries()) {
+    const workspace = makeTempDir();
+    const stateFile = resolveStateFile(workspace);
+    fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+    fs.writeFileSync(stateFile, JSON.stringify(state), "utf8");
+
+    assert.throws(
+      () => readStateIndexStrict(workspace),
+      (error) =>
+        error?.code === "ERR_STATE_INDEX_CORRUPT" &&
+        error?.stateFile === stateFile &&
+        /required schema/.test(error.message),
+      `invalid state case ${index}`
+    );
+  }
+});
+
+test("strict state-index reads accept valid mixed historical records", () => {
+  const workspace = makeTempDir();
+  const stateFile = resolveStateFile(workspace);
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+  fs.writeFileSync(
+    stateFile,
+    JSON.stringify({
+      jobs: [
+        { id: "historical-no-request", pid: null, status: "completed" },
+        { id: "historical-null-request", request: null, status: "failed" },
+        {
+          id: "current-shape",
+          pid: 123,
+          request: { jobId: "current-shape" },
+          status: "running"
+        }
+      ]
+    }),
+    "utf8"
+  );
+
+  const state = readStateIndexStrict(workspace);
+
+  assert.equal(state.jobs.length, 3);
+  assert.equal(state.jobs[0].pid, null);
+  assert.equal(state.jobs[1].request, null);
+});
+
+test("publication candidates require current pid and request identity", () => {
+  const workspace = makeTempDir();
+
+  for (const candidate of [
+    { id: "candidate", pid: null, request: { jobId: "candidate" } },
+    { id: "candidate", pid: 123, request: null },
+    { id: "candidate", pid: 123, request: {} }
+  ]) {
+    assert.throws(
+      () => validateStateIndexPublicationCandidate(workspace, candidate),
+      (error) =>
+        error?.code === "ERR_STATE_INDEX_CORRUPT" &&
+        /publication candidate/.test(error.message)
+    );
+  }
+});
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();

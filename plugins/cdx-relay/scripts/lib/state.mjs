@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,6 +11,14 @@ const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
+
+class StateIndexCorruptionError extends Error {
+  constructor(message, stateFile, options) {
+    super(`ERR_STATE_INDEX_CORRUPT: ${message}`, options);
+    this.code = "ERR_STATE_INDEX_CORRUPT";
+    this.stateFile = stateFile;
+  }
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -77,6 +85,82 @@ export function loadState(cwd) {
   }
 }
 
+export function readStateIndexStrict(cwd) {
+  const stateFile = resolveStateFile(cwd);
+  if (!fs.existsSync(stateFile)) {
+    return null;
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  } catch (cause) {
+    throw new StateIndexCorruptionError(
+      `State index ${stateFile} contains malformed JSON.`,
+      stateFile,
+      { cause }
+    );
+  }
+  const validJob = (job) =>
+    job !== null &&
+    typeof job === "object" &&
+    !Array.isArray(job) &&
+    typeof job.id === "string" &&
+    job.id.length > 0 &&
+    (
+      job.request === undefined ||
+      job.request === null ||
+      (
+        typeof job.request === "object" &&
+        !Array.isArray(job.request) &&
+        (
+          job.request.jobId === undefined ||
+          (
+            typeof job.request.jobId === "string" &&
+            job.request.jobId.length > 0
+          )
+        )
+      )
+    ) &&
+    (
+      job.pid === undefined ||
+      job.pid === null ||
+      (Number.isInteger(job.pid) && job.pid > 0)
+    );
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    !Array.isArray(parsed.jobs) ||
+    !parsed.jobs.every(validJob)
+  ) {
+    throw new StateIndexCorruptionError(
+      `State index ${stateFile} does not match the required schema.`,
+      stateFile
+    );
+  }
+  return parsed;
+}
+
+export function validateStateIndexPublicationCandidate(cwd, job) {
+  if (
+    !Number.isInteger(job?.pid) ||
+    job.pid <= 0 ||
+    !job.request ||
+    typeof job.request !== "object" ||
+    Array.isArray(job.request) ||
+    typeof job.request.jobId !== "string" ||
+    job.request.jobId.length === 0
+  ) {
+    const stateFile = resolveStateFile(cwd);
+    throw new StateIndexCorruptionError(
+      `State index ${stateFile} publication candidate does not include a valid pid and request job id.`,
+      stateFile
+    );
+  }
+  return job;
+}
+
 function pruneJobs(jobs) {
   return [...jobs]
     .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")))
@@ -86,6 +170,48 @@ function pruneJobs(jobs) {
 function removeFileIfExists(filePath) {
   if (filePath && fs.existsSync(filePath)) {
     fs.unlinkSync(filePath);
+  }
+}
+
+function atomicWriteJson(filePath, payload) {
+  const contents = `${JSON.stringify(payload, null, 2)}\n`;
+  const directory = path.dirname(filePath);
+  const temporaryFile = path.join(
+    directory,
+    `.${path.basename(filePath)}.${process.pid}.${randomUUID()}.tmp`
+  );
+  let descriptor;
+  try {
+    let mode = 0o600;
+    try {
+      mode = fs.statSync(filePath).mode & 0o777;
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
+    descriptor = fs.openSync(temporaryFile, "wx", mode);
+    fs.writeFileSync(descriptor, contents, "utf8");
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = undefined;
+    fs.renameSync(temporaryFile, filePath);
+  } catch (error) {
+    if (descriptor !== undefined) {
+      try {
+        fs.closeSync(descriptor);
+      } catch {
+        // Preserve the publication failure below.
+      }
+    }
+    try {
+      fs.unlinkSync(temporaryFile);
+    } catch (cleanupError) {
+      if (cleanupError?.code !== "ENOENT") {
+        error.cleanupError = cleanupError;
+      }
+    }
+    throw error;
   }
 }
 
@@ -111,7 +237,7 @@ export function saveState(cwd, state) {
     removeFileIfExists(job.logFile);
   }
 
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  atomicWriteJson(resolveStateFile(cwd), nextState);
   return nextState;
 }
 
@@ -166,7 +292,7 @@ export function getConfig(cwd) {
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  atomicWriteJson(jobFile, payload);
   return jobFile;
 }
 
