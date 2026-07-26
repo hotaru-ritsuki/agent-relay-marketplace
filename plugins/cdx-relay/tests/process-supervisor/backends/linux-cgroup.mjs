@@ -14,9 +14,11 @@ import {
 const BACKEND = "linux-cgroup";
 const ENDPOINT_ENV = "CDX_RELAY_LINUX_REAPER_ENDPOINT";
 const CREDENTIAL_ENV = "CDX_RELAY_LINUX_REAPER_CREDENTIAL";
+const BOOT_ID_ENV = "CDX_RELAY_LINUX_REAPER_BOOT_ID";
 const PRIVATE_REAPER_ENV = Object.freeze([
   ENDPOINT_ENV,
   CREDENTIAL_ENV,
+  BOOT_ID_ENV,
   "CDX_RELAY_LINUX_REAPER_REGISTRY"
 ]);
 const REQUIRED_CHECKS = Object.freeze([
@@ -220,11 +222,13 @@ function requestLaunchFrame(endpoint, credential, request, timeoutMs) {
 export function createUnixLinuxReaperClient({
   endpoint = process.env[ENDPOINT_ENV],
   credential = process.env[CREDENTIAL_ENV],
+  reaperBootId = process.env[BOOT_ID_ENV],
   timeoutMs = 5000
 } = {}) {
-  if (!endpoint || !credential) return null;
+  if (!endpoint || !credential || !reaperBootId) return null;
   return {
     identity: null,
+    reaperBootId,
     request: (request) => request.operation === "launch"
       ? requestLaunchFrame(endpoint, credential, request, timeoutMs)
       : requestFrame(endpoint, credential, request, timeoutMs)
@@ -238,6 +242,7 @@ export function createLinuxCgroupBackend({
   harnessPid = process.pid,
   harnessStartTime = currentHarnessStartTime()
 } = {}) {
+  const expectedReaperBootId = reaperClient?.reaperBootId;
   const leases = new Map();
   const probeIdentity = {
     epoch: `probe-${randomId()}`,
@@ -275,6 +280,8 @@ export function createLinuxCgroupBackend({
       epoch: identity.epoch,
       runId: identity.runId,
       nonce: identity.nonce,
+      backend: BACKEND,
+      reaperBootId: expectedReaperBootId,
       payload
     });
     let response;
@@ -298,6 +305,7 @@ export function createLinuxCgroupBackend({
         response.backend !== BACKEND ||
         typeof response.reaperBootId !== "string" ||
         response.reaperBootId.length === 0 ||
+        response.reaperBootId !== expectedReaperBootId ||
         (channelIdentity && response.reaperIdentity !== channelIdentity)) {
       throw latch(fail(
         "PROTOCOL_IDENTITY_MISMATCH",

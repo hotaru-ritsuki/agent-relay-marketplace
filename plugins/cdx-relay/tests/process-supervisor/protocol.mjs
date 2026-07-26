@@ -218,6 +218,21 @@ export function validateReaperRequest(message, expected) {
       "reaper request operation is unsupported."
     );
   }
+  for (const field of ["backend", "reaperBootId"]) {
+    if (typeof message[field] !== "string" ||
+        !/^[A-Za-z0-9._-]{1,128}$/.test(message[field])) {
+      throw protocolError(
+        "PROTOCOL_INVALID_MESSAGE",
+        `reaper request ${field} must be a safe nonempty identity.`
+      );
+    }
+    if (expected?.[field] && message[field] !== expected[field]) {
+      throw protocolError(
+        "PROTOCOL_IDENTITY_MISMATCH",
+        `reaper request ${field} does not match the protected reaper.`
+      );
+    }
+  }
   for (const field of ["epoch", "runId", "nonce"]) {
     if (typeof message[field] !== "string" || message[field].length === 0) {
       throw protocolError(

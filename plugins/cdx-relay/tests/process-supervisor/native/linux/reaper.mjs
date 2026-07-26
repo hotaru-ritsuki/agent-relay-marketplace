@@ -39,11 +39,39 @@ const PAYLOAD_RUNTIME_CAP_MS = 10 * 60 * 1000;
 const canonicalJson = (value) => JSON.stringify(Object.fromEntries(
   Object.entries(value).sort(([left], [right]) => left.localeCompare(right))
 ));
+const hasCompleteCgroupWriteDenials = (ready) =>
+  ready?.cgroupWriteDenied?.procs === true &&
+  ready.cgroupWriteDenied.threads === true &&
+  ready.cgroupWriteDenied.subtreeControl === true;
+
+export function deriveProtectedTupleKey(backend, epoch, runId) {
+  if (![backend, epoch, runId].every((value) => typeof value === "string")) {
+    throw new TypeError("Protected tuple components must be strings.");
+  }
+  return `lease-${createHash("sha256")
+    .update(JSON.stringify([backend, epoch, runId]))
+    .digest("hex")}`;
+}
 
 export async function loadOrCreateReaperAuthority(authorityPath, {
   expectedUid = process.getuid?.(),
-  enforcePosixMetadata = process.platform !== "win32"
+  enforcePosixMetadata = process.platform !== "win32",
+  hostBootId,
+  requestedReaperBootId
 } = {}) {
+  const activeHostBootId = hostBootId ?? (
+    process.platform === "linux"
+      ? (await fs.readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim()
+      : `host-${process.platform}`
+  );
+  const desiredReaperBootId = requestedReaperBootId ?? randomUUID();
+  if (!SAFE_IDENTITY.test(activeHostBootId) ||
+      !SAFE_IDENTITY.test(desiredReaperBootId)) {
+    throw fail(
+      "REAPER_AUTHORITY_INSECURE",
+      "Host and reaper boot identities must be safe nonempty identities."
+    );
+  }
   const directory = path.dirname(authorityPath);
   await fs.mkdir(directory, { recursive: true, mode: 0o700 });
   const directoryStat = await fs.lstat(directory);
@@ -58,8 +86,9 @@ export async function loadOrCreateReaperAuthority(authorityPath, {
   }
   try {
     await fs.writeFile(authorityPath, JSON.stringify({
-      version: 1,
-      reaperBootId: randomUUID(),
+      version: 2,
+      hostBootId: activeHostBootId,
+      reaperBootId: desiredReaperBootId,
       authenticationKey: randomBytes(32).toString("base64")
     }), {
       encoding: "utf8",
@@ -91,12 +120,26 @@ export async function loadOrCreateReaperAuthority(authorityPath, {
       stored.authenticationKey ?? "",
       "base64"
     );
-    if (stored.version !== 1 ||
+    if (stored.version !== 2 ||
+        !SAFE_IDENTITY.test(stored.hostBootId ?? "") ||
         !SAFE_IDENTITY.test(stored.reaperBootId ?? "") ||
         authenticationKey.length !== 32) {
       throw fail(
         "REAPER_AUTHORITY_INSECURE",
         "Reaper authority content is invalid."
+      );
+    }
+    if (stored.hostBootId !== activeHostBootId) {
+      throw fail(
+        "REAPER_HOST_BOOT_CHANGED",
+        "Durable reaper authority belongs to a different Linux host boot."
+      );
+    }
+    if (requestedReaperBootId &&
+        stored.reaperBootId !== requestedReaperBootId) {
+      throw fail(
+        "REAPER_BOOT_ID_MISMATCH",
+        "Configured reaper boot identity does not match durable authority."
       );
     }
     return {
@@ -171,7 +214,14 @@ export function createAtomicReaperRegistry(registryPath, {
           }
           const stored = JSON.parse(await handle.readFile("utf8"));
           const { authentication, ...entry } = stored;
-          if (entry.reaperBootId !== reaperBootId ||
+          const expectedName =
+            `${deriveProtectedTupleKey(
+              entry.backend,
+              entry.epoch,
+              entry.runId
+            )}.json`;
+          if (name !== expectedName ||
+              entry.reaperBootId !== reaperBootId ||
               typeof authentication !== "string" ||
               !sameSecret(authentication, authenticate(entry))) {
             throw fail(
@@ -196,7 +246,10 @@ export function createAtomicReaperRegistry(registryPath, {
           "Protected registry write identity is invalid."
         );
       }
-      const target = path.join(registryPath, `${entry.epoch}-${entry.runId}.json`);
+      const target = path.join(
+        registryPath,
+        `${deriveProtectedTupleKey(entry.backend, entry.epoch, entry.runId)}.json`
+      );
       const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
       const stored = { ...entry, authentication: authenticate(entry) };
       await fs.writeFile(temporary, JSON.stringify(stored), {
@@ -252,7 +305,7 @@ export function createProtectedLinuxReaper({
   const canonicalPaths = (epoch, runId) => {
     const outerCgroup = path.posix.join(
       protectedRoot.replaceAll("\\", "/"),
-      `${epoch}-${runId}`
+      deriveProtectedTupleKey(BACKEND, epoch, runId)
     );
     return {
       outerCgroup,
@@ -307,7 +360,11 @@ export function createProtectedLinuxReaper({
     return entry;
   };
   const drain = (entry) => {
-    const key = `${entry.epoch}:${entry.runId}`;
+    const key = deriveProtectedTupleKey(
+      entry.backend,
+      entry.epoch,
+      entry.runId
+    );
     if (drains.has(key)) return drains.get(key);
     const operation = (async () => {
       if (entry.state === "drained") return entry;
@@ -325,13 +382,23 @@ export function createProtectedLinuxReaper({
         throw fail("CLEANUP_UNPROVEN", "Protected outer cgroup remains populated.");
       }
       entry.lastPopulated = 0;
-      watches.get(entry.runId)?.close?.();
+      const watch = watches.get(entry.runId);
       watches.delete(entry.runId);
+      await watch?.close?.();
       await cgroups.removeRun(entry);
       entry.drainedAt = now().toISOString();
       await save(entry, "drained");
       return entry;
-    })();
+    })().catch((error) => {
+      poisoned ??= error instanceof SupervisorInfrastructureError
+        ? error
+        : fail(
+            "CLEANUP_FAILED",
+            String(error?.message ?? error).slice(0, 240),
+            error
+          );
+      throw poisoned;
+    });
     drains.set(key, operation);
     return operation;
   };
@@ -445,7 +512,10 @@ export function createProtectedLinuxReaper({
   return {
     async handleRequest(input) {
       assertHealthy();
-      const request = validateReaperRequest(input);
+      const request = validateReaperRequest(input, {
+        backend: BACKEND,
+        reaperBootId
+      });
       if (request.operation === "probe") {
         const result = await checks();
         probed = true;
@@ -510,9 +580,9 @@ export function createProtectedLinuxReaper({
           );
           throw poisoned;
         }
-        await drain(entry);
         entry.proofConsumed = true;
-        await save(entry, "drained");
+        await save(entry, entry.state);
+        await drain(entry);
         return {
           version: PROTOCOL_VERSION,
           operation: "cleanup",
@@ -549,12 +619,25 @@ export function createProtectedLinuxReaper({
   };
 }
 
+export async function reportControlLoss(reaper, runId, reportError) {
+  try {
+    await reaper.handleControlLoss(runId);
+    return true;
+  } catch (error) {
+    reportError(error);
+    return false;
+  }
+}
+
 export async function serveProtectedLinuxReaper({
   reaper,
   socketPath,
   credential,
   socketUid,
-  socketGid
+  socketGid,
+  reportError = (error) => console.error(
+    `Protected reaper control-loss cleanup failed: ${error?.message ?? error}`
+  )
 }) {
   if (!socketPath || !credential) {
     throw new TypeError("Protected reaper socket and credential are required.");
@@ -622,7 +705,7 @@ export async function serveProtectedLinuxReaper({
     });
     socket.once("close", () => {
       if (request?.operation === "launch" && !socket.writableEnded) {
-        void reaper.handleControlLoss(request.runId).catch(() => {});
+        void reportControlLoss(reaper, request.runId, reportError);
       }
     });
   });
@@ -842,7 +925,10 @@ export async function performProtectedBoundaryProbe({
   };
   const epoch = `probe-${process.pid}`;
   const runId = `${Date.now()}-${randomBytes(6).toString("hex")}`;
-  const outerCgroup = path.posix.join(protectedRoot, `${epoch}-${runId}`);
+  const outerCgroup = path.posix.join(
+    protectedRoot,
+    deriveProtectedTupleKey(BACKEND, epoch, runId)
+  );
   const entry = {
     backend: BACKEND,
     reaperBootId: "probe",
@@ -879,7 +965,7 @@ export async function performProtectedBoundaryProbe({
     checks.reaperOutsidePayloadPidNamespace =
       restricted === true && blocked.ready?.reaperVisible === false;
     checks.payloadCgroupFilesReadOnly =
-      restricted === true && blocked.ready?.cgroupWritable === false;
+      restricted === true && hasCompleteCgroupWriteDenials(blocked.ready);
     if (member !== true ||
         !checks.reaperOutsidePayloadPidNamespace ||
         !checks.payloadCgroupFilesReadOnly) {
@@ -900,7 +986,7 @@ export async function performProtectedBoundaryProbe({
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     if (populated !== 0) return checks;
-    watch.close();
+    await watch.close();
     watch = undefined;
     await cgroups.removeRun(entry);
     checks.outerCgroupLifecycle = true;
@@ -908,7 +994,7 @@ export async function performProtectedBoundaryProbe({
   } catch {
     return checks;
   } finally {
-    watch?.close?.();
+    await Promise.resolve(watch?.close?.()).catch(() => {});
     if (!checks.outerCgroupLifecycle) {
       if (blocked) await cgroups.killOuter(entry).catch(() => {});
       await cgroups.removeRun(entry).catch(() => {});
@@ -1047,7 +1133,7 @@ async function createCliService() {
             if (!readySettled) {
               if (frame.type !== "ready" ||
                   !Number.isSafeInteger(frame.hostPid) ||
-                  typeof frame.cgroupWritable !== "boolean" ||
+                  !hasCompleteCgroupWriteDenials(frame) ||
                   typeof frame.reaperVisible !== "boolean") {
                 throw new Error("not a complete ready frame");
               }
@@ -1125,7 +1211,7 @@ async function createCliService() {
       return pidNamespace !== reaperPidNamespace &&
         mountNamespace !== reaperMountNamespace &&
         blocked.ready.reaperVisible === false &&
-        blocked.ready.cgroupWritable === false;
+        hasCompleteCgroupWriteDenials(blocked.ready);
     },
     async releaseShim(_entry, blocked) {
       process.kill(blocked.pid, "SIGCONT");
@@ -1144,7 +1230,11 @@ async function createCliService() {
     }
   };
   const authority = await loadOrCreateReaperAuthority(
-    path.join(registryPath, ".authority.json")
+    path.join(registryPath, ".authority.json"),
+    {
+      requestedReaperBootId:
+        process.env.CDX_RELAY_LINUX_REAPER_BOOT_ID
+    }
   );
   const registry = createAtomicReaperRegistry(registryPath, {
     ...authority
@@ -1167,11 +1257,18 @@ async function runPayloadShim() {
   const status = await fs.readFile("/proc/self/status", "utf8");
   const nspid = /^NSpid:\s+(.+)$/m.exec(status)?.[1]
     ?.trim().split(/\s+/).map(Number) ?? [process.pid];
-  let cgroupWritable = true;
-  try {
-    await fs.writeFile("/sys/fs/cgroup/cgroup.procs", String(process.pid));
-  } catch {
-    cgroupWritable = false;
+  const cgroupWriteDenied = {};
+  for (const [name, file, value] of [
+    ["procs", "cgroup.procs", String(process.pid)],
+    ["threads", "cgroup.threads", String(process.pid)],
+    ["subtreeControl", "cgroup.subtree_control", "+memory"]
+  ]) {
+    try {
+      await fs.writeFile(path.join("/sys/fs/cgroup", file), value);
+      cgroupWriteDenied[name] = false;
+    } catch {
+      cgroupWriteDenied[name] = true;
+    }
   }
   let reaperVisible = true;
   try {
@@ -1182,7 +1279,7 @@ async function runPayloadShim() {
   process.stdout.write(`${JSON.stringify({
     type: "ready",
     hostPid: nspid[0],
-    cgroupWritable,
+    cgroupWriteDenied,
     reaperVisible
   })}\n`);
   process.kill(process.pid, "SIGSTOP");

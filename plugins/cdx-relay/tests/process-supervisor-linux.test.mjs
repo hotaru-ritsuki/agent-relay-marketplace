@@ -18,8 +18,10 @@ import {
 } from "./process-supervisor/index.mjs";
 import {
   createPidfdHarnessWatcher,
+  deriveProtectedTupleKey,
   loadOrCreateReaperAuthority,
   performProtectedBoundaryProbe,
+  reportControlLoss,
   runBoundedPayload
 } from "./process-supervisor/native/linux/reaper.mjs";
 
@@ -34,6 +36,11 @@ const REQUIRED_CHECKS = Object.freeze({
 
 const hashNonce = (nonce) =>
   createHash("sha256").update(nonce).digest("hex");
+const protectedOuter = (epoch, runId, root = "/protected") =>
+  path.posix.join(
+    root,
+    deriveProtectedTupleKey("linux-cgroup", epoch, runId)
+  );
 
 function createInjectedClient({
   identity = "protected-reaper:injected",
@@ -46,6 +53,7 @@ function createInjectedClient({
   const requests = [];
   return {
     identity,
+    reaperBootId,
     requests,
     async request(request) {
       requests.push(structuredClone(request));
@@ -85,8 +93,11 @@ function createInjectedClient({
           reaperIdentity: identity,
           backend: "linux-cgroup",
           reaperBootId,
-          outerCgroup: `/protected/${request.epoch}-${request.runId}`,
-          payloadCgroup: `/protected/${request.epoch}-${request.runId}/payload`,
+          outerCgroup: protectedOuter(request.epoch, request.runId),
+          payloadCgroup: path.posix.join(
+            protectedOuter(request.epoch, request.runId),
+            "payload"
+          ),
           pid: 4242,
           child: { pid: 4242 },
           root: Promise.resolve({
@@ -186,6 +197,58 @@ test("atomic registry authenticates the complete record before returning it", as
   }
 });
 
+test("backend epoch and run tuples cannot alias registry or cgroup keys", async () => {
+  const left = {
+    backend: "linux-cgroup",
+    epoch: "a-b",
+    runId: "c"
+  };
+  const right = {
+    backend: "linux-cgroup",
+    epoch: "a",
+    runId: "b-c"
+  };
+  assert.notEqual(
+    deriveProtectedTupleKey(left.backend, left.epoch, left.runId),
+    deriveProtectedTupleKey(right.backend, right.epoch, right.runId)
+  );
+  assert.notEqual(
+    deriveProtectedTupleKey(left.backend, left.epoch, left.runId),
+    deriveProtectedTupleKey("other-backend", left.epoch, left.runId)
+  );
+
+  const registryPath = await fs.mkdtemp(path.join(os.tmpdir(), "cdx-tuple-"));
+  try {
+    const registry = createAtomicReaperRegistry(registryPath, {
+      authenticationKey: Buffer.alloc(32, 9),
+      reaperBootId: "boot-test",
+      enforcePosixMetadata: false
+    });
+    await registry.write({ ...left, reaperBootId: "boot-test", marker: "left" });
+    await registry.write({ ...right, reaperBootId: "boot-test", marker: "right" });
+
+    const records = await registry.list();
+
+    assert.equal(records.length, 2);
+    assert.deepEqual(
+      new Set(records.map((record) => record.marker)),
+      new Set(["left", "right"])
+    );
+    const leftName =
+      `${deriveProtectedTupleKey(left.backend, left.epoch, left.runId)}.json`;
+    await fs.rename(
+      path.join(registryPath, leftName),
+      path.join(registryPath, "renamed.json")
+    );
+    await assert.rejects(
+      registry.list(),
+      (error) => error?.code === "REGISTRY_AUTHENTICATION_FAILED"
+    );
+  } finally {
+    await fs.rm(registryPath, { recursive: true, force: true });
+  }
+});
+
 test("Linux registry refuses symlinks and unsafe protected-directory metadata", {
   skip: process.platform !== "linux"
 }, async () => {
@@ -237,16 +300,29 @@ test("protected reaper restart reloads one durable boot authority", async () => 
   const authorityPath = path.join(directory, "authority.json");
   try {
     const first = await loadOrCreateReaperAuthority(authorityPath, {
-      enforcePosixMetadata: false
+      enforcePosixMetadata: false,
+      hostBootId: "host-boot-a",
+      requestedReaperBootId: "reaper-boot-a"
     });
     const second = await loadOrCreateReaperAuthority(authorityPath, {
-      enforcePosixMetadata: false
+      enforcePosixMetadata: false,
+      hostBootId: "host-boot-a",
+      requestedReaperBootId: "reaper-boot-a"
     });
 
     assert.equal(first.reaperBootId, second.reaperBootId);
+    assert.equal(first.reaperBootId, "reaper-boot-a");
     assert.deepEqual(first.authenticationKey, second.authenticationKey);
     assert.match(first.reaperBootId, /^[A-Za-z0-9._-]+$/);
     assert.equal(first.authenticationKey.length, 32);
+    await assert.rejects(
+      loadOrCreateReaperAuthority(authorityPath, {
+        enforcePosixMetadata: false,
+        hostBootId: "host-boot-b",
+        requestedReaperBootId: "reaper-boot-a"
+      }),
+      (error) => error?.code === "REAPER_HOST_BOOT_CHANGED"
+    );
   } finally {
     await fs.rm(directory, { recursive: true, force: true });
   }
@@ -335,7 +411,14 @@ test("strict capability probe performs the complete disposable boundary itself",
         return {
           pid: 77,
           launcherPid: 76,
-          ready: { reaperVisible: false, cgroupWritable: false },
+          ready: {
+            reaperVisible: false,
+            cgroupWriteDenied: {
+              procs: true,
+              threads: true,
+              subtreeControl: true
+            }
+          },
           root: new Promise(() => {})
         };
       },
@@ -350,7 +433,13 @@ test("strict capability probe performs the complete disposable boundary itself",
     readStartTime: async () => "start-77",
     async watchHarness(entry) {
       events.push(`pidfd:${entry.harnessStartTime}`);
-      return { close() { events.push("watch-close"); } };
+      return {
+        async close() {
+          events.push("watch-close-start");
+          await new Promise((resolve) => setImmediate(resolve));
+          events.push("watch-close");
+        }
+      };
     }
   });
 
@@ -367,6 +456,7 @@ test("strict capability probe performs the complete disposable boundary itself",
     "release",
     "kill",
     "populated",
+    "watch-close-start",
     "watch-close",
     "remove"
   ]);
@@ -499,6 +589,46 @@ test("cross-boot cleanup proof poisons the backend", async () => {
   assert.throws(() => backend.assertHealthy());
 });
 
+test("every backend request binds backend and reaper boot identities", async () => {
+  const client = createInjectedClient();
+  const backend = createLinuxCgroupBackend({
+    platform: "linux",
+    reaperClient: client
+  });
+  await backend.probe();
+  const launched = await backend.launch({
+    command: process.execPath,
+    args: [],
+    shell: false,
+    epoch: "bound-epoch",
+    runId: "bound-run",
+    nonce: "bound-nonce",
+    backend: "linux-cgroup"
+  });
+  await launched.cleanup();
+
+  assert.ok(client.requests.length >= 4);
+  for (const sent of client.requests) {
+    assert.equal(sent.backend, "linux-cgroup");
+    assert.equal(sent.reaperBootId, "boot-injected");
+  }
+});
+
+test("protected reaper rejects request backend or boot mismatch before operation", async () => {
+  const { reaper, events } = createReaperHarness();
+
+  for (const mismatch of [
+    { backend: "other-backend", reaperBootId: "boot-test" },
+    { backend: "linux-cgroup", reaperBootId: "other-boot" }
+  ]) {
+    await assert.rejects(
+      reaper.handleRequest(request("probe", mismatch)),
+      (error) => error?.code === "PROTOCOL_IDENTITY_MISMATCH"
+    );
+  }
+  assert.deepEqual(events, []);
+});
+
 test("leaf populated zero is insufficient when the outer cgroup remains populated", async () => {
   const client = createInjectedClient({
     mutateResponse(response, request) {
@@ -545,7 +675,7 @@ test("cleanup accepts only authenticated outer-cgroup populated zero", async () 
     runId: launchSpec.runId,
     nonceHash: hashNonce(launchSpec.nonce),
     proofTokenHash: hashNonce(launchedRequest.payload.proofToken),
-    outerCgroup: `/protected/${launchSpec.epoch}-${launchSpec.runId}`,
+    outerCgroup: protectedOuter(launchSpec.epoch, launchSpec.runId),
     populated: 0,
     reaperBootId: "boot-injected",
     reaperIdentity: client.identity,
@@ -568,7 +698,7 @@ test("protected reaper consumes each cleanup proof token exactly once", async ()
   }));
   const cleanup = request("cleanup", {
     payload: {
-      outerCgroup: "/protected/epoch-a-run-a",
+      outerCgroup: protectedOuter("epoch-a", "run-a"),
       proofToken: "one-time-proof-token"
     }
   });
@@ -646,6 +776,7 @@ test("real reaper transport acknowledges launch before root completion", async (
     const client = createUnixLinuxReaperClient({
       endpoint,
       credential,
+      reaperBootId: "boot-test",
       timeoutMs: 1000
     });
     const launched = await client.request(request("launch", {
@@ -663,10 +794,23 @@ test("real reaper transport acknowledges launch before root completion", async (
   }
 });
 
+test("reaper transport reports a failed control-loss drain", async () => {
+  const reports = [];
+  const handled = await reportControlLoss({
+    async handleControlLoss() {
+      throw new Error("reported control-loss failure");
+    }
+  }, "run-a", (error) => reports.push(error));
+
+  assert.equal(handled, false);
+  assert.match(reports[0]?.message ?? "", /reported control-loss failure/);
+});
+
 function createReaperHarness({
   registryEntries = [],
   checks = REQUIRED_CHECKS,
   cgroupOverrides = {},
+  watchFactory,
   reaperBootId = "boot-test"
 } = {}) {
   const events = [];
@@ -726,7 +870,7 @@ function createReaperHarness({
     registry,
     watchHarness(entry, onDeath) {
       watchers.set(entry.runId, onDeath);
-      return { close() {} };
+      return watchFactory?.(entry, onDeath) ?? { close() {} };
     },
     now: () => new Date("2026-07-26T00:00:00.000Z")
   });
@@ -737,6 +881,9 @@ function request(operation, {
   epoch = "epoch-a",
   runId = "run-a",
   nonce = "nonce-a",
+  backend = "linux-cgroup",
+  reaperBootId =
+    process.env.CDX_RELAY_LINUX_REAPER_BOOT_ID ?? "boot-test",
   payload = {}
 } = {}) {
   return {
@@ -745,6 +892,8 @@ function request(operation, {
     epoch,
     runId,
     nonce,
+    backend,
+    reaperBootId,
     payload: ["launch", "cleanup"].includes(operation)
       ? { proofToken: "default-one-time-proof-token", ...payload }
       : payload
@@ -791,13 +940,56 @@ test("simultaneous cleanup and harness death join one idempotent drain", async (
   await Promise.all([
     watchers.get("run-a")(),
     reaper.handleRequest(request("cleanup", {
-      payload: { outerCgroup: "/protected/epoch-a-run-a" }
+      payload: { outerCgroup: protectedOuter("epoch-a", "run-a") }
     }))
   ]);
 
   assert.equal(events.filter((event) => event === "kill:run-a").length, 1);
   assert.equal(events.filter((event) => event === "events:run-a").length, 1);
   assert.equal(events.filter((event) => event === "remove:run-a").length, 1);
+});
+
+test("concurrent cleanup consumes the one-time proof token before drain awaits", async () => {
+  let signalKillStarted;
+  const killStarted = new Promise((resolve) => {
+    signalKillStarted = resolve;
+  });
+  let releaseKill;
+  const killReleased = new Promise((resolve) => {
+    releaseKill = resolve;
+  });
+  const { reaper } = createReaperHarness({
+    cgroupOverrides: {
+      async killOuter() {
+        signalKillStarted();
+        await killReleased;
+      }
+    }
+  });
+  await reaper.handleRequest(request("probe"));
+  await reaper.handleRequest(request("recover"));
+  const launched = await reaper.handleRequest(request("launch", {
+    payload: {
+      command: process.execPath,
+      args: [],
+      harnessPid: 111,
+      harnessStartTime: "222"
+    }
+  }));
+  const cleanupRequest = request("cleanup", {
+    payload: { outerCgroup: launched.outerCgroup }
+  });
+
+  const first = reaper.handleRequest(cleanupRequest);
+  await killStarted;
+  const replay = assert.rejects(
+    reaper.handleRequest(cleanupRequest),
+    (error) => error?.code === "PROOF_REPLAYED"
+  );
+  releaseKill();
+
+  const [proof] = await Promise.all([first, replay]);
+  assert.equal(proof.level, "kernel-drained");
 });
 
 test("watcher drain failure is handled and latched without an exposed rejection", async () => {
@@ -827,6 +1019,74 @@ test("watcher drain failure is handled and latched without an exposed rejection"
   assert.throws(
     () => reaper.assertHealthy(),
     /injected removal failure/
+  );
+});
+
+test("protected drain awaits and latches a rejecting asynchronous watcher close", async () => {
+  let closeAwaited = false;
+  const { reaper, events } = createReaperHarness({
+    watchFactory() {
+      return {
+        close() {
+          return {
+            then(_resolve, reject) {
+              closeAwaited = true;
+              reject(new Error("injected watcher close failure"));
+            }
+          };
+        }
+      };
+    }
+  });
+  await reaper.handleRequest(request("probe"));
+  await reaper.handleRequest(request("recover"));
+  await reaper.handleRequest(request("launch", {
+    payload: {
+      command: process.execPath,
+      args: [],
+      harnessPid: 111,
+      harnessStartTime: "222"
+    }
+  }));
+
+  await assert.rejects(
+    reaper.handleRequest(request("cleanup", {
+      payload: { outerCgroup: protectedOuter("epoch-a", "run-a") }
+    })),
+    /injected watcher close failure/
+  );
+
+  assert.equal(closeAwaited, true);
+  assert.equal(events.includes("remove:run-a"), false);
+  assert.throws(() => reaper.assertHealthy(), /injected watcher close failure/);
+});
+
+test("control-channel-loss drain failure is latched and returned to the reporter", async () => {
+  const { reaper } = createReaperHarness({
+    cgroupOverrides: {
+      async removeRun() {
+        throw new Error("injected control-loss drain failure");
+      }
+    }
+  });
+  await reaper.handleRequest(request("probe"));
+  await reaper.handleRequest(request("recover"));
+  await reaper.handleRequest(request("launch", {
+    payload: {
+      command: process.execPath,
+      args: [],
+      harnessPid: 111,
+      harnessStartTime: "222"
+    }
+  }));
+
+  await assert.rejects(
+    reaper.handleControlLoss("run-a"),
+    /injected control-loss drain failure/
+  );
+  assert.throws(
+    () => reaper.assertHealthy(),
+    /injected control-loss drain failure/
   );
 });
 
@@ -869,8 +1129,11 @@ test("stale registry recovery completes before a new launch", async () => {
     proofConsumed: false,
     harnessPid: 12,
     harnessStartTime: "34",
-    outerCgroup: "/protected/old-epoch-old-run",
-    payloadCgroup: "/protected/old-epoch-old-run/payload",
+    outerCgroup: protectedOuter("old-epoch", "old-run"),
+    payloadCgroup: path.posix.join(
+      protectedOuter("old-epoch", "old-run"),
+      "payload"
+    ),
     state: "running"
   };
   const { reaper, events } = createReaperHarness({
@@ -906,8 +1169,11 @@ test("recovery rejects cross-boundary registry records before privileged cleanup
     proofConsumed: false,
     harnessPid: 12,
     harnessStartTime: "34",
-    outerCgroup: "/protected/old-epoch-old-run",
-    payloadCgroup: "/protected/old-epoch-old-run/payload",
+    outerCgroup: protectedOuter("old-epoch", "old-run"),
+    payloadCgroup: path.posix.join(
+      protectedOuter("old-epoch", "old-run"),
+      "payload"
+    ),
     state: "running"
   };
   for (const forged of [
@@ -1100,6 +1366,7 @@ test("Linux strict mode requires a live protected runner", {
   const requiredReaperEnvironment = [
     "CDX_RELAY_LINUX_REAPER_ENDPOINT",
     "CDX_RELAY_LINUX_REAPER_CREDENTIAL",
+    "CDX_RELAY_LINUX_REAPER_BOOT_ID",
     "CDX_RELAY_LINUX_PROTECTED_ROOT",
     "CDX_RELAY_LINUX_REAPER_REGISTRY",
     "CDX_RELAY_LINUX_PAYLOAD_UID",
@@ -1177,7 +1444,14 @@ test("Linux strict mode requires a live protected runner", {
   const proof = await launched.cleanup();
   assert.equal(proof.level, "kernel-drained");
   assert.equal(proof.populated, 0);
-  assert.equal(proof.outerCgroup.endsWith(`${identity.epoch}-${identity.runId}`), true);
+  assert.equal(
+    proof.outerCgroup,
+    protectedOuter(
+      identity.epoch,
+      identity.runId,
+      process.env.CDX_RELAY_LINUX_PROTECTED_ROOT
+    )
+  );
 
   const migrationIdentity = {
     epoch: `migration-${Date.now()}`,
@@ -1194,8 +1468,11 @@ test("Linux strict mode requires a live protected runner", {
     ].join("")],
     env: {
       ATTEMPT_CGROUP: path.join(
-        process.env.CDX_RELAY_LINUX_PROTECTED_ROOT,
-        `${migrationIdentity.epoch}-${migrationIdentity.runId}`,
+        protectedOuter(
+          migrationIdentity.epoch,
+          migrationIdentity.runId,
+          process.env.CDX_RELAY_LINUX_PROTECTED_ROOT
+        ),
         "cgroup.procs"
       )
     },
