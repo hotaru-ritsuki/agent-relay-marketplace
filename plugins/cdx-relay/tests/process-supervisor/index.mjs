@@ -1,3 +1,5 @@
+import process from "node:process";
+
 export {
   SupervisorCleanupError,
   SupervisorInfrastructureError
@@ -20,20 +22,39 @@ export {
 } from "./result.mjs";
 export {
   createProcessSupervisor,
-  defaultBackendFactories
+  defaultBackendFactories,
+  inheritSupervisorEnvironment,
+  registerControlledDescendant,
+  SUPERVISOR_TOKEN_ENV
 } from "./coordinator.mjs";
 export { runSynchronous } from "./worker.mjs";
 export { createWindowsBackend } from "./backends/windows.mjs";
+export {
+  createPosixProcessGroupBackend,
+  decodeSupervisorToken,
+  encodeSupervisorToken
+} from "./backends/posix-process-group.mjs";
+export { createMacosBackend } from "./backends/macos.mjs";
 
 import { createProcessSupervisor } from "./coordinator.mjs";
+import { createMacosBackend } from "./backends/macos.mjs";
+import { createPosixProcessGroupBackend } from "./backends/posix-process-group.mjs";
 import { createWindowsBackend } from "./backends/windows.mjs";
 
-const sharedWindowsBackend = createWindowsBackend();
+const sharedBackend = process.platform === "win32"
+  ? createWindowsBackend()
+  : process.platform === "darwin"
+    ? createMacosBackend()
+    : createPosixProcessGroupBackend();
 const sharedSupervisor = createProcessSupervisor({
   minimumGuarantee: "cooperative",
-  backendFactories: [() => sharedWindowsBackend],
-  syncBridge: sharedWindowsBackend.runSynchronous,
-  syncBackendSelection: { type: "windows-job" }
+  backendFactories: [() => sharedBackend],
+  ...(process.platform === "win32"
+    ? {
+        syncBridge: sharedBackend.runSynchronous,
+        syncBackendSelection: { type: "windows-job" }
+      }
+    : {})
 });
 
 function normalizeInvocation(command, args = [], options = {}) {

@@ -60,7 +60,7 @@ export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile
   const logFd = fs.openSync(logFile, "a");
   const child = spawn(process.execPath, [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile], {
     cwd,
-    env,
+    env: { ...process.env, ...env },
     detached: true,
     stdio: ["ignore", logFd, logFd]
   });

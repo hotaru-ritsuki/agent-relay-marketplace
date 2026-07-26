@@ -1093,6 +1093,11 @@ async function handleCancel(argv) {
 }
 
 async function main() {
+  if (process.env.CDX_RELAY_SUPERVISOR_TOKEN) {
+    const { registerControlledDescendant } =
+      await import("../tests/process-supervisor/coordinator.mjs");
+    await registerControlledDescendant();
+  }
   const [subcommand, ...argv] = process.argv.slice(2);
   if (!subcommand || subcommand === "help" || subcommand === "--help") {
     printUsage();

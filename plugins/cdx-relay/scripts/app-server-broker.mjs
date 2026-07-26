@@ -50,6 +50,11 @@ async function main() {
   if (subcommand !== "serve") {
     throw new Error("Usage: node scripts/app-server-broker.mjs serve --endpoint <value> [--cwd <path>] [--pid-file <path>]");
   }
+  if (process.env.CDX_RELAY_SUPERVISOR_TOKEN) {
+    const { registerControlledDescendant } =
+      await import("../tests/process-supervisor/coordinator.mjs");
+    await registerControlledDescendant();
+  }
 
   const { options } = parseArgs(argv, {
     valueOptions: ["cwd", "pid-file", "endpoint"]

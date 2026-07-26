@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
+import net from "node:net";
+import process from "node:process";
 
 import { SupervisorInfrastructureError } from "./errors.mjs";
 import {
@@ -14,8 +16,93 @@ import {
 } from "./protocol.mjs";
 import { assertCleanupProven, createTerminalResult } from "./result.mjs";
 import { runSynchronous } from "./worker.mjs";
+import { decodeSupervisorToken } from "./backends/posix-process-group.mjs";
 
 export const defaultBackendFactories = [];
+export const SUPERVISOR_TOKEN_ENV = "CDX_RELAY_SUPERVISOR_TOKEN";
+
+const controlledRegistrations = new Set();
+
+export function inheritSupervisorEnvironment(env = process.env) {
+  return { ...env };
+}
+
+async function openRegistrationSocket(token, hello) {
+  if (!token.endpoint.startsWith("unix:")) {
+    throw new SupervisorInfrastructureError(
+      "PROTOCOL_INVALID_ENDPOINT",
+      "Controlled POSIX descendants require a Unix registration socket."
+    );
+  }
+  const socket = net.createConnection({
+    path: token.endpoint.slice("unix:".length)
+  });
+  socket.setEncoding("utf8");
+  await new Promise((resolve, reject) => {
+    let pending = "";
+    const onError = (error) => {
+      reject(new SupervisorInfrastructureError(
+        "PROTOCOL_LOST",
+        "Controlled descendant registration failed.",
+        { cause: error }
+      ));
+    };
+    socket.once("error", onError);
+    socket.on("data", (chunk) => {
+      pending += chunk;
+      const newline = pending.indexOf("\n");
+      if (newline < 0) return;
+      let release;
+      try {
+        release = JSON.parse(pending.slice(0, newline));
+      } catch (error) {
+        reject(new SupervisorInfrastructureError(
+          "PROTOCOL_INVALID_MESSAGE",
+          "Controlled descendant received an invalid release frame.",
+          { cause: error }
+        ));
+        return;
+      }
+      if (release.type !== "release" || release.version !== PROTOCOL_VERSION) {
+        reject(new SupervisorInfrastructureError(
+          "PROTOCOL_INVALID_MESSAGE",
+          "Controlled descendant received an invalid release frame."
+        ));
+        return;
+      }
+      socket.off("error", onError);
+      socket.unref();
+      resolve();
+    });
+    socket.write(`${JSON.stringify(hello)}\n`);
+  });
+  return socket;
+}
+
+export async function registerControlledDescendant({
+  env = process.env,
+  pid = process.pid,
+  parentPid = process.ppid,
+  openRegistration = openRegistrationSocket
+} = {}) {
+  const encoded = env?.[SUPERVISOR_TOKEN_ENV];
+  if (!encoded) return { registered: false };
+  const token = decodeSupervisorToken(encoded);
+  const hello = {
+    type: "hello",
+    version: PROTOCOL_VERSION,
+    epoch: token.epoch,
+    runId: token.runId,
+    nonce: token.nonce,
+    backend: "posix-cooperative",
+    pid,
+    parentPid
+  };
+  const connection = await openRegistration(token, hello);
+  controlledRegistrations.add(connection);
+  connection?.once?.("close", () => controlledRegistrations.delete(connection));
+  return { registered: true, connection };
+}
 
 function infrastructureError(error, fallbackCode = "SUPERVISOR_FAILURE") {
   if (error instanceof SupervisorInfrastructureError) return error;
