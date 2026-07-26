@@ -27,7 +27,9 @@ export function inheritSupervisorEnvironment(env = process.env) {
   return { ...env };
 }
 
-async function openRegistrationSocket(token, hello) {
+async function openRegistrationSocket(token, hello, {
+  handshakeMs = 5000
+} = {}) {
   if (!token.endpoint.startsWith("unix:")) {
     throw new SupervisorInfrastructureError(
       "PROTOCOL_INVALID_ENDPOINT",
@@ -40,7 +42,15 @@ async function openRegistrationSocket(token, hello) {
   socket.setEncoding("utf8");
   await new Promise((resolve, reject) => {
     let pending = "";
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new SupervisorInfrastructureError(
+        "PROTOCOL_HANDSHAKE_TIMEOUT",
+        "Controlled descendant release deadline expired."
+      ));
+    }, handshakeMs);
     const onError = (error) => {
+      clearTimeout(timer);
       reject(new SupervisorInfrastructureError(
         "PROTOCOL_LOST",
         "Controlled descendant registration failed.",
@@ -50,6 +60,15 @@ async function openRegistrationSocket(token, hello) {
     socket.once("error", onError);
     socket.on("data", (chunk) => {
       pending += chunk;
+      if (Buffer.byteLength(pending) > MAX_FRAME_BYTES) {
+        clearTimeout(timer);
+        socket.destroy();
+        reject(new SupervisorInfrastructureError(
+          "PROTOCOL_FRAME_TOO_LARGE",
+          `Release frame exceeds ${MAX_FRAME_BYTES} bytes.`
+        ));
+        return;
+      }
       const newline = pending.indexOf("\n");
       if (newline < 0) return;
       let release;
@@ -71,6 +90,7 @@ async function openRegistrationSocket(token, hello) {
         return;
       }
       socket.off("error", onError);
+      clearTimeout(timer);
       socket.unref();
       resolve();
     });
@@ -83,7 +103,8 @@ export async function registerControlledDescendant({
   env = process.env,
   pid = process.pid,
   parentPid = process.ppid,
-  openRegistration = openRegistrationSocket
+  openRegistration = openRegistrationSocket,
+  handshakeMs = 5000
 } = {}) {
   const encoded = env?.[SUPERVISOR_TOKEN_ENV];
   if (!encoded) return { registered: false };
@@ -98,7 +119,7 @@ export async function registerControlledDescendant({
     pid,
     parentPid
   };
-  const connection = await openRegistration(token, hello);
+  const connection = await openRegistration(token, hello, { handshakeMs });
   controlledRegistrations.add(connection);
   connection?.once?.("close", () => controlledRegistrations.delete(connection));
   return { registered: true, connection };

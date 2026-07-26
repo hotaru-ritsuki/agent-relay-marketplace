@@ -60,7 +60,13 @@ export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile
   const logFd = fs.openSync(logFile, "a");
   const child = spawn(process.execPath, [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile], {
     cwd,
-    env: { ...process.env, ...env },
+    env: process.env.CDX_RELAY_SUPERVISOR_TOKEN &&
+        env.CDX_RELAY_SUPERVISOR_TOKEN === undefined
+      ? {
+          ...env,
+          CDX_RELAY_SUPERVISOR_TOKEN: process.env.CDX_RELAY_SUPERVISOR_TOKEN
+        }
+      : env,
     detached: true,
     stdio: ["ignore", logFd, logFd]
   });

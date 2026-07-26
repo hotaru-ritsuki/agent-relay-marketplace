@@ -7,7 +7,12 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { SupervisorInfrastructureError } from "../errors.mjs";
-import { PROTOCOL_VERSION, validateHello } from "../protocol.mjs";
+import {
+  MAX_FRAME_BYTES,
+  PROTOCOL_VERSION,
+  validateHello,
+  validateRoot
+} from "../protocol.mjs";
 
 const BACKEND = "posix-cooperative";
 const TOKEN_ENV = "CDX_RELAY_SUPERVISOR_TOKEN";
@@ -103,7 +108,9 @@ function endpointPath(endpoint) {
   return endpoint.slice("unix:".length);
 }
 
-async function createNetRegistrationChannel(handlers) {
+async function createNetRegistrationChannel(handlers, {
+  handshakeMs = 5000
+} = {}) {
   const socketPath = path.join(
     os.tmpdir(),
     `cdx-relay-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`
@@ -115,8 +122,21 @@ async function createNetRegistrationChannel(handlers) {
     let pending = "";
     let registeredPid = null;
     socket.setEncoding("utf8");
+    socket.setTimeout(handshakeMs, () => {
+      socket.destroy(fail(
+        "PROTOCOL_HANDSHAKE_TIMEOUT",
+        "Registration hello deadline expired."
+      ));
+    });
     socket.on("data", async (chunk) => {
       pending += chunk;
+      if (Buffer.byteLength(pending) > MAX_FRAME_BYTES) {
+        socket.destroy(fail(
+          "PROTOCOL_FRAME_TOO_LARGE",
+          `Registration frame exceeds ${MAX_FRAME_BYTES} bytes.`
+        ));
+        return;
+      }
       for (;;) {
         const newline = pending.indexOf("\n");
         if (newline < 0) break;
@@ -127,6 +147,7 @@ async function createNetRegistrationChannel(handlers) {
           if (message.type === "hello") {
             await handlers.hello(message);
             registeredPid = message.pid;
+            socket.setTimeout(0);
             socket.write(`${JSON.stringify({ type: "release", version: 1 })}\n`);
           } else if (message.type === "root") {
             handlers.root(message);
@@ -140,7 +161,9 @@ async function createNetRegistrationChannel(handlers) {
     });
     socket.on("close", () => {
       sockets.delete(socket);
-      if (registeredPid !== null) handlers.closed(registeredPid);
+      if (registeredPid !== null) {
+        void handlers.closed(registeredPid).catch(handlers.lost);
+      }
     });
     socket.on("error", (error) => {
       if (!closing) handlers.lost(error);
@@ -179,7 +202,8 @@ export function createPosixProcessGroupBackend({
   discoverRecordedProcesses = async () => [],
   now = Date.now,
   graceMs = 1000,
-  forceMs = 1000
+  forceMs = 1000,
+  handshakeMs = 5000
 } = {}) {
   const leases = new Map();
   let protocolFailure = null;
@@ -262,10 +286,45 @@ export function createPosixProcessGroupBackend({
     return false;
   }
 
+  async function verifyDrainedSnapshot(lease) {
+    const root = await inspectProcess(lease.rootPid);
+    if (root && !sameProcess(root, lease.rootIdentity)) {
+      throw fail(
+        "PROCESS_IDENTITY_MISMATCH",
+        `Process ${lease.rootPid} no longer matches its root identity.`
+      );
+    }
+    lease.rootGone = !root;
+    for (const [pid, registered] of lease.registry) {
+      const actual = await inspectProcess(pid);
+      if (!actual) {
+        lease.registry.delete(pid);
+      } else if (!sameProcess(actual, registered)) {
+        throw fail(
+          "PROCESS_IDENTITY_MISMATCH",
+          `Process ${pid} no longer matches its registered identity.`
+        );
+      }
+    }
+    return lease.rootGone && lease.registry.size === 0;
+  }
+
+  async function pollForVerifiedDrain(lease, deadline) {
+    const maximumAttempts = Math.max(
+      1,
+      Math.min(1000, Math.ceil(forceMs / 10) + 1)
+    );
+    for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
+      if (await verifyDrainedSnapshot(lease)) return true;
+      if (now() >= deadline) return false;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    return false;
+  }
+
   async function cleanupLease(lease) {
     if (lease.cleanupPromise) return lease.cleanupPromise;
     lease.cleanupPromise = (async () => {
-      assertHealthy();
       const waitForDrain = injectedWaitForDrain ?? defaultWaitForDrain;
       const termSent = await signalGroup(lease, "SIGTERM");
       let drained = !termSent || await waitForDrain({
@@ -282,6 +341,7 @@ export function createPosixProcessGroupBackend({
           });
       }
       if (!drained) {
+        if (protocolFailure) throw protocolFailure;
         for (const [pid, registered] of lease.registry) {
           await inspectOwned(registered);
           try {
@@ -289,9 +349,14 @@ export function createPosixProcessGroupBackend({
           } catch (error) {
             if (error?.code !== "ESRCH") throw error;
           }
-          lease.registry.delete(pid);
         }
-        lease.rootGone = true;
+      }
+      if (protocolFailure) throw protocolFailure;
+      if (!await pollForVerifiedDrain(lease, now() + forceMs)) {
+        throw fail(
+          "CLEANUP_UNPROVEN",
+          "Owned POSIX processes remain after bounded escalation."
+        );
       }
       assertHealthy();
       await lease.channel.close();
@@ -313,6 +378,7 @@ export function createPosixProcessGroupBackend({
     const registry = new Map();
     let resolveRoot;
     let rejectRoot;
+    let rootSettled = false;
     const root = new Promise((resolve, reject) => {
       resolveRoot = resolve;
       rejectRoot = reject;
@@ -335,7 +401,7 @@ export function createPosixProcessGroupBackend({
     };
     lease.channel = await createRegistrationChannel({
       async hello(message) {
-        validateHello({ ...message, backend: message.backend ?? BACKEND }, expected);
+        validateHello(message, expected);
         if (!Number.isSafeInteger(message.pid) || message.pid <= 0 ||
             !Number.isSafeInteger(message.parentPid) || message.parentPid <= 0) {
           throw fail("PROTOCOL_INVALID_MESSAGE", "Registration requires pid and parentPid.");
@@ -354,12 +420,13 @@ export function createPosixProcessGroupBackend({
         registry.set(message.pid, processIdentity);
       },
       root(message) {
-        if (message.epoch !== spec.epoch ||
-            message.runId !== spec.runId ||
-            message.nonce !== spec.nonce) {
-          rejectRoot(fail("PROTOCOL_IDENTITY_MISMATCH", "Root message changed lease identity."));
+        try {
+          validateRoot(message, expected);
+        } catch (error) {
+          rejectRoot(error);
           return;
         }
+        rootSettled = true;
         resolveRoot({
           backend: BACKEND,
           status: message.status ?? null,
@@ -369,8 +436,18 @@ export function createPosixProcessGroupBackend({
           error: message.error
         });
       },
-      closed(pid) {
-        registry.delete(pid);
+      async closed(pid) {
+        const registered = registry.get(pid);
+        if (!registered) return;
+        const actual = await inspectProcess(pid);
+        if (!actual) {
+          registry.delete(pid);
+          return;
+        }
+        protocolFailure ??= fail(
+          "PROTOCOL_LOST",
+          "Registration channel closed before validated process termination."
+        );
       },
       lost(error) {
         protocolFailure ??= fail(
@@ -380,7 +457,7 @@ export function createPosixProcessGroupBackend({
         );
         rejectRoot(protocolFailure);
       }
-    });
+    }, { handshakeMs });
     const token = encodeSupervisorToken({
       version: PROTOCOL_VERSION,
       epoch: spec.epoch,
@@ -416,6 +493,18 @@ export function createPosixProcessGroupBackend({
     }
     leases.set(spec.runId, lease);
     child.once?.("error", (error) => rejectRoot(error));
+    child.once?.("exit", (status, signal) => {
+      if (rootSettled) return;
+      rootSettled = true;
+      resolveRoot({
+        backend: BACKEND,
+        status,
+        signal,
+        stdout: undefined,
+        stderr: undefined,
+        error: undefined
+      });
+    });
     return {
       child,
       pid: child.pid,
@@ -423,7 +512,10 @@ export function createPosixProcessGroupBackend({
       stderr: child.stderr,
       root,
       kill(signal = "SIGTERM") {
-        return { backend: BACKEND, stopped: child.kill(signal) };
+        void cleanupLease(lease).catch((error) => {
+          protocolFailure ??= error;
+        });
+        return { backend: BACKEND, stopped: true };
       },
       cleanup: () => cleanupLease(lease)
     };
@@ -438,6 +530,7 @@ export function createPosixProcessGroupBackend({
       if (!lease ||
           lease.epoch !== record.epoch ||
           lease.nonce !== record.nonce ||
+          record.backend !== BACKEND ||
           !registered) {
         throw fail(
           "UNREGISTERED_RECORDED_PROCESS",

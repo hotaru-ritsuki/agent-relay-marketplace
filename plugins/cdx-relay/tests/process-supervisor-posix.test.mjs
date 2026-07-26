@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   createPosixProcessGroupBackend,
@@ -10,6 +16,7 @@ import {
   inheritSupervisorEnvironment,
   registerControlledDescendant
 } from "./process-supervisor/coordinator.mjs";
+import { spawnBrokerProcess } from "../scripts/lib/broker-lifecycle.mjs";
 
 const identity = {
   epoch: "epoch-1",
@@ -17,6 +24,44 @@ const identity = {
   nonce: "nonce-1",
   backend: "posix-cooperative"
 };
+const launchShimPath = fileURLToPath(
+  new URL("./process-supervisor/launch-shim.mjs", import.meta.url)
+);
+
+async function listenOnTestPipe(onMessage, onClose = () => {}) {
+  const pipe = `\\\\.\\pipe\\cdx-posix-${process.pid}-${Date.now()}-${Math.random()}`;
+  const sockets = new Set();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    let pending = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      pending += chunk;
+      for (;;) {
+        const newline = pending.indexOf("\n");
+        if (newline < 0) break;
+        const message = JSON.parse(pending.slice(0, newline));
+        pending = pending.slice(newline + 1);
+        onMessage(message, socket);
+      }
+    });
+    socket.on("close", () => {
+      sockets.delete(socket);
+      onClose();
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(pipe, resolve);
+  });
+  return {
+    endpoint: `unix:${pipe}`,
+    async close() {
+      for (const socket of sockets) socket.destroy();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  };
+}
 
 function controlledBackend(overrides = {}) {
   const calls = [];
@@ -142,13 +187,19 @@ test("root completion does not wait for descendant-held stdout to close", async 
 test("registered descendants are revalidated before fallback termination", async () => {
   const inspections = [];
   const individualKills = [];
+  const alive = new Set([4312, 4500]);
   const fixture = controlledBackend({
     async inspectProcess(pid) {
       inspections.push(pid);
+      if (!alive.has(pid)) return null;
       return { pid, startTime: pid === 4312 ? "100" : "200", executable: "/usr/bin/node" };
+    },
+    killGroup(pid, signal) {
+      if (signal === "SIGKILL") alive.delete(pid);
     },
     killProcess(pid, signal) {
       individualKills.push({ pid, signal });
+      alive.delete(pid);
     },
     async waitForDrain() {}
   });
@@ -168,13 +219,24 @@ test("registered descendants are revalidated before fallback termination", async
   });
   await launched.cleanup();
 
-  assert.deepEqual(inspections, [4312, 4500, 4312, 4312, 4500]);
+  assert.deepEqual(inspections, [4312, 4500, 4312, 4312, 4500, 4312, 4500]);
   assert.deepEqual(individualKills, [{ pid: 4500, signal: "SIGKILL" }]);
 });
 
 test("cleanup sends group SIGTERM, waits a bounded grace, then sends group SIGKILL", async () => {
   const waits = [];
+  const groupCalls = [];
+  let rootAlive = true;
   const fixture = controlledBackend({
+    async inspectProcess(pid) {
+      return rootAlive
+        ? { pid, startTime: "100", executable: "/usr/bin/node" }
+        : null;
+    },
+    killGroup(pid, signal) {
+      groupCalls.push({ type: "kill", pid, signal });
+      if (signal === "SIGKILL") rootAlive = false;
+    },
     async waitForDrain({ deadline, phase }) {
       waits.push({ deadline, phase });
       return false;
@@ -196,7 +258,7 @@ test("cleanup sends group SIGTERM, waits a bounded grace, then sends group SIGKI
   const proof = await launched.cleanup();
 
   assert.deepEqual(
-    fixture.calls.filter((call) => call.type === "kill"),
+    groupCalls,
     [
       { type: "kill", pid: 4312, signal: "SIGTERM" },
       { type: "kill", pid: 4312, signal: "SIGKILL" }
@@ -401,4 +463,361 @@ test("controlled child spawn environment preserves the supervisor token", () => 
     PATH: "/usr/bin",
     CDX_RELAY_SUPERVISOR_TOKEN: "trusted-token"
   });
+});
+
+test("clean registration close while the process is live latches PROTOCOL_LOST", async () => {
+  const fixture = controlledBackend();
+  const launched = await fixture.backend.launch({
+    ...identity,
+    command: "/usr/bin/true",
+    args: [],
+    env: {},
+    shell: false
+  });
+  await fixture.handlers().hello({
+    type: "hello",
+    version: 1,
+    ...identity,
+    pid: 4500,
+    parentPid: 4312
+  });
+
+  await fixture.handlers().closed(4500);
+
+  await assert.rejects(
+    launched.cleanup(),
+    (error) => error.code === "PROTOCOL_LOST"
+  );
+});
+
+test("cleanup refuses registered-drained while identities remain alive after escalation", async () => {
+  const fixture = controlledBackend({
+    async waitForDrain() {
+      return false;
+    }
+  });
+  const launched = await fixture.backend.launch({
+    ...identity,
+    command: "/usr/bin/true",
+    args: [],
+    env: {},
+    shell: false
+  });
+
+  await assert.rejects(
+    launched.cleanup(),
+    (error) => error.code === "CLEANUP_UNPROVEN"
+  );
+});
+
+test("public kill routes through process-group cleanup instead of raw child kill", async () => {
+  const fixture = controlledBackend();
+  let rawKills = 0;
+  fixture.child.kill = () => {
+    rawKills += 1;
+    return true;
+  };
+  const launched = await fixture.backend.launch({
+    ...identity,
+    command: "/usr/bin/true",
+    args: [],
+    env: {},
+    shell: false
+  });
+
+  const stopped = launched.kill("SIGTERM");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(stopped, {
+    backend: "posix-cooperative",
+    stopped: true
+  });
+  assert.equal(rawKills, 0);
+  assert.equal(
+    fixture.calls.some((call) =>
+      call.type === "kill" && call.pid === 4312 && call.signal === "SIGTERM"),
+    true
+  );
+});
+
+test("hello requires explicit backend identity", async () => {
+  const fixture = controlledBackend();
+  await fixture.backend.launch({
+    ...identity,
+    command: "/usr/bin/true",
+    args: [],
+    env: {},
+    shell: false
+  });
+
+  await assert.rejects(
+    fixture.handlers().hello({
+      type: "hello",
+      version: 1,
+      epoch: identity.epoch,
+      runId: identity.runId,
+      nonce: identity.nonce,
+      pid: 4500,
+      parentPid: 4312
+    }),
+    (error) => error.code === "PROTOCOL_INVALID_MESSAGE"
+  );
+});
+
+test("root completion requires explicit matching backend identity", async () => {
+  const fixture = controlledBackend();
+  const launched = await fixture.backend.launch({
+    ...identity,
+    command: "/usr/bin/true",
+    args: [],
+    env: {},
+    shell: false
+  });
+  fixture.handlers().root({
+    type: "root",
+    version: 1,
+    epoch: identity.epoch,
+    runId: identity.runId,
+    nonce: identity.nonce,
+    status: 0,
+    signal: null
+  });
+
+  await assert.rejects(
+    launched.root,
+    (error) => error.code === "PROTOCOL_INVALID_MESSAGE"
+  );
+});
+
+test("macOS host-strict direct launch refuses before process creation", async () => {
+  let launches = 0;
+  const backend = createMacosBackend({
+    mode: "host-strict",
+    createPosixBackend: () => ({
+      async launch() {
+        launches += 1;
+      },
+      async cleanupAll() {},
+      async shutdown() {}
+    })
+  });
+
+  await assert.rejects(
+    backend.launch({
+      ...identity,
+      command: "/usr/bin/true",
+      args: []
+    }),
+    (error) => error.code === "CAPABILITY_UNAVAILABLE"
+  );
+  assert.equal(launches, 0);
+});
+
+test("real registration socket rejects an oversized release frame", async () => {
+  const channel = await listenOnTestPipe((_message, socket) => {
+    socket.write("x".repeat(1024 * 1024 + 1));
+  });
+  const token = Buffer.from(JSON.stringify({
+    version: 1,
+    epoch: "epoch-real",
+    runId: "run-real",
+    nonce: "nonce-real",
+    endpoint: channel.endpoint
+  })).toString("base64url");
+  try {
+    await assert.rejects(
+      registerControlledDescendant({
+        env: { CDX_RELAY_SUPERVISOR_TOKEN: token },
+        handshakeMs: 1000
+      }),
+      (error) => error.code === "PROTOCOL_FRAME_TOO_LARGE"
+    );
+  } finally {
+    await channel.close();
+  }
+});
+
+test("real registration socket rejects a stalled release handshake", async () => {
+  const channel = await listenOnTestPipe(() => {});
+  const token = Buffer.from(JSON.stringify({
+    version: 1,
+    epoch: "epoch-stall",
+    runId: "run-stall",
+    nonce: "nonce-stall",
+    endpoint: channel.endpoint
+  })).toString("base64url");
+  try {
+    await assert.rejects(
+      registerControlledDescendant({
+        env: { CDX_RELAY_SUPERVISOR_TOKEN: token },
+        handshakeMs: 25
+      }),
+      (error) => error.code === "PROTOCOL_HANDSHAKE_TIMEOUT"
+    );
+  } finally {
+    await channel.close();
+  }
+});
+
+test("real launch shim reports root exit while a descendant holds stdout open", async () => {
+  let resolveRoot;
+  const rootMessage = new Promise((resolve) => {
+    resolveRoot = resolve;
+  });
+  const channel = await listenOnTestPipe((message, socket) => {
+    if (message.type === "hello") {
+      socket.write(`${JSON.stringify({ type: "release", version: 1 })}\n`);
+    } else if (message.type === "root") {
+      resolveRoot(message);
+    }
+  });
+  const token = Buffer.from(JSON.stringify({
+    version: 1,
+    epoch: "epoch-shim",
+    runId: "run-shim",
+    nonce: "nonce-shim",
+    endpoint: channel.endpoint
+  })).toString("base64url");
+  const targetSource = [
+    "const {spawn}=require('node:child_process');",
+    "const child=spawn(process.execPath,['-e','setTimeout(()=>{},1500)'],",
+    "{detached:true,stdio:['ignore',1,2]});",
+    "child.unref();"
+  ].join("");
+  const target = Buffer.from(JSON.stringify({
+    command: process.execPath,
+    args: ["-e", targetSource]
+  })).toString("base64url");
+  const shim = spawn(process.execPath, [launchShimPath, target], {
+    env: { ...process.env, CDX_RELAY_SUPERVISOR_TOKEN: token },
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true
+  });
+  try {
+    const message = await Promise.race([
+      rootMessage,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("root message timed out")), 1000))
+    ]);
+    assert.equal(message.status, 0);
+    assert.equal(shim.stdout.readableEnded, false);
+  } finally {
+    shim.kill();
+    await channel.close();
+  }
+});
+
+test("real clean socket close while registered process is live latches protocol loss", async () => {
+  let endpoint;
+  let registrationChannel;
+  const fixture = controlledBackend({
+    async createRegistrationChannel(handlers) {
+      let registeredPid;
+      const channel = await listenOnTestPipe(async (message, socket) => {
+        registeredPid = message.pid;
+        await handlers.hello(message);
+        socket.write(`${JSON.stringify({ type: "release", version: 1 })}\n`);
+        socket.end();
+      }, () => handlers.closed(registeredPid));
+      endpoint = channel.endpoint;
+      registrationChannel = channel;
+      return channel;
+    }
+  });
+  const launched = await fixture.backend.launch({
+    ...identity,
+    command: "/usr/bin/true",
+    args: [],
+    env: {},
+    shell: false
+  });
+  await new Promise((resolve, reject) => {
+    const socket = net.createConnection({
+      path: endpoint.slice("unix:".length)
+    });
+    socket.resume();
+    socket.setTimeout(1000, () => socket.destroy(new Error("socket close timed out")));
+    socket.once("error", reject);
+    socket.once("close", resolve);
+    socket.write(`${JSON.stringify({
+      type: "hello",
+      version: 1,
+      ...identity,
+      pid: 4500,
+      parentPid: 4312
+    })}\n`);
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  try {
+    await assert.rejects(
+      launched.cleanup(),
+      (error) => error.code === "PROTOCOL_LOST"
+    );
+  } finally {
+    await registrationChannel.close();
+  }
+});
+
+test("real broker spawn preserves exact no-token env and adds only an active token", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "cdx-broker-env-"));
+  const scriptPath = path.join(directory, "capture-env.mjs");
+  const outputPath = path.join(directory, "env.json");
+  const logFile = path.join(directory, "broker.log");
+  const pidFile = path.join(directory, "broker.pid");
+  fs.writeFileSync(
+    scriptPath,
+    `import fs from "node:fs";fs.writeFileSync(${JSON.stringify(outputPath)},JSON.stringify(process.env));`
+  );
+  const originalToken = process.env.CDX_RELAY_SUPERVISOR_TOKEN;
+  const originalParentOnly = process.env.TASK4_PARENT_ONLY;
+  try {
+    process.env.TASK4_PARENT_ONLY = "must-not-leak";
+    delete process.env.CDX_RELAY_SUPERVISOR_TOKEN;
+    spawnBrokerProcess({
+      scriptPath,
+      cwd: directory,
+      endpoint: "unused",
+      pidFile,
+      logFile,
+      env: { ONLY_CALLER_ENV: "present" }
+    });
+    for (let index = 0; index < 100 && !fs.existsSync(outputPath); index += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const noTokenEnv = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    assert.equal(noTokenEnv.ONLY_CALLER_ENV, "present");
+    assert.equal(noTokenEnv.CDX_RELAY_SUPERVISOR_TOKEN, undefined);
+    assert.equal(noTokenEnv.TASK4_PARENT_ONLY, undefined);
+
+    fs.rmSync(outputPath);
+    process.env.CDX_RELAY_SUPERVISOR_TOKEN = "active-token";
+    spawnBrokerProcess({
+      scriptPath,
+      cwd: directory,
+      endpoint: "unused",
+      pidFile,
+      logFile,
+      env: { ONLY_CALLER_ENV: "present" }
+    });
+    for (let index = 0; index < 100 && !fs.existsSync(outputPath); index += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const tokenEnv = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    assert.equal(tokenEnv.ONLY_CALLER_ENV, "present");
+    assert.equal(tokenEnv.CDX_RELAY_SUPERVISOR_TOKEN, "active-token");
+    assert.equal(tokenEnv.TASK4_PARENT_ONLY, undefined);
+  } finally {
+    if (originalToken === undefined) {
+      delete process.env.CDX_RELAY_SUPERVISOR_TOKEN;
+    } else {
+      process.env.CDX_RELAY_SUPERVISOR_TOKEN = originalToken;
+    }
+    if (originalParentOnly === undefined) {
+      delete process.env.TASK4_PARENT_ONLY;
+    } else {
+      process.env.TASK4_PARENT_ONLY = originalParentOnly;
+    }
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });

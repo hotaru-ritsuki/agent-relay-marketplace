@@ -30,17 +30,29 @@ const socket = net.createConnection({ path: token.endpoint.slice("unix:".length)
 socket.setEncoding("utf8");
 await new Promise((resolve, reject) => {
   let pending = "";
+  const timer = setTimeout(() => {
+    socket.destroy();
+    reject(new Error("Supervisor release deadline expired."));
+  }, 5000);
   socket.once("error", reject);
   socket.on("data", (chunk) => {
     pending += chunk;
+    if (Buffer.byteLength(pending) > 1024 * 1024) {
+      clearTimeout(timer);
+      reject(new Error("Supervisor release frame exceeds 1048576 bytes."));
+      socket.destroy();
+      return;
+    }
     const newline = pending.indexOf("\n");
     if (newline < 0) return;
     const message = JSON.parse(pending.slice(0, newline));
     if (message.type !== "release" || message.version !== 1) {
+      clearTimeout(timer);
       reject(new Error("Invalid supervisor release."));
       return;
     }
     socket.off("error", reject);
+    clearTimeout(timer);
     resolve();
   });
   socket.write(`${JSON.stringify({
