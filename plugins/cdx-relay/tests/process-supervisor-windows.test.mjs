@@ -950,10 +950,10 @@ test("Windows controller exit resets the Worker client and next launch restarts 
 test("Windows assignment failure terminates the retained suspended shim", {
   skip: process.platform !== "win32"
 }, () => {
-  const countSliceProcesses = () => {
+  const countShimProcesses = () => {
     const result = spawnSync("pwsh.exe", [
       "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
-      "$p=@(Get-CimInstance Win32_Process | ? { $_.ProcessId -ne $PID -and $_.CommandLine -and ($_.CommandLine -like '*process-supervisor*native*windows*controller.ps1*' -or $_.CommandLine -like '*process-supervisor*native*windows*launch-shim.mjs*') }); $p.Count"
+      "$p=@(Get-CimInstance Win32_Process | ? { $_.ProcessId -ne $PID -and $_.CommandLine -and $_.CommandLine -like '*process-supervisor*native*windows*launch-shim.mjs*' -and $_.CommandLine -notlike '*process-supervisor*native*windows*controller.ps1*' }); $p.Count"
     ], { encoding: "utf8", windowsHide: true });
     return Number(result.stdout.trim());
   };
@@ -986,7 +986,7 @@ test("Windows assignment failure terminates the retained suspended shim", {
         (error) => error?.code === "ESRCH"
       );
     }
-    assert.equal(countSliceProcesses(), 0);
+    assert.equal(countShimProcesses(), 0);
   }
 });
 
@@ -1269,7 +1269,7 @@ test("invalid cleanup proof poisons the exact old controller before restart", {
   assert.equal(sibling.controllerInstanceId, invalid.controllerInstanceId);
   assert.throws(
     () => cleanupBackendLaunch(invalid.lease),
-    /invalid terminal proof/i
+    /invalid (?:ownership )?terminal proof/i
   );
   const oldControllerPid = Number(fs.readFileSync(controllerPidFile, "utf8"));
   assert.throws(
@@ -1288,23 +1288,21 @@ test("invalid cleanup proof poisons the exact old controller before restart", {
   assert.equal(getBackendLeaseCount(), 0);
 });
 
-test("cleanup proof controller PID mismatch poisons its epoch", {
+test("cleanup proof controller PID is diagnostic rather than ownership", {
   skip: process.platform !== "win32"
 }, () => {
-  const invalid = runBackend(process.execPath, ["-e", ""], {
+  const diagnostic = runBackend(process.execPath, ["-e", ""], {
     controllerFault: "mismatched-controller-pid-proof",
     timeout: 2000
   });
-  assert.throws(
-    () => cleanupBackendLaunch(invalid.lease),
-    /invalid terminal proof/i
-  );
+  const proof = cleanupBackendLaunch(diagnostic.lease);
+  assert.notEqual(proof.controllerPid, diagnostic.controllerPid);
   assert.equal(getBackendLeaseCount(), 0);
 
   const fresh = runBackend(process.execPath, ["-e", ""], {
     timeout: 2000
   });
-  assert.notEqual(fresh.controllerPid, invalid.controllerPid);
+  assert.equal(fresh.controllerPid, diagnostic.controllerPid);
   cleanupBackendLaunch(fresh.lease);
   assert.equal(getBackendLeaseCount(), 0);
 });
@@ -1392,6 +1390,91 @@ test("replacement Windows Worker still performs repeatable explicit shutdown", {
     );
   }
   assert.equal(countSliceProcesses(), baseline);
+});
+
+test("Windows cleanup rejects mismatch and replay for every ownership tuple field", {
+  skip: process.platform !== "win32"
+}, async () => {
+  const backend = createWindowsBackend();
+  const result = backend.test.runWindowsJobForTest(
+    process.execPath,
+    ["-e", "process.stdout.write('owned')"],
+    { timeout: 2000 }
+  );
+  const expected = result.lease.ownership;
+  assert.deepEqual(Object.keys(expected).sort(), [
+    "backend", "epoch", "nonce", "runId"
+  ]);
+
+  const proof = backend.test.cleanupWindowsJobForTest(result.lease);
+  for (const field of ["epoch", "runId", "nonce", "backend"]) {
+    assert.equal(proof[field], expected[field]);
+    assert.throws(
+      () => backend.test.cleanupWindowsJobForTest({
+        ...result.lease,
+        ownership: { ...expected, [field]: `${expected[field]}-replayed` }
+      }),
+      /ownership|unknown Windows job launch/i,
+      `${field} replay must fail closed`
+    );
+  }
+  await backend.shutdown();
+});
+
+test("Windows cleanup rejects native proof mismatch for every ownership tuple field", {
+  skip: process.platform !== "win32"
+}, async () => {
+  for (const field of ["epoch", "runId", "nonce", "backend"]) {
+    const backend = createWindowsBackend();
+    const result = backend.test.runWindowsJobForTest(
+      process.execPath,
+      ["-e", "process.stdout.write('mismatch')"],
+      {
+        controllerFault: `mismatched-${field}-proof`,
+        timeout: 2000
+      }
+    );
+    assert.throws(
+      () => backend.test.cleanupWindowsJobForTest(result.lease),
+      /ownership|invalid terminal proof/i,
+      `${field} proof mismatch must fail closed`
+    );
+    await backend.shutdown();
+  }
+});
+
+test("two Windows backend instances isolate cleanup poison and shutdown", {
+  skip: process.platform !== "win32"
+}, async () => {
+  const first = createWindowsBackend();
+  const second = createWindowsBackend();
+  const firstRun = first.test.runWindowsJobForTest(
+    process.execPath,
+    ["-e", "process.stdout.write('first')"],
+    { controllerFault: "invalid-cleanup-proof", timeout: 2000 }
+  );
+  const secondRun = second.test.runWindowsJobForTest(
+    process.execPath,
+    ["-e", "process.stdout.write('second')"],
+    { timeout: 2000 }
+  );
+
+  assert.equal(first.test.getWindowsJobLeaseCount(), 1);
+  assert.equal(second.test.getWindowsJobLeaseCount(), 1);
+  assert.throws(
+    () => first.test.cleanupWindowsJobForTest(firstRun.lease),
+    /invalid (?:ownership )?terminal proof/i
+  );
+  assert.equal(second.test.getWindowsJobLeaseCount(), 1);
+  process.kill(secondRun.controllerPid, 0);
+
+  await first.shutdown();
+  process.kill(secondRun.controllerPid, 0);
+  assert.equal(
+    second.test.cleanupWindowsJobForTest(secondRun.lease).activeProcesses,
+    0
+  );
+  await second.shutdown();
 });
 
 test("Windows backend shutdown stops infrastructure after cleanup failure", {

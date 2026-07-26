@@ -2,6 +2,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
@@ -20,6 +21,10 @@ const WINDOWS_CAPABILITIES = Object.freeze({
   supportsDetachedDescendants: true
 });
 const LEASE = Symbol("windows-job-lease");
+const OWNERSHIP_FIELDS = Object.freeze(["epoch", "runId", "nonce", "backend"]);
+
+export function createWindowsBackend({ faults = {} } = {}) {
+const backendInstanceId = randomUUID();
 let windowsJobWorker = null;
 let windowsJobWorkerChannel = null;
 let windowsJobWorkerReady = null;
@@ -31,8 +36,38 @@ let windowsJobShuttingDown = false;
 const windowsJobLeases = new Map();
 const completedWindowsJobProofs = new Map();
 
+function validateOwnership(ownership, label = "Windows job ownership") {
+  if (!ownership || typeof ownership !== "object" || Array.isArray(ownership) ||
+      Object.keys(ownership).sort().join(",") !==
+        [...OWNERSHIP_FIELDS].sort().join(",") ||
+      OWNERSHIP_FIELDS.some((field) =>
+        typeof ownership[field] !== "string" || !ownership[field]
+      )) {
+    throw new TypeError(`${label} is invalid.`);
+  }
+  return ownership;
+}
+
+function sameOwnership(left, right) {
+  return OWNERSHIP_FIELDS.every((field) => left?.[field] === right?.[field]);
+}
+
+function ownershipFor(options = {}) {
+  const ownership = options.ownership ?? {
+    epoch: randomUUID(),
+    runId: randomUUID(),
+    nonce: randomUUID(),
+    backend: "windows-job"
+  };
+  validateOwnership(ownership);
+  return Object.freeze({ ...ownership });
+}
+
 function validateWindowsJobLease(lease) {
   if (!lease || typeof lease !== "object" ||
+      lease.backendInstanceId !== backendInstanceId ||
+      !lease.ownership ||
+      !sameOwnership(lease.ownership, validateOwnership(lease.ownership)) ||
       typeof lease.controllerInstanceId !== "string" || !lease.controllerInstanceId ||
       typeof lease.launchId !== "string" || !lease.launchId ||
       !Number.isSafeInteger(lease.controllerPid) || lease.controllerPid <= 0 ||
@@ -266,6 +301,7 @@ function launchWindowsJob(command, args, options = {}) {
     throw new RangeError("maxBuffer must be a bounded integer.");
   }
   const controlTimeout = options.controlTimeout ?? 7000;
+  const ownership = ownershipFor(options);
   const lease = requestWindowsJobWorker(
     "launch",
     {
@@ -282,6 +318,7 @@ function launchWindowsJob(command, args, options = {}) {
           maxBuffer
         },
         input: { type: "string", value: "" },
+        ownership,
         testFault: options.controllerFault,
           faultPidFile: options.faultPidFile,
           handshakePid: options.handshakePid
@@ -290,6 +327,12 @@ function launchWindowsJob(command, args, options = {}) {
     },
     controlTimeout + 1000
   );
+  if (!sameOwnership(lease.ownership, ownership)) {
+    poisonWindowsJobWorker();
+    throw new Error("Windows job launch ownership changed in transit.");
+  }
+  lease.backendInstanceId = backendInstanceId;
+  lease.ownership = Object.freeze({ ...lease.ownership });
   lease.maxBuffer = maxBuffer;
   lease.controlTimeout = controlTimeout;
   windowsJobLeases.set(lease.launchId, lease);
@@ -318,7 +361,7 @@ function createWindowsSpawnError(descriptor, { synchronous = true } = {}) {
   return error;
 }
 
-export function runWindowsJobForTest(command, args, options = {}) {
+function runWindowsJobForTest(command, args, options = {}) {
   if (process.platform !== "win32") {
     throw new Error("The Windows job controller is only available on Windows.");
   }
@@ -381,6 +424,7 @@ export function runWindowsJobForTest(command, args, options = {}) {
     throw new Error("Windows job lease limit reached; explicit cleanup is required.");
   }
   const maxBuffer = options.maxBuffer ?? 1024 * 1024;
+  const ownership = ownershipFor(options);
   let lease;
   let transportPoisoned = false;
   try {
@@ -400,6 +444,7 @@ export function runWindowsJobForTest(command, args, options = {}) {
             maxBuffer
           },
           input,
+          ownership,
           testFault: options.controllerFault,
           faultPidFile: options.faultPidFile,
           controllerPidFile: options.controllerPidFile,
@@ -410,6 +455,12 @@ export function runWindowsJobForTest(command, args, options = {}) {
       },
       (options.controlTimeout ?? 7000) + 1000
     );
+    if (!sameOwnership(lease.ownership, ownership)) {
+      poisonWindowsJobWorker();
+      throw new Error("Windows job launch ownership changed in transit.");
+    }
+    lease.backendInstanceId = backendInstanceId;
+    lease.ownership = Object.freeze({ ...lease.ownership });
     windowsJobLeases.set(lease.launchId, lease);
     lease.maxBuffer = maxBuffer;
     windowsJobControllerInstanceId = lease.controllerInstanceId;
@@ -433,6 +484,9 @@ export function runWindowsJobForTest(command, args, options = {}) {
     }
     if (typeof result.stdoutBase64 !== "string" || typeof result.stderrBase64 !== "string") {
       throw new Error("Controller returned an invalid output snapshot.");
+    }
+    if (!sameOwnership(result, lease.ownership)) {
+      throw new Error("Windows job wait ownership changed in transit.");
     }
     const stdout = Buffer.from(result.stdoutBase64, "base64");
     const stderr = Buffer.from(result.stderrBase64, "base64");
@@ -473,7 +527,7 @@ export function runWindowsJobForTest(command, args, options = {}) {
   }
 }
 
-export function cleanupWindowsJobForTest(leaseOrLaunchId) {
+function cleanupWindowsJobForTest(leaseOrLaunchId) {
   const suppliedLease = typeof leaseOrLaunchId === "object" && leaseOrLaunchId
     ? leaseOrLaunchId
     : null;
@@ -481,11 +535,21 @@ export function cleanupWindowsJobForTest(leaseOrLaunchId) {
   const lease = suppliedLease
     ? windowsJobLeases.get(suppliedLease.launchId)
     : windowsJobLeases.get(leaseOrLaunchId);
+  if (lease && suppliedLease &&
+      (suppliedLease.backendInstanceId !== lease.backendInstanceId ||
+        !sameOwnership(suppliedLease.ownership, lease.ownership))) {
+    throw new Error("Windows job cleanup ownership does not match the active lease.");
+  }
   if (!lease && suppliedLease) {
     const completed = completedWindowsJobProofs.get(suppliedLease.launchId);
-    if (completed?.controllerInstanceId === suppliedLease.controllerInstanceId &&
-        completed?.controllerPid === suppliedLease.controllerPid) {
+    if (completed?.backendInstanceId === suppliedLease.backendInstanceId &&
+        sameOwnership(completed?.ownership, suppliedLease.ownership)) {
       return completed.proof;
+    }
+    if (completed) {
+      throw new Error(
+        "Windows job cleanup ownership does not match the terminal tombstone."
+      );
     }
   }
   if (!lease) throw new Error(`Unknown Windows job launch: ${leaseOrLaunchId}`);
@@ -507,8 +571,7 @@ export function cleanupWindowsJobForTest(leaseOrLaunchId) {
     throw error;
   }
   if (
-    proof.controllerInstanceId !== lease.controllerInstanceId ||
-    proof.controllerPid !== lease.controllerPid ||
+    !sameOwnership(proof, lease.ownership) ||
     proof.launchId !== launchId ||
     proof.status !== "stopped" ||
     proof.activeProcesses !== 0 ||
@@ -520,8 +583,9 @@ export function cleanupWindowsJobForTest(leaseOrLaunchId) {
   }
   windowsJobLeases.delete(launchId);
   completedWindowsJobProofs.set(launchId, {
+    backendInstanceId: lease.backendInstanceId,
     controllerInstanceId: lease.controllerInstanceId,
-    controllerPid: lease.controllerPid,
+    ownership: lease.ownership,
     proof
   });
   while (completedWindowsJobProofs.size > 128) {
@@ -673,7 +737,7 @@ async function legacySpawnTracked(command, args, options = {}) {
   return child;
 }
 
-export function getWindowsJobLeaseCount() {
+function getWindowsJobLeaseCount() {
   return windowsJobLeases.size;
 }
 
@@ -711,15 +775,30 @@ function launchOptions(spec, faults) {
     windowsHide: spec.windowsHide,
     stdio: spec.stdio,
     shell: false,
-    ...faultsFor(spec, faults)
+    ...faultsFor(spec, faults),
+    ownership: {
+      epoch: spec.epoch,
+      runId: spec.runId,
+      nonce: spec.nonce,
+      backend: spec.backend
+    }
   };
 }
 
 function cleanupProof(spec, proof) {
+  const expected = {
+    epoch: spec.epoch,
+    runId: spec.runId,
+    nonce: spec.nonce,
+    backend: spec.backend
+  };
+  if (!sameOwnership(proof, validateOwnership(expected))) {
+    throw new Error("Windows job cleanup proof ownership changed in transit.");
+  }
   return {
     backend: "windows-job",
     level: "kernel-drained",
-    controllerEpoch: proof.controllerInstanceId,
+    controllerEpoch: proof.epoch,
     runId: spec.runId,
     nonce: spec.nonce,
     terminalState: proof.status,
@@ -741,7 +820,6 @@ function stopInfrastructure(faults = {}) {
   }
 }
 
-export function createWindowsBackend({ faults = {} } = {}) {
   const launch = async (spec) => {
     const child = await legacySpawnTracked(
       spec.command,
@@ -809,6 +887,36 @@ export function createWindowsBackend({ faults = {} } = {}) {
     };
   };
 
+  const runSynchronous = (request) => {
+    const result = runWindowsJobForTest(
+      request.spec.command,
+      request.spec.args ?? [],
+      launchOptions({
+        ...request.spec,
+        epoch: request.epoch,
+        runId: request.runId,
+        nonce: request.nonce,
+        backend: "windows-job"
+      }, faults)
+    );
+    const proof = cleanupWindowsJobForTest(result.lease);
+    return {
+      capabilities: { ...WINDOWS_CAPABILITIES },
+      root: {
+        backend: "windows-job",
+        status: result.status,
+        signal: result.signal,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        error: result.error
+      },
+      cleanup: cleanupProof({
+        ...request,
+        backend: "windows-job"
+      }, proof)
+    };
+  };
+
   return {
     async probe() {
       return {
@@ -820,6 +928,7 @@ export function createWindowsBackend({ faults = {} } = {}) {
     launch,
     cleanup,
     cleanupAll: cleanup,
+    runSynchronous,
     async shutdown() {
       let cleanupError;
       let stopError;
@@ -847,26 +956,5 @@ export function createWindowsBackend({ faults = {} } = {}) {
       cleanupWindowsJobForTest,
       getWindowsJobLeaseCount
     }
-  };
-}
-
-export function runWindowsSynchronous(request, { faults = {} } = {}) {
-  const result = runWindowsJobForTest(
-    request.spec.command,
-    request.spec.args ?? [],
-    launchOptions(request.spec, faults)
-  );
-  const proof = cleanupWindowsJobForTest(result.lease);
-  return {
-    capabilities: { ...WINDOWS_CAPABILITIES },
-    root: {
-      backend: "windows-job",
-      status: result.status,
-      signal: result.signal,
-      stdout: result.stdout,
-      stderr: result.stderr,
-      error: result.error
-    },
-    cleanup: cleanupProof(request, proof)
   };
 }

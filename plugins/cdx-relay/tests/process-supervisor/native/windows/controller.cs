@@ -159,6 +159,7 @@ public static class PersistentWindowsJobController
     {
         public readonly object Gate = new object();
         public string Id;
+        public OwnershipIdentity Ownership;
         public string TargetPidDirectory;
         public string TargetPidFile;
         public string TestFault;
@@ -205,6 +206,35 @@ public static class PersistentWindowsJobController
         }
     }
 
+    sealed class OwnershipIdentity
+    {
+        public string epoch { get; set; }
+        public string runId { get; set; }
+        public string nonce { get; set; }
+        public string backend { get; set; }
+    }
+
+    sealed class TerminalProof
+    {
+        public string epoch { get; set; }
+        public string runId { get; set; }
+        public string nonce { get; set; }
+        public string backend { get; set; }
+        public string controllerInstanceId { get; set; }
+        public int controllerPid { get; set; }
+        public string launchId { get; set; }
+        public string status { get; set; }
+        public uint activeProcesses { get; set; }
+        public bool tombstone { get; set; }
+        public string errorCode { get; set; }
+    }
+
+    sealed class TombstoneRecord
+    {
+        public OwnershipIdentity Ownership;
+        public TerminalProof Proof;
+    }
+
     sealed class ShimResult
     {
         public long? status { get; set; }
@@ -230,8 +260,8 @@ public static class PersistentWindowsJobController
 
     static readonly ConcurrentDictionary<string, LaunchRecord> Launches =
         new ConcurrentDictionary<string, LaunchRecord>();
-    static readonly ConcurrentDictionary<string, object> Tombstones =
-        new ConcurrentDictionary<string, object>();
+    static readonly ConcurrentDictionary<string, TombstoneRecord> Tombstones =
+        new ConcurrentDictionary<string, TombstoneRecord>();
     static readonly Queue<string> TombstoneOrder = new Queue<string>();
     static readonly object TombstoneGate = new object(), WriteGate = new object();
     static Stream OutputStream;
@@ -280,9 +310,45 @@ public static class PersistentWindowsJobController
         }
     }
 
+    static OwnershipIdentity ReadOwnership(JsonElement container)
+    {
+        JsonElement value = container.GetProperty("ownership");
+        if (value.ValueKind != JsonValueKind.Object ||
+            value.EnumerateObject().Count() != 4)
+            throw new InvalidOperationException("Ownership tuple is invalid.");
+        var ownership = new OwnershipIdentity {
+            epoch = value.GetProperty("epoch").GetString(),
+            runId = value.GetProperty("runId").GetString(),
+            nonce = value.GetProperty("nonce").GetString(),
+            backend = value.GetProperty("backend").GetString()
+        };
+        if (String.IsNullOrEmpty(ownership.epoch) ||
+            String.IsNullOrEmpty(ownership.runId) ||
+            String.IsNullOrEmpty(ownership.nonce) ||
+            String.IsNullOrEmpty(ownership.backend))
+            throw new InvalidOperationException("Ownership tuple is invalid.");
+        return ownership;
+    }
+
+    static bool SameOwnership(OwnershipIdentity left, OwnershipIdentity right)
+    {
+        return left != null && right != null &&
+            left.epoch == right.epoch &&
+            left.runId == right.runId &&
+            left.nonce == right.nonce &&
+            left.backend == right.backend;
+    }
+
+    static void RequireOwnership(JsonElement request, OwnershipIdentity expected)
+    {
+        if (!SameOwnership(ReadOwnership(request), expected))
+            throw new InvalidOperationException("Ownership tuple mismatch.");
+    }
+
     static void HandleLaunch(JsonElement request, long requestId, string node, string shim)
     {
         JsonElement launch = request.GetProperty("launch");
+        OwnershipIdentity ownership = ReadOwnership(launch);
         string launchId = Guid.NewGuid().ToString("N");
         string configuredFault = launch.TryGetProperty("testFault", out var configuredFaultElement) &&
             configuredFaultElement.ValueKind == JsonValueKind.String
@@ -295,6 +361,7 @@ public static class PersistentWindowsJobController
         var record = StartSuspended(node, shim, launchId, configuredFault, faultPidPath);
         try
         {
+            record.Ownership = ownership;
             record.TestFault = configuredFault;
             if (launch.TryGetProperty("controllerPidFile", out var controllerPidFile) &&
                 controllerPidFile.ValueKind == JsonValueKind.String)
@@ -337,6 +404,7 @@ public static class PersistentWindowsJobController
             Write(new {
                 requestId, action = "launch", status = "ok", controllerInstanceId = InstanceId,
                 launchId,
+                ownership,
                 pid = record.SpawnError == null ? (int?)record.TargetPid : null,
                 spawnError = record.SpawnError
             });
@@ -433,6 +501,7 @@ public static class PersistentWindowsJobController
         string launchId = request.GetProperty("launchId").GetString();
         if (!Launches.TryGetValue(launchId, out var record))
             throw new InvalidOperationException("Unknown launch.");
+        RequireOwnership(request, record.Ownership);
         if (record.TestFault == "drop-wait-ack") return;
         if (record.TestFault == "malformed-wait-frame")
         {
@@ -490,6 +559,8 @@ public static class PersistentWindowsJobController
                 }
                 WriteOutputChunks(requestId, record.RootSnapshot);
                 Write(new { requestId, action = "wait", controllerInstanceId = InstanceId, status = "ok", result = new {
+                    record.Ownership.epoch, record.Ownership.runId,
+                    record.Ownership.nonce, record.Ownership.backend,
                     status, result.signal, error,
                     stdout = OutputProof(record.RootSnapshot.Stdout, record.TestFault, "stdout"),
                     stderr = OutputProof(record.RootSnapshot.Stderr, record.TestFault, "stderr")
@@ -504,6 +575,8 @@ public static class PersistentWindowsJobController
                     };
                     WriteOutputChunks(requestId, snapshot);
                     Write(new { requestId, action = "wait", controllerInstanceId = InstanceId, status = "ok", result = new {
+                        record.Ownership.epoch, record.Ownership.runId,
+                        record.Ownership.nonce, record.Ownership.backend,
                         status = (long?)null,
                         signal = (string)null,
                         error = record.Overflow
@@ -521,17 +594,21 @@ public static class PersistentWindowsJobController
     static void HandleCleanup(JsonElement request, long requestId)
     {
         string launchId = request.GetProperty("launchId").GetString();
-        if (Tombstones.TryGetValue(launchId, out var oldProof))
+        if (Tombstones.TryGetValue(launchId, out var tombstone))
         {
-            Write(new { requestId, action = "cleanup", controllerInstanceId = InstanceId, status = "ok", result = oldProof });
+            RequireOwnership(request, tombstone.Ownership);
+            Write(new { requestId, action = "cleanup", controllerInstanceId = InstanceId, status = "ok", result = tombstone.Proof });
             return;
         }
         if (!Launches.TryGetValue(launchId, out var record))
             throw new InvalidOperationException("Unknown launch.");
+        RequireOwnership(request, record.Ownership);
         if (record.TestFault == "drop-cleanup-ack") return;
         if (record.TestFault == "invalid-cleanup-proof")
         {
             Write(new { requestId, action = "cleanup", controllerInstanceId = InstanceId, status = "ok", result = new {
+                record.Ownership.epoch, record.Ownership.runId,
+                record.Ownership.nonce, record.Ownership.backend,
                 controllerInstanceId = InstanceId,
                 controllerPid = Environment.ProcessId + 1,
                 launchId,
@@ -544,6 +621,8 @@ public static class PersistentWindowsJobController
         if (record.TestFault == "mismatched-controller-pid-proof")
         {
             Write(new { requestId, action = "cleanup", controllerInstanceId = InstanceId, status = "ok", result = new {
+                record.Ownership.epoch, record.Ownership.runId,
+                record.Ownership.nonce, record.Ownership.backend,
                 controllerInstanceId = InstanceId,
                 controllerPid = Environment.ProcessId + 1,
                 launchId,
@@ -607,21 +686,44 @@ public static class PersistentWindowsJobController
         if (!Task.WaitAll(new[] { record.StdoutDrain, record.StderrDrain }, 3000))
             throw new InvalidOperationException("Cleanup output-drain deadline expired.");
         lock (record.Gate) record.State = LaunchState.Terminal;
-        var proof = new { controllerInstanceId = InstanceId,
-            controllerPid = Environment.ProcessId, launchId = record.Id,
-            status = "stopped", activeProcesses = 0, tombstone = true,
-            errorCode = record.Overflow ? "ENOBUFS" : record.TimedOut ? "ETIMEDOUT" : null };
+        var proof = new TerminalProof {
+            epoch = record.Ownership.epoch,
+            runId = record.Ownership.runId,
+            nonce = record.Ownership.nonce,
+            backend = record.Ownership.backend,
+            controllerInstanceId = InstanceId,
+            controllerPid = Environment.ProcessId,
+            launchId = record.Id,
+            status = "stopped",
+            activeProcesses = 0,
+            tombstone = true,
+            errorCode = record.Overflow ? "ENOBUFS" : record.TimedOut ? "ETIMEDOUT" : null
+        };
+        if (record.TestFault == "mismatched-epoch-proof")
+            proof.epoch += "-mismatch";
+        else if (record.TestFault == "mismatched-runId-proof")
+            proof.runId += "-mismatch";
+        else if (record.TestFault == "mismatched-nonce-proof")
+            proof.nonce += "-mismatch";
+        else if (record.TestFault == "mismatched-backend-proof")
+            proof.backend += "-mismatch";
         Launches.TryRemove(record.Id, out _);
-        AddTombstone(record.Id, proof);
+        AddTombstone(record.Id, record.Ownership, proof);
         record.Dispose();
         return proof;
     }
 
-    static void AddTombstone(string id, object proof)
+    static void AddTombstone(
+        string id,
+        OwnershipIdentity ownership,
+        TerminalProof proof)
     {
         lock (TombstoneGate)
         {
-            Tombstones[id] = proof;
+            Tombstones[id] = new TombstoneRecord {
+                Ownership = ownership,
+                Proof = proof
+            };
             TombstoneOrder.Enqueue(id);
             while (TombstoneOrder.Count > 128)
                 Tombstones.TryRemove(TombstoneOrder.Dequeue(), out _);

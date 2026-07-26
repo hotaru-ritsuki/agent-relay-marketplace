@@ -26,15 +26,13 @@ export { runSynchronous } from "./worker.mjs";
 export { createWindowsBackend } from "./backends/windows.mjs";
 
 import { createProcessSupervisor } from "./coordinator.mjs";
-import {
-  createWindowsBackend,
-  runWindowsSynchronous
-} from "./backends/windows.mjs";
+import { createWindowsBackend } from "./backends/windows.mjs";
 
+const sharedWindowsBackend = createWindowsBackend();
 const sharedSupervisor = createProcessSupervisor({
   minimumGuarantee: "cooperative",
-  backendFactories: [createWindowsBackend],
-  syncBridge: runWindowsSynchronous,
+  backendFactories: [() => sharedWindowsBackend],
+  syncBridge: sharedWindowsBackend.runSynchronous,
   syncBackendSelection: { type: "windows-job" }
 });
 

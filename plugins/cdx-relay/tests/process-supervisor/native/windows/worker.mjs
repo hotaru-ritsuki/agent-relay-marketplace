@@ -152,6 +152,22 @@ function hasExactKeys(value, keys) {
     actual.every((key, index) => key === expected[index]);
 }
 
+const OWNERSHIP_FIELDS = Object.freeze(["epoch", "runId", "nonce", "backend"]);
+
+function validateOwnership(ownership) {
+  if (!hasExactKeys(ownership, OWNERSHIP_FIELDS) ||
+      OWNERSHIP_FIELDS.some((field) =>
+        typeof ownership[field] !== "string" || !ownership[field]
+      )) {
+    throw new Error("Controller ownership tuple is invalid.");
+  }
+  return ownership;
+}
+
+function sameOwnership(left, right) {
+  return OWNERSHIP_FIELDS.every((field) => left?.[field] === right?.[field]);
+}
+
 function decodeCanonicalBase64(value) {
   if (typeof value !== "string" || value.length % 4 !== 0 ||
       !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
@@ -217,7 +233,11 @@ function validateOutputProof(proof, chunks, stream) {
 function finalizeWaitResponse(message, waiter) {
   const result = message.result;
   if (!result || typeof result !== "object" ||
-      !hasExactKeys(result, ["status", "signal", "error", "stdout", "stderr"]) ||
+      !hasExactKeys(result, [
+        "epoch", "runId", "nonce", "backend",
+        "status", "signal", "error", "stdout", "stderr"
+      ]) ||
+      !sameOwnership(result, validateOwnership(waiter.ownership)) ||
       !(result.status === null ||
         Number.isSafeInteger(result.status) &&
         result.status >= 0 && result.status <= 0xffffffff) ||
@@ -256,6 +276,10 @@ function finalizeWaitResponse(message, waiter) {
   return {
     ...message,
     result: {
+      epoch: result.epoch,
+      runId: result.runId,
+      nonce: result.nonce,
+      backend: result.backend,
       status: result.status,
       signal: result.signal,
       error: result.error,
@@ -311,7 +335,7 @@ function handleFrame(message) {
     const expectedKeys = waiter.type === "launch"
       ? [
           "requestId", "action", "controllerInstanceId", "status",
-          "launchId", "pid", "spawnError"
+          "launchId", "ownership", "pid", "spawnError"
         ]
       : ["requestId", "action", "controllerInstanceId", "status", "result"];
     if (!hasExactKeys(message, expectedKeys)) {
@@ -436,6 +460,7 @@ async function request(type, payload, timeoutMs, { maxBuffer = 0 } = {}) {
       timer,
       type,
       maxBuffer,
+      ownership: payload.ownership ?? payload.launch?.ownership,
       output: { stdout: [], stderr: [], total: 0 }
     });
   });
@@ -462,11 +487,15 @@ async function cleanupLease(lease, timeoutMs = 7000) {
   if (lease.controllerInstanceId !== controllerInstanceId) {
     throw new Error("Controller instance changed before terminal cleanup proof.");
   }
-  const response = await request("cleanup", { launchId: lease.launchId }, timeoutMs);
+  const response = await request("cleanup", {
+    launchId: lease.launchId,
+    ownership: lease.ownership
+  }, timeoutMs);
+  validateTerminalProof(response.result, lease);
   return response.result;
 }
 
-function validateLaunchResponse(response) {
+function validateLaunchResponse(response, expectedOwnership) {
   const successful = Number.isSafeInteger(response.pid) && response.pid > 0 &&
     response.spawnError === null;
   const failed = response.pid === null && response.spawnError &&
@@ -477,18 +506,36 @@ function validateLaunchResponse(response) {
     Array.isArray(response.spawnError.spawnargs);
   if (typeof response.launchId !== "string" || !response.launchId ||
       (!successful && !failed) ||
+      !sameOwnership(
+        validateOwnership(response.ownership),
+        validateOwnership(expectedOwnership)
+      ) ||
       response.controllerInstanceId !== controllerInstanceId) {
     throw new Error("Controller returned an invalid launch response.");
   }
 }
 
-function validateWaitResult(result) {
+function validateWaitResult(result, expectedOwnership) {
   if (!result || typeof result !== "object" ||
+      !sameOwnership(result, validateOwnership(expectedOwnership)) ||
       !(result.status === null || Number.isInteger(result.status)) ||
       typeof result.stdoutBase64 !== "string" ||
       typeof result.stderrBase64 !== "string" ||
       !(result.error === null || typeof result.error === "object")) {
     throw new Error("Controller returned an invalid wait result.");
+  }
+}
+
+function validateTerminalProof(proof, lease) {
+  if (!proof || typeof proof !== "object" ||
+      !sameOwnership(proof, validateOwnership(lease.ownership)) ||
+      proof.launchId !== lease.launchId ||
+      proof.controllerInstanceId !== lease.controllerInstanceId ||
+      !Number.isSafeInteger(proof.controllerPid) || proof.controllerPid <= 0 ||
+      proof.status !== "stopped" ||
+      proof.activeProcesses !== 0 ||
+      proof.tombstone !== true) {
+    throw new Error("Controller returned an invalid ownership terminal proof.");
   }
 }
 
@@ -513,7 +560,7 @@ requestPort.on("message", async ({ operation, payload, port, shared }) => {
         { launch: payload.launch },
         payload.controlTimeout ?? 7000
       );
-      validateLaunchResponse(response);
+      validateLaunchResponse(response, payload.launch.ownership);
       Atomics.store(stages, 3, 1);
       if (payload.workerFault === "drop-response-port") {
         port.close();
@@ -523,6 +570,7 @@ requestPort.on("message", async ({ operation, payload, port, shared }) => {
         controllerInstanceId,
         controllerPid: controller.pid,
         launchId: response.launchId,
+        ownership: response.ownership,
         pid: response.pid,
         spawnError: response.spawnError
       });
@@ -536,11 +584,11 @@ requestPort.on("message", async ({ operation, payload, port, shared }) => {
       try {
         const response = await request(
           "wait",
-          { launchId: lease.launchId },
+          { launchId: lease.launchId, ownership: lease.ownership },
           payload.controlTimeout ?? 30000,
           { maxBuffer: lease.maxBuffer }
         );
-        validateWaitResult(response.result);
+        validateWaitResult(response.result, lease.ownership);
         settlePort(port, shared, response.result);
       } catch (error) {
         try {
