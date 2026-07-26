@@ -260,7 +260,10 @@ export function validateKernelDrainedProof(proof, expected) {
     proof.level === "kernel-drained" &&
     proof.epoch === expected.epoch &&
     proof.runId === expected.runId &&
+    proof.backend === expected.backend &&
+    proof.reaperBootId === expected.reaperBootId &&
     proof.nonceHash === expected.nonceHash &&
+    proof.proofTokenHash === expected.proofTokenHash &&
     proof.outerCgroup === expected.outerCgroup &&
     proof.populated === 0 &&
     proof.reaperIdentity === expected.reaperIdentity &&

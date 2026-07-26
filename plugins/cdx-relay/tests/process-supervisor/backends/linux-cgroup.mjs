@@ -245,6 +245,7 @@ export function createLinuxCgroupBackend({
     nonce: randomId()
   };
   let channelIdentity;
+  let channelBootId;
   let recovered = false;
   let failure;
 
@@ -294,13 +295,23 @@ export function createLinuxCgroupBackend({
     }
     if (typeof response.reaperIdentity !== "string" ||
         response.reaperIdentity.length === 0 ||
+        response.backend !== BACKEND ||
+        typeof response.reaperBootId !== "string" ||
+        response.reaperBootId.length === 0 ||
         (channelIdentity && response.reaperIdentity !== channelIdentity)) {
       throw latch(fail(
         "PROTOCOL_IDENTITY_MISMATCH",
         "Protected reaper identity changed during the authenticated channel."
       ));
     }
+    if (channelBootId && response.reaperBootId !== channelBootId) {
+      throw latch(fail(
+        "PROTOCOL_IDENTITY_MISMATCH",
+        "Protected reaper boot identity changed during the authenticated channel."
+      ));
+    }
     channelIdentity ??= response.reaperIdentity;
+    channelBootId ??= response.reaperBootId;
     return response;
   };
 
@@ -357,7 +368,8 @@ export function createLinuxCgroupBackend({
     if (lease.cleanupPromise) return lease.cleanupPromise;
     lease.cleanupPromise = (async () => {
       const response = await send("cleanup", lease, {
-        outerCgroup: lease.outerCgroup
+        outerCgroup: lease.outerCgroup,
+        proofToken: lease.proofToken
       });
       let proof;
       try {
@@ -365,8 +377,11 @@ export function createLinuxCgroupBackend({
           epoch: lease.epoch,
           runId: lease.runId,
           nonceHash: nonceHash(lease.nonce),
+          proofTokenHash: nonceHash(lease.proofToken),
           outerCgroup: lease.outerCgroup,
-          reaperIdentity: channelIdentity
+          backend: BACKEND,
+          reaperIdentity: channelIdentity,
+          reaperBootId: channelBootId
         });
       } catch (error) {
         throw latch(error, "CLEANUP_UNPROVEN");
@@ -378,8 +393,10 @@ export function createLinuxCgroupBackend({
         epoch: proof.epoch,
         runId: proof.runId,
         nonceHash: proof.nonceHash,
+        proofTokenHash: proof.proofTokenHash,
         outerCgroup: proof.outerCgroup,
         populated: proof.populated,
+        reaperBootId: proof.reaperBootId,
         reaperIdentity: proof.reaperIdentity,
         drainedAt: proof.drainedAt
       };
@@ -400,6 +417,7 @@ export function createLinuxCgroupBackend({
       runId: spec.runId,
       nonce: spec.nonce
     };
+    const proofToken = randomId();
     const env = { ...(spec.env ?? process.env) };
     for (const name of PRIVATE_REAPER_ENV) delete env[name];
     const response = await send("launch", identity, {
@@ -412,7 +430,8 @@ export function createLinuxCgroupBackend({
       maxBuffer: spec.maxBuffer,
       timeout: spec.timeout,
       harnessPid,
-      harnessStartTime
+      harnessStartTime,
+      proofToken
     });
     if (typeof response.outerCgroup !== "string" ||
         !response.outerCgroup ||
@@ -428,6 +447,7 @@ export function createLinuxCgroupBackend({
       ...identity,
       outerCgroup: response.outerCgroup,
       payloadCgroup: response.payloadCgroup,
+      proofToken,
       cleanupPromise: null
     };
     leases.set(lease.runId, lease);

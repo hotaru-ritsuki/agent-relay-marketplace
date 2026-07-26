@@ -39,9 +39,6 @@ jobs:
           fd = os.pidfd_open(os.getpid())
           os.close(fd)
           PY
-          echo "CDX_RELAY_LINUX_PID_NAMESPACE_VERIFIED=1" >> "$GITHUB_ENV"
-          echo "CDX_RELAY_LINUX_CGROUP_RO_VERIFIED=1" >> "$GITHUB_ENV"
-          echo "CDX_RELAY_LINUX_PIDFD_VERIFIED=1" >> "$GITHUB_ENV"
       - name: Start independent protected reaper
         shell: bash
         run: |
@@ -49,6 +46,10 @@ jobs:
           credential="$(openssl rand -hex 32)"
           echo "::add-mask::$credential"
           echo "CDX_RELAY_LINUX_REAPER_CREDENTIAL=$credential" >> "$GITHUB_ENV"
+          echo "CDX_RELAY_LINUX_PAYLOAD_UID=$(id -u)" >> "$GITHUB_ENV"
+          echo "CDX_RELAY_LINUX_PAYLOAD_GID=$(id -g)" >> "$GITHUB_ENV"
+          echo "CDX_RELAY_LINUX_SOCKET_UID=$(id -u)" >> "$GITHUB_ENV"
+          echo "CDX_RELAY_LINUX_SOCKET_GID=$(id -g)" >> "$GITHUB_ENV"
           sudo install -d -m 0755 "$CDX_RELAY_LINUX_PROTECTED_ROOT"
           sudo install -d -m 0711 "$(dirname "$CDX_RELAY_LINUX_REAPER_ENDPOINT")"
           sudo install -d -m 0700 "$CDX_RELAY_LINUX_REAPER_REGISTRY"
@@ -57,9 +58,6 @@ jobs:
             CDX_RELAY_LINUX_REAPER_CREDENTIAL="$credential" \
             CDX_RELAY_LINUX_PROTECTED_ROOT="$CDX_RELAY_LINUX_PROTECTED_ROOT" \
             CDX_RELAY_LINUX_REAPER_REGISTRY="$CDX_RELAY_LINUX_REAPER_REGISTRY" \
-            CDX_RELAY_LINUX_PID_NAMESPACE_VERIFIED=1 \
-            CDX_RELAY_LINUX_CGROUP_RO_VERIFIED=1 \
-            CDX_RELAY_LINUX_PIDFD_VERIFIED=1 \
             CDX_RELAY_LINUX_PAYLOAD_UID="$(id -u)" \
             CDX_RELAY_LINUX_PAYLOAD_GID="$(id -g)" \
             CDX_RELAY_LINUX_SOCKET_UID="$(id -u)" \

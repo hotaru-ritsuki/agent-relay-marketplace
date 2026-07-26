@@ -1,5 +1,12 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import {
+  createHash,
+  createHmac,
+  randomBytes,
+  randomUUID,
+  timingSafeEqual
+} from "node:crypto";
 import { spawn } from "node:child_process";
+import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
@@ -15,6 +22,8 @@ import {
 
 const fail = (code, message, cause) =>
   new SupervisorInfrastructureError(code, message, { cause });
+const BACKEND = "linux-cgroup";
+const SAFE_IDENTITY = /^[A-Za-z0-9._-]{1,128}$/;
 const nonceHash = (nonce) =>
   createHash("sha256").update(nonce).digest("hex");
 const sameSecret = (left, right) => {
@@ -23,47 +32,188 @@ const sameSecret = (left, right) => {
   return a.length === b.length && timingSafeEqual(a, b);
 };
 const MODULE_PATH = fileURLToPath(import.meta.url);
+// Leave room for base64 expansion plus the terminal-frame JSON envelope.
+const PAYLOAD_OUTPUT_CAP = Math.floor((MAX_FRAME_BYTES - 4096) * 3 / 4);
+const PAYLOAD_RUNTIME_CAP_MS = 10 * 60 * 1000;
 
-export function createAtomicReaperRegistry(registryPath) {
+const canonicalJson = (value) => JSON.stringify(Object.fromEntries(
+  Object.entries(value).sort(([left], [right]) => left.localeCompare(right))
+));
+
+export async function loadOrCreateReaperAuthority(authorityPath, {
+  expectedUid = process.getuid?.(),
+  enforcePosixMetadata = process.platform !== "win32"
+} = {}) {
+  const directory = path.dirname(authorityPath);
+  await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+  const directoryStat = await fs.lstat(directory);
+  if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() ||
+      (enforcePosixMetadata &&
+        (directoryStat.uid !== expectedUid ||
+         (directoryStat.mode & 0o777) !== 0o700))) {
+    throw fail(
+      "REAPER_AUTHORITY_INSECURE",
+      "Reaper authority directory owner or mode is unsafe."
+    );
+  }
+  try {
+    await fs.writeFile(authorityPath, JSON.stringify({
+      version: 1,
+      reaperBootId: randomUUID(),
+      authenticationKey: randomBytes(32).toString("base64")
+    }), {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx"
+    });
+    if (enforcePosixMetadata) await fs.chmod(authorityPath, 0o600);
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+  }
+  let handle;
+  try {
+    handle = await fs.open(
+      authorityPath,
+      fsConstants.O_RDONLY |
+        (enforcePosixMetadata ? fsConstants.O_NOFOLLOW : 0)
+    );
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size > 4096 ||
+        (enforcePosixMetadata &&
+          (stat.uid !== expectedUid || (stat.mode & 0o777) !== 0o600))) {
+      throw fail(
+        "REAPER_AUTHORITY_INSECURE",
+        "Reaper authority file owner, mode, type, or size is unsafe."
+      );
+    }
+    const stored = JSON.parse(await handle.readFile("utf8"));
+    const authenticationKey = Buffer.from(
+      stored.authenticationKey ?? "",
+      "base64"
+    );
+    if (stored.version !== 1 ||
+        !SAFE_IDENTITY.test(stored.reaperBootId ?? "") ||
+        authenticationKey.length !== 32) {
+      throw fail(
+        "REAPER_AUTHORITY_INSECURE",
+        "Reaper authority content is invalid."
+      );
+    }
+    return {
+      reaperBootId: stored.reaperBootId,
+      authenticationKey
+    };
+  } finally {
+    await handle?.close();
+  }
+}
+
+export function createAtomicReaperRegistry(registryPath, {
+  authenticationKey,
+  reaperBootId,
+  expectedUid = process.getuid?.(),
+  enforcePosixMetadata = process.platform !== "win32"
+} = {}) {
+  if (!Buffer.isBuffer(authenticationKey) || authenticationKey.length < 32 ||
+      !SAFE_IDENTITY.test(reaperBootId ?? "")) {
+    throw new TypeError("Registry authentication key and reaper boot identity are required.");
+  }
+  const authenticate = (entry) => createHmac("sha256", authenticationKey)
+    .update(canonicalJson(entry))
+    .digest("hex");
+  const assertDirectory = async () => {
+    await fs.mkdir(registryPath, { recursive: true, mode: 0o700 });
+    const stat = await fs.lstat(registryPath);
+    if (!stat.isDirectory() || stat.isSymbolicLink() ||
+        (enforcePosixMetadata &&
+          (stat.uid !== expectedUid || (stat.mode & 0o777) !== 0o700))) {
+      throw fail(
+        "REGISTRY_INSECURE",
+        "Protected registry directory owner or mode is unsafe."
+      );
+    }
+  };
   return {
     async list() {
-      let names;
-      try {
-        names = await fs.readdir(registryPath);
-      } catch (error) {
-        if (error?.code === "ENOENT") return [];
-        throw error;
-      }
+      await assertDirectory();
+      const names = await fs.readdir(registryPath);
       const entries = [];
       for (const name of names) {
-        if (!name.endsWith(".json")) continue;
-        const file = path.join(registryPath, name);
-        const stat = await fs.stat(file);
-        if ((stat.mode & 0o077) !== 0) {
-          throw fail("REGISTRY_INSECURE", "Protected registry entry permissions are unsafe.");
+        if (name === ".authority.json") continue;
+        if (!/^[A-Za-z0-9._-]+\.json$/.test(name)) {
+          throw fail("REGISTRY_INSECURE", "Protected registry filename is unsafe.");
         }
-        entries.push(JSON.parse(await fs.readFile(file, "utf8")));
+        const file = path.join(registryPath, name);
+        let handle;
+        try {
+          handle = await fs.open(
+            file,
+            fsConstants.O_RDONLY |
+              (enforcePosixMetadata ? fsConstants.O_NOFOLLOW : 0)
+          );
+        } catch (error) {
+          throw fail(
+            "REGISTRY_INSECURE",
+            "Protected registry entry cannot be opened without following links.",
+            error
+          );
+        }
+        try {
+          const stat = await handle.stat();
+          if (!stat.isFile() ||
+              (enforcePosixMetadata &&
+                (stat.uid !== expectedUid || (stat.mode & 0o777) !== 0o600)) ||
+              stat.size > MAX_FRAME_BYTES) {
+            throw fail(
+              "REGISTRY_INSECURE",
+              "Protected registry entry owner, mode, type, or size is unsafe."
+            );
+          }
+          const stored = JSON.parse(await handle.readFile("utf8"));
+          const { authentication, ...entry } = stored;
+          if (entry.reaperBootId !== reaperBootId ||
+              typeof authentication !== "string" ||
+              !sameSecret(authentication, authenticate(entry))) {
+            throw fail(
+              "REGISTRY_AUTHENTICATION_FAILED",
+              "Protected registry record authentication failed."
+            );
+          }
+          entries.push(entry);
+        } finally {
+          await handle.close();
+        }
       }
       return entries;
     },
     async write(entry) {
-      await fs.mkdir(registryPath, { recursive: true, mode: 0o700 });
+      await assertDirectory();
+      if (!SAFE_IDENTITY.test(entry?.epoch ?? "") ||
+          !SAFE_IDENTITY.test(entry?.runId ?? "") ||
+          entry.reaperBootId !== reaperBootId) {
+        throw fail(
+          "REGISTRY_AUTHENTICATION_FAILED",
+          "Protected registry write identity is invalid."
+        );
+      }
       const target = path.join(registryPath, `${entry.epoch}-${entry.runId}.json`);
       const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
-      await fs.writeFile(temporary, JSON.stringify(entry), {
+      const stored = { ...entry, authentication: authenticate(entry) };
+      await fs.writeFile(temporary, JSON.stringify(stored), {
         encoding: "utf8",
         mode: 0o600,
         flag: "wx"
       });
-      await fs.chmod(temporary, 0o600);
+      if (enforcePosixMetadata) await fs.chmod(temporary, 0o600);
       await fs.rename(temporary, target);
-      await fs.chmod(target, 0o600);
+      if (enforcePosixMetadata) await fs.chmod(target, 0o600);
     }
   };
 }
 
 export function createProtectedLinuxReaper({
   reaperIdentity,
+  reaperBootId,
   protectedRoot,
   checks,
   cgroups,
@@ -71,12 +221,13 @@ export function createProtectedLinuxReaper({
   watchHarness,
   now = () => new Date()
 }) {
-  if (!reaperIdentity || !protectedRoot || !checks || !cgroups ||
+  if (!reaperIdentity || !reaperBootId || !protectedRoot || !checks || !cgroups ||
       !registry || !watchHarness) {
     throw new TypeError("Protected reaper dependencies are required.");
   }
   const entries = new Map();
   const watches = new Map();
+  const drains = new Map();
   let probed = false;
   let capable = false;
   let recovered = false;
@@ -93,9 +244,50 @@ export function createProtectedLinuxReaper({
     epoch: request.epoch,
     runId: request.runId,
     nonce: request.nonce,
+    backend: BACKEND,
     reaperIdentity,
+    reaperBootId,
     ...payload
   });
+  const canonicalPaths = (epoch, runId) => {
+    const outerCgroup = path.posix.join(
+      protectedRoot.replaceAll("\\", "/"),
+      `${epoch}-${runId}`
+    );
+    return {
+      outerCgroup,
+      payloadCgroup: path.posix.join(outerCgroup, "payload")
+    };
+  };
+  const validateRegistryRecord = (record) => {
+    if (!record || typeof record !== "object" ||
+        record.backend !== BACKEND ||
+        record.reaperBootId !== reaperBootId ||
+        !SAFE_IDENTITY.test(record.epoch ?? "") ||
+        !SAFE_IDENTITY.test(record.runId ?? "") ||
+        !/^[a-f0-9]{64}$/.test(record.nonceHash ?? "") ||
+        !/^[a-f0-9]{64}$/.test(record.proofTokenHash ?? "") ||
+        typeof record.proofConsumed !== "boolean" ||
+        !Number.isSafeInteger(record.harnessPid) ||
+        record.harnessPid <= 0 ||
+        typeof record.harnessStartTime !== "string" ||
+        record.harnessStartTime.length === 0 ||
+        !["created", "running", "draining", "drained"].includes(record.state)) {
+      throw fail(
+        "REGISTRY_AUTHENTICATION_FAILED",
+        "Protected registry record identity is invalid."
+      );
+    }
+    const expected = canonicalPaths(record.epoch, record.runId);
+    if (record.outerCgroup !== expected.outerCgroup ||
+        record.payloadCgroup !== expected.payloadCgroup) {
+      throw fail(
+        "REGISTRY_AUTHENTICATION_FAILED",
+        "Protected registry record paths are not canonical."
+      );
+    }
+    return record;
+  };
   const save = async (entry, state = entry.state) => {
     entry.state = state;
     await registry.write(entry);
@@ -114,42 +306,41 @@ export function createProtectedLinuxReaper({
     }
     return entry;
   };
-  const drain = async (entry) => {
-    if (entry.state === "drained") return entry;
-    await save(entry, "draining");
-    await cgroups.killOuter(entry);
-    const maximumPolls = 500;
-    let populated = 1;
-    for (let attempt = 0; attempt < maximumPolls; attempt += 1) {
-      const events = await cgroups.readOuterEvents(entry);
-      populated = Number(events?.populated);
-      if (populated === 0) break;
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    if (populated !== 0) {
-      throw fail("CLEANUP_UNPROVEN", "Protected outer cgroup remains populated.");
-    }
-    watches.get(entry.runId)?.close?.();
-    watches.delete(entry.runId);
-    await cgroups.removeRun(entry);
-    entry.drainedAt = now().toISOString();
-    await save(entry, "drained");
-    return entry;
+  const drain = (entry) => {
+    const key = `${entry.epoch}:${entry.runId}`;
+    if (drains.has(key)) return drains.get(key);
+    const operation = (async () => {
+      if (entry.state === "drained") return entry;
+      await save(entry, "draining");
+      await cgroups.killOuter(entry);
+      const maximumPolls = 500;
+      let populated = 1;
+      for (let attempt = 0; attempt < maximumPolls; attempt += 1) {
+        const events = await cgroups.readOuterEvents(entry);
+        populated = Number(events?.populated);
+        if (populated === 0) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      if (populated !== 0) {
+        throw fail("CLEANUP_UNPROVEN", "Protected outer cgroup remains populated.");
+      }
+      entry.lastPopulated = 0;
+      watches.get(entry.runId)?.close?.();
+      watches.delete(entry.runId);
+      await cgroups.removeRun(entry);
+      entry.drainedAt = now().toISOString();
+      await save(entry, "drained");
+      return entry;
+    })();
+    drains.set(key, operation);
+    return operation;
   };
 
   async function recover(request) {
     const records = await registry.list();
     const drained = [];
     for (const record of records) {
-      if (!record || typeof record !== "object" ||
-          typeof record.epoch !== "string" ||
-          typeof record.runId !== "string" ||
-          typeof record.nonceHash !== "string" ||
-          typeof record.outerCgroup !== "string" ||
-          typeof record.payloadCgroup !== "string" ||
-          !["created", "running", "draining", "drained"].includes(record.state)) {
-        throw fail("REGISTRY_INVALID", "Protected registry contains an invalid entry.");
-      }
+      validateRegistryRecord(record);
       entries.set(record.runId, record);
       if (record.state !== "drained") {
         drained.push(record.runId);
@@ -177,24 +368,31 @@ export function createProtectedLinuxReaper({
         payload.args.some((argument) => typeof argument !== "string") ||
         !Number.isSafeInteger(payload.harnessPid) || payload.harnessPid <= 0 ||
         typeof payload.harnessStartTime !== "string" ||
-        !payload.harnessStartTime) {
+        !payload.harnessStartTime ||
+        typeof payload.proofToken !== "string" ||
+        payload.proofToken.length < 16) {
       throw fail("PROTOCOL_INVALID_MESSAGE", "Protected launch payload is invalid.");
     }
+    const paths = canonicalPaths(request.epoch, request.runId);
     const entry = {
+      backend: BACKEND,
+      reaperBootId,
       epoch: request.epoch,
       runId: request.runId,
       nonceHash: nonceHash(request.nonce),
+      proofTokenHash: nonceHash(payload.proofToken),
+      proofConsumed: false,
       harnessPid: payload.harnessPid,
       harnessStartTime: payload.harnessStartTime,
-      outerCgroup: `${protectedRoot}/${request.epoch}-${request.runId}`,
-      payloadCgroup: `${protectedRoot}/${request.epoch}-${request.runId}/payload`,
+      ...paths,
       state: "created"
     };
     await cgroups.createRun(entry);
     await save(entry);
     let blocked;
     try {
-      blocked = await cgroups.spawnBlockedShim(entry, payload);
+      const { proofToken: _proofToken, ...targetPayload } = payload;
+      blocked = await cgroups.spawnBlockedShim(entry, targetPayload);
       await cgroups.migrateBlockedShim(entry, blocked);
       const member = await cgroups.validatePayloadMembership(entry, blocked);
       const restricted = await cgroups.validateRestrictedNamespace(entry, blocked);
@@ -205,7 +403,17 @@ export function createProtectedLinuxReaper({
         );
       }
       await save(entry, "running");
-      const watch = await watchHarness(entry, () => drain(entry));
+      const watch = await watchHarness(entry, () => {
+        void drain(entry).catch((error) => {
+          poisoned ??= error instanceof SupervisorInfrastructureError
+            ? error
+            : fail(
+                "CLEANUP_FAILED",
+                String(error?.message ?? error).slice(0, 240),
+                error
+              );
+        });
+      });
       watches.set(entry.runId, watch);
       await cgroups.releaseShim(entry, blocked);
     } catch (error) {
@@ -221,12 +429,16 @@ export function createProtectedLinuxReaper({
       }
       throw error;
     }
+    const root = Promise.resolve(blocked.root).then(async (terminal) => {
+      if (terminal?.boundaryBreach) await drain(entry);
+      return terminal;
+    });
     return response(request, {
       outerCgroup: entry.outerCgroup,
       payloadCgroup: entry.payloadCgroup,
       pid: blocked.pid,
       child: blocked.child,
-      root: blocked.root
+      root
     });
   }
 
@@ -247,14 +459,27 @@ export function createProtectedLinuxReaper({
         ];
         const failed = required.find((name) => result?.[name] !== true);
         capable = !failed;
+        const registryState = await Promise.all(
+          [...entries.values()].map(async (entry) => {
+            let populated = entry.lastPopulated;
+            let pids = [];
+            if (entry.state !== "drained") {
+              populated = Number((await cgroups.readOuterEvents(entry)).populated);
+              pids = await cgroups.readPayloadPids?.(entry) ?? [];
+            }
+            return {
+              epoch: entry.epoch,
+              runId: entry.runId,
+              state: entry.state,
+              populated,
+              pids
+            };
+          })
+        );
         return response(request, {
           available: !failed,
           checks: result,
-          registry: [...entries.values()].map((entry) => ({
-            epoch: entry.epoch,
-            runId: entry.runId,
-            state: entry.state
-          })),
+          registry: registryState,
           ...(failed
             ? { reason: `Protected boundary prerequisite failed: ${failed}.` }
             : {})
@@ -264,6 +489,20 @@ export function createProtectedLinuxReaper({
       if (request.operation === "launch") return launch(request);
       if (request.operation === "cleanup") {
         const entry = authenticate(request);
+        if (entry.proofConsumed) {
+          throw fail("PROOF_REPLAYED", "Cleanup proof token was already consumed.");
+        }
+        if (typeof request.payload.proofToken !== "string" ||
+            !sameSecret(
+              entry.proofTokenHash,
+              nonceHash(request.payload.proofToken)
+            )) {
+          poisoned ??= fail(
+            "PROOF_TOKEN_MISMATCH",
+            "Cleanup proof token does not match the authenticated registry lease."
+          );
+          throw poisoned;
+        }
         if (request.payload.outerCgroup !== entry.outerCgroup) {
           poisoned ??= fail(
             "PROTOCOL_IDENTITY_MISMATCH",
@@ -272,13 +511,18 @@ export function createProtectedLinuxReaper({
           throw poisoned;
         }
         await drain(entry);
+        entry.proofConsumed = true;
+        await save(entry, "drained");
         return {
           version: PROTOCOL_VERSION,
           operation: "cleanup",
+          backend: BACKEND,
           level: "kernel-drained",
           epoch: entry.epoch,
           runId: entry.runId,
           nonceHash: entry.nonceHash,
+          proofTokenHash: entry.proofTokenHash,
+          reaperBootId,
           outerCgroup: entry.outerCgroup,
           populated: 0,
           reaperIdentity,
@@ -397,10 +641,290 @@ export async function serveProtectedLinuxReaper({
   };
 }
 
+export async function runBoundedPayload({
+  payload,
+  spawnProcess = spawn,
+  onBoundaryBreach = () => {}
+}) {
+  const requestedBuffer = Number.isSafeInteger(payload.maxBuffer)
+    ? payload.maxBuffer
+    : PAYLOAD_OUTPUT_CAP;
+  const maxBuffer = Math.max(0, Math.min(PAYLOAD_OUTPUT_CAP, requestedBuffer));
+  const requestedTimeout = Number.isSafeInteger(payload.timeout) && payload.timeout > 0
+    ? payload.timeout
+    : PAYLOAD_RUNTIME_CAP_MS;
+  const timeout = Math.min(PAYLOAD_RUNTIME_CAP_MS, requestedTimeout);
+  const child = spawnProcess(payload.command, payload.args ?? [], {
+    cwd: payload.cwd,
+    env: payload.env,
+    shell: false,
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  const stdout = [];
+  const stderr = [];
+  let captured = 0;
+  let settled = false;
+  let timer;
+
+  return new Promise((resolve) => {
+    const finish = (root) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(root);
+    };
+    const breach = (reason, code, message) => {
+      if (settled) return;
+      onBoundaryBreach(reason);
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      child.kill("SIGKILL");
+      finish({
+        status: null,
+        signal: "SIGKILL",
+        stdout: Buffer.concat(stdout),
+        stderr: Buffer.concat(stderr),
+        error: { code, message },
+        boundaryBreach: reason
+      });
+    };
+    const capture = (chunks, chunk) => {
+      if (settled) return;
+      const bytes = Buffer.from(chunk);
+      const remaining = Math.max(0, maxBuffer - captured);
+      if (remaining > 0) {
+        chunks.push(bytes.subarray(0, remaining));
+        captured += Math.min(bytes.length, remaining);
+      }
+      if (bytes.length > remaining) {
+        breach(
+          "output-limit",
+          "ENOBUFS",
+          `Protected payload output exceeded ${maxBuffer} bytes.`
+        );
+      }
+    };
+    child.stdout?.on("data", (chunk) => capture(stdout, chunk));
+    child.stderr?.on("data", (chunk) => capture(stderr, chunk));
+    child.once("error", (error) => finish({
+      status: null,
+      signal: null,
+      stdout: Buffer.concat(stdout),
+      stderr: Buffer.concat(stderr),
+      error: {
+        code: error?.code ?? "PAYLOAD_ERROR",
+        message: String(error?.message ?? error).slice(0, 240)
+      }
+    }));
+    child.once("exit", (code, signal) => finish({
+      status: code,
+      signal,
+      stdout: Buffer.concat(stdout),
+      stderr: Buffer.concat(stderr)
+    }));
+    if (payload.input !== undefined) {
+      const input = payload.input?.type === "Buffer"
+        ? Buffer.from(payload.input.data)
+        : payload.input;
+      child.stdin?.end(input);
+    } else {
+      child.stdin?.end();
+    }
+    timer = setTimeout(() => breach(
+      "runtime-limit",
+      "ETIMEDOUT",
+      `Protected payload exceeded ${timeout} milliseconds.`
+    ), timeout);
+    timer.unref?.();
+  });
+}
+
+export async function createPidfdHarnessWatcher({
+  entry,
+  onDeath,
+  spawnWatcher = spawn,
+  readyLimit = 128,
+  readyTimeoutMs = 5000
+}) {
+  const source = [
+    "import ctypes,os,select,signal,sys",
+    "assert ctypes.CDLL(None).prctl(1, signal.SIGKILL) == 0",
+    "pid=int(sys.argv[1]); expected=sys.argv[2]",
+    "fd=os.pidfd_open(pid)",
+    "poll=select.poll(); poll.register(fd)",
+    "assert not poll.poll(0)",
+    "stat=open(f'/proc/{pid}/stat').read(); close=stat.rfind(')')",
+    "actual=stat[close+2:].split()[19]",
+    "assert actual == expected",
+    "assert not poll.poll(0)",
+    "print('READY', flush=True)",
+    "poll.poll()",
+    "os.close(fd)"
+  ].join("\n");
+  const watcher = spawnWatcher("python3", [
+    "-c",
+    source,
+    String(entry.harnessPid),
+    entry.harnessStartTime
+  ], { shell: false, stdio: ["ignore", "pipe", "ignore"] });
+  watcher.stdout.setEncoding?.("utf8");
+  let ready = false;
+  let closed = false;
+  let pending = "";
+  const handle = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      closed = true;
+      watcher.kill();
+      reject(fail(
+        "HARNESS_WATCH_UNAVAILABLE",
+        "pidfd watcher did not acquire the harness handle."
+      ));
+    }, readyTimeoutMs);
+    const failReady = (message, cause) => {
+      if (ready) return;
+      clearTimeout(timer);
+      closed = true;
+      watcher.kill();
+      reject(fail("HARNESS_WATCH_UNAVAILABLE", message, cause));
+    };
+    watcher.once("error", (error) => {
+      if (!ready) failReady("pidfd watcher failed.", error);
+      else if (!closed) onDeath(error);
+    });
+    watcher.once("exit", (code) => {
+      if (!ready) {
+        failReady(`pidfd watcher exited before readiness (${code}).`);
+      } else if (!closed) {
+        onDeath(code);
+      }
+    });
+    watcher.stdout.on("data", (chunk) => {
+      if (ready || closed) return;
+      pending += chunk;
+      if (Buffer.byteLength(pending) > readyLimit) {
+        failReady("pidfd watcher readiness frame exceeded its bound.");
+        return;
+      }
+      const newline = pending.indexOf("\n");
+      if (newline < 0) return;
+      if (pending.slice(0, newline) !== "READY" ||
+          pending.slice(newline + 1).length !== 0) {
+        failReady("pidfd watcher readiness frame is invalid.");
+        return;
+      }
+      clearTimeout(timer);
+      ready = true;
+      resolve({
+        close() {
+          closed = true;
+          watcher.kill();
+        }
+      });
+    });
+  });
+  return handle;
+}
+
+export async function performProtectedBoundaryProbe({
+  protectedRoot,
+  cgroups,
+  watchHarness,
+  accessControllers = () => fs.access("/sys/fs/cgroup/cgroup.controllers"),
+  readStartTime
+}) {
+  const checks = {
+    controllers: false,
+    disposableCgroupKill: false,
+    reaperOutsidePayloadPidNamespace: false,
+    payloadCgroupFilesReadOnly: false,
+    raceResistantHarnessWatch: false,
+    outerCgroupLifecycle: false
+  };
+  const epoch = `probe-${process.pid}`;
+  const runId = `${Date.now()}-${randomBytes(6).toString("hex")}`;
+  const outerCgroup = path.posix.join(protectedRoot, `${epoch}-${runId}`);
+  const entry = {
+    backend: BACKEND,
+    reaperBootId: "probe",
+    epoch,
+    runId,
+    nonceHash: nonceHash("probe"),
+    proofTokenHash: nonceHash("probe-proof-token"),
+    proofConsumed: false,
+    harnessPid: process.pid,
+    harnessStartTime: "probe",
+    outerCgroup,
+    payloadCgroup: path.posix.join(outerCgroup, "payload"),
+    state: "created"
+  };
+  let blocked;
+  let watch;
+  try {
+    await accessControllers();
+    checks.controllers = true;
+    await cgroups.createRun(entry);
+    checks.disposableCgroupKill = await cgroups.hasCgroupKill(entry) === true;
+    if (!checks.disposableCgroupKill) return checks;
+    blocked = await cgroups.spawnBlockedShim(entry, {
+      command: process.execPath,
+      args: ["-e", "setInterval(()=>{},1000)"],
+      env: {},
+      maxBuffer: 1024,
+      timeout: 5000
+    });
+    void blocked.root?.catch?.(() => {});
+    await cgroups.migrateBlockedShim(entry, blocked);
+    const member = await cgroups.validatePayloadMembership(entry, blocked);
+    const restricted = await cgroups.validateRestrictedNamespace(entry, blocked);
+    checks.reaperOutsidePayloadPidNamespace =
+      restricted === true && blocked.ready?.reaperVisible === false;
+    checks.payloadCgroupFilesReadOnly =
+      restricted === true && blocked.ready?.cgroupWritable === false;
+    if (member !== true ||
+        !checks.reaperOutsidePayloadPidNamespace ||
+        !checks.payloadCgroupFilesReadOnly) {
+      return checks;
+    }
+    const startTime = await readStartTime(blocked.pid);
+    watch = await watchHarness({
+      harnessPid: blocked.pid,
+      harnessStartTime: startTime
+    }, () => {});
+    checks.raceResistantHarnessWatch = true;
+    await cgroups.releaseShim(entry, blocked);
+    await cgroups.killOuter(entry);
+    let populated = 1;
+    for (let attempt = 0; attempt < 500; attempt += 1) {
+      populated = (await cgroups.readOuterEvents(entry)).populated;
+      if (populated === 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    if (populated !== 0) return checks;
+    watch.close();
+    watch = undefined;
+    await cgroups.removeRun(entry);
+    checks.outerCgroupLifecycle = true;
+    return checks;
+  } catch {
+    return checks;
+  } finally {
+    watch?.close?.();
+    if (!checks.outerCgroupLifecycle) {
+      if (blocked) await cgroups.killOuter(entry).catch(() => {});
+      await cgroups.removeRun(entry).catch(() => {});
+    }
+  }
+}
+
 async function readPopulated(outerCgroup) {
   const events = await fs.readFile(path.join(outerCgroup, "cgroup.events"), "utf8");
   const match = /^populated\s+([01])$/m.exec(events);
   return { populated: match ? Number(match[1]) : NaN };
+}
+
+async function readLinuxStartTime(pid) {
+  const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
+  return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
 }
 
 async function createCliService() {
@@ -409,45 +933,27 @@ async function createCliService() {
   if (!protectedRoot || !registryPath) {
     throw new Error("Protected root and private registry paths are required.");
   }
-  const checks = async () => {
-    const result = {
-      controllers: false,
-      disposableCgroupKill: false,
-      reaperOutsidePayloadPidNamespace:
-        process.env.CDX_RELAY_LINUX_PID_NAMESPACE_VERIFIED === "1",
-      payloadCgroupFilesReadOnly:
-        process.env.CDX_RELAY_LINUX_CGROUP_RO_VERIFIED === "1",
-      raceResistantHarnessWatch:
-        process.env.CDX_RELAY_LINUX_PIDFD_VERIFIED === "1",
-      outerCgroupLifecycle: false
-    };
-    try {
-      await fs.access("/sys/fs/cgroup/cgroup.controllers");
-      result.controllers = true;
-      const probe = path.join(protectedRoot, `.probe-${process.pid}`);
-      await fs.mkdir(probe);
-      try {
-        await fs.access(path.join(probe, "cgroup.kill"));
-        result.disposableCgroupKill = true;
-      } finally {
-        await fs.rmdir(probe);
-      }
-      const outer = path.join(protectedRoot, `.outer-${process.pid}`);
-      const payload = path.join(outer, "payload");
-      await fs.mkdir(outer);
-      await fs.mkdir(payload);
-      await fs.rmdir(payload);
-      await fs.rmdir(outer);
-      result.outerCgroupLifecycle = true;
-    } catch {
-      // A failed kernel prerequisite is reported as unavailable, never inferred.
-    }
-    return result;
-  };
-  const cgroups = {
+  const watchHarness = (entry, onDeath) =>
+    createPidfdHarnessWatcher({ entry, onDeath });
+  let cgroups;
+  const checks = () => performProtectedBoundaryProbe({
+    protectedRoot,
+    cgroups,
+    watchHarness,
+    readStartTime: readLinuxStartTime
+  });
+  cgroups = {
     async createRun(entry) {
       await fs.mkdir(entry.outerCgroup);
       await fs.mkdir(entry.payloadCgroup);
+    },
+    async hasCgroupKill(entry) {
+      try {
+        await fs.access(path.join(entry.outerCgroup, "cgroup.kill"));
+        return true;
+      } catch {
+        return false;
+      }
     },
     async spawnBlockedShim(entry, payload) {
       const encoded = Buffer.from(JSON.stringify(payload)).toString("base64url");
@@ -482,66 +988,111 @@ async function createCliService() {
       });
       child.stdout.setEncoding("utf8");
       child.stderr.setEncoding("utf8");
-      let stdout = "";
+      let pending = "";
       let stderr = "";
-      child.stderr.on("data", (chunk) => { stderr += chunk; });
+      child.stderr.on("data", (chunk) => {
+        if (Buffer.byteLength(stderr) < 4096) stderr += chunk;
+      });
+      let resolveReady;
+      let rejectReady;
+      let readySettled = false;
       let resolveRoot;
       let rejectRoot;
+      let rootSettled = false;
+      const readyPromise = new Promise((resolve, reject) => {
+        resolveReady = resolve;
+        rejectReady = reject;
+      });
       const root = new Promise((resolve, reject) => {
         resolveRoot = resolve;
         rejectRoot = reject;
       });
       void root.catch(() => {});
-      const ready = await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-          reject(fail("PROTOCOL_HANDSHAKE_TIMEOUT", "Protected payload shim did not block."));
-        }, 5000);
-        child.once("error", reject);
-        child.stdout.on("data", (chunk) => {
-          stdout += chunk;
-          const newline = stdout.indexOf("\n");
-          if (newline < 0) return;
-          clearTimeout(timer);
-          try {
-            resolve(JSON.parse(stdout.slice(0, newline)));
-            stdout = stdout.slice(newline + 1);
-          } catch (error) {
-            reject(fail("PROTOCOL_INVALID_MESSAGE", "Payload shim readiness is invalid.", error));
-          }
-        });
-      });
-      child.stdout.on("data", (chunk) => {
-        stdout += chunk;
-        const newline = stdout.indexOf("\n");
-        if (newline < 0) return;
-        try {
-          const terminal = JSON.parse(stdout.slice(0, newline));
-          if (terminal.type !== "root") throw new Error("not a root frame");
-          resolveRoot({
-            backend: "linux-cgroup",
-            status: terminal.status,
-            signal: terminal.signal,
-            stdout: Buffer.from(terminal.stdout, "base64"),
-            stderr: Buffer.from(terminal.stderr, "base64")
-          });
-        } catch (error) {
-          rejectRoot(fail("PROTOCOL_INVALID_MESSAGE", "Payload shim terminal frame is invalid.", error));
+      const timer = setTimeout(() => {
+        if (readySettled) return;
+        readySettled = true;
+        child.kill("SIGKILL");
+        rejectReady(fail(
+          "PROTOCOL_HANDSHAKE_TIMEOUT",
+          "Protected payload shim did not block."
+        ));
+      }, 5000);
+      const failFrames = (error) => {
+        clearTimeout(timer);
+        if (!readySettled) {
+          readySettled = true;
+          rejectReady(error);
         }
-        stdout = "";
+        if (!rootSettled) {
+          rootSettled = true;
+          rejectRoot(error);
+        }
+        child.kill("SIGKILL");
+      };
+      child.stdout.on("data", (chunk) => {
+        pending += chunk;
+        if (Buffer.byteLength(pending) > MAX_FRAME_BYTES) {
+          failFrames(fail(
+            "PROTOCOL_FRAME_TOO_LARGE",
+            "Payload shim frame exceeded its bound."
+          ));
+          return;
+        }
+        let newline;
+        while ((newline = pending.indexOf("\n")) >= 0) {
+          const line = pending.slice(0, newline);
+          pending = pending.slice(newline + 1);
+          try {
+            const frame = JSON.parse(line);
+            if (!readySettled) {
+              if (frame.type !== "ready" ||
+                  !Number.isSafeInteger(frame.hostPid) ||
+                  typeof frame.cgroupWritable !== "boolean" ||
+                  typeof frame.reaperVisible !== "boolean") {
+                throw new Error("not a complete ready frame");
+              }
+              clearTimeout(timer);
+              readySettled = true;
+              resolveReady(frame);
+              continue;
+            }
+            if (rootSettled || frame.type !== "root") {
+              throw new Error("not one terminal root frame");
+            }
+            rootSettled = true;
+            resolveRoot({
+              backend: "linux-cgroup",
+              status: frame.status,
+              signal: frame.signal,
+              stdout: Buffer.from(frame.stdout, "base64"),
+              stderr: Buffer.from(frame.stderr, "base64"),
+              error: frame.error,
+              boundaryBreach: frame.boundaryBreach
+            });
+          } catch (error) {
+            failFrames(fail(
+              "PROTOCOL_INVALID_MESSAGE",
+              "Payload shim frame is invalid.",
+              error
+            ));
+            return;
+          }
+        }
       });
-      child.once("error", (error) => rejectRoot(fail(
-        "PROTOCOL_LOST",
-        "Protected payload shim failed.",
-        error
-      )));
+      child.once("error", (error) => failFrames(fail(
+          "PROTOCOL_LOST",
+          "Protected payload shim failed.",
+          error
+        )));
       child.once("exit", (code, signal) => {
-        if (code !== 0 && stdout.length === 0) {
-          rejectRoot(fail(
+        if (!rootSettled) {
+          failFrames(fail(
             "PROTOCOL_LOST",
             `Protected payload shim exited before a root frame: ${stderr.slice(0, 160) || signal || code}.`
           ));
         }
       });
+      const ready = await readyPromise;
       return {
         pid: ready.hostPid,
         launcherPid: child.pid,
@@ -561,6 +1112,10 @@ async function createCliService() {
           .trim().split(/\s+/).filter(Boolean).map(Number)
       );
       return members.has(blocked.launcherPid) && members.has(blocked.pid);
+    },
+    async readPayloadPids(entry) {
+      return (await fs.readFile(path.join(entry.payloadCgroup, "cgroup.procs"), "utf8"))
+        .trim().split(/\s+/).filter(Boolean).map(Number);
     },
     async validateRestrictedNamespace(_entry, blocked) {
       const pidNamespace = await fs.readlink(`/proc/${blocked.pid}/ns/pid`);
@@ -588,68 +1143,20 @@ async function createCliService() {
       });
     }
   };
-  const registry = createAtomicReaperRegistry(registryPath);
+  const authority = await loadOrCreateReaperAuthority(
+    path.join(registryPath, ".authority.json")
+  );
+  const registry = createAtomicReaperRegistry(registryPath, {
+    ...authority
+  });
   return createProtectedLinuxReaper({
     reaperIdentity: `protected-reaper:${process.pid}`,
+    reaperBootId: authority.reaperBootId,
     protectedRoot,
     checks,
     cgroups,
     registry,
-    async watchHarness(entry, onDeath) {
-      const source = [
-        "import os,select,sys",
-        "pid=int(sys.argv[1]); expected=sys.argv[2]",
-        "stat=open(f'/proc/{pid}/stat').read(); close=stat.rfind(')')",
-        "actual=stat[close+2:].split()[19]",
-        "assert actual == expected",
-        "fd=os.pidfd_open(pid)",
-        "print('READY', flush=True)",
-        "poll=select.poll(); poll.register(fd); poll.poll()",
-        "os.close(fd)"
-      ].join("\n");
-      const watcher = spawn("python3", [
-        "-c",
-        source,
-        String(entry.harnessPid),
-        entry.harnessStartTime
-      ], { shell: false, stdio: ["ignore", "pipe", "ignore"] });
-      watcher.stdout.setEncoding("utf8");
-      await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-          watcher.kill();
-          reject(fail(
-            "HARNESS_WATCH_UNAVAILABLE",
-            "pidfd watcher did not acquire the harness handle."
-          ));
-        }, 5000);
-        watcher.once("error", (error) => {
-          clearTimeout(timer);
-          reject(fail("HARNESS_WATCH_UNAVAILABLE", "pidfd watcher failed.", error));
-        });
-        watcher.once("exit", (code) => {
-          clearTimeout(timer);
-          reject(fail(
-            "HARNESS_WATCH_UNAVAILABLE",
-            `pidfd watcher exited before readiness (${code}).`
-          ));
-        });
-        watcher.stdout.once("data", (chunk) => {
-          if (!chunk.startsWith("READY")) return;
-          clearTimeout(timer);
-          resolve();
-        });
-      });
-      let closed = false;
-      watcher.once("exit", (code) => {
-        if (!closed) void onDeath(code);
-      });
-      return {
-        close() {
-          closed = true;
-          watcher.kill();
-        }
-      };
-    }
+    watchHarness
   });
 }
 
@@ -679,34 +1186,15 @@ async function runPayloadShim() {
     reaperVisible
   })}\n`);
   process.kill(process.pid, "SIGSTOP");
-  const child = spawn(payload.command, payload.args ?? [], {
-    cwd: payload.cwd,
-    env: payload.env,
-    shell: false,
-    stdio: ["pipe", "pipe", "pipe"]
-  });
-  const stdout = [];
-  const stderr = [];
-  child.stdout.on("data", (chunk) => stdout.push(chunk));
-  child.stderr.on("data", (chunk) => stderr.push(chunk));
-  if (payload.input !== undefined) {
-    const input = payload.input?.type === "Buffer"
-      ? Buffer.from(payload.input.data)
-      : payload.input;
-    child.stdin.end(input);
-  } else {
-    child.stdin.end();
-  }
-  const terminal = await new Promise((resolve, reject) => {
-    child.once("error", reject);
-    child.once("exit", (code, signal) => resolve({ code, signal }));
-  });
+  const terminal = await runBoundedPayload({ payload });
   process.stdout.write(`${JSON.stringify({
     type: "root",
-    status: terminal.code,
+    status: terminal.status,
     signal: terminal.signal,
-    stdout: Buffer.concat(stdout).toString("base64"),
-    stderr: Buffer.concat(stderr).toString("base64")
+    stdout: terminal.stdout.toString("base64"),
+    stderr: terminal.stderr.toString("base64"),
+    error: terminal.error,
+    boundaryBreach: terminal.boundaryBreach
   })}\n`);
 }
 

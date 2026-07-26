@@ -1,14 +1,27 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
+import fs from "node:fs/promises";
+import { PassThrough } from "node:stream";
 import net from "node:net";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
+  createAtomicReaperRegistry,
   createLinuxCgroupBackend,
   createUnixLinuxReaperClient,
   createProtectedLinuxReaper
 } from "./process-supervisor/index.mjs";
+import {
+  createPidfdHarnessWatcher,
+  loadOrCreateReaperAuthority,
+  performProtectedBoundaryProbe,
+  runBoundedPayload
+} from "./process-supervisor/native/linux/reaper.mjs";
 
 const REQUIRED_CHECKS = Object.freeze({
   controllers: true,
@@ -24,6 +37,7 @@ const hashNonce = (nonce) =>
 
 function createInjectedClient({
   identity = "protected-reaper:injected",
+  reaperBootId = "boot-injected",
   checks = REQUIRED_CHECKS,
   recover = { recovered: true, drained: [] },
   mutateResponse,
@@ -45,7 +59,9 @@ function createInjectedClient({
           nonce: request.nonce,
           available: true,
           checks: { ...checks },
-          reaperIdentity: identity
+          backend: "linux-cgroup",
+          reaperIdentity: identity,
+          reaperBootId
         };
       } else if (request.operation === "recover") {
         response = {
@@ -55,6 +71,8 @@ function createInjectedClient({
           runId: request.runId,
           nonce: request.nonce,
           reaperIdentity: identity,
+          backend: "linux-cgroup",
+          reaperBootId,
           ...recover
         };
       } else if (request.operation === "launch") {
@@ -65,6 +83,8 @@ function createInjectedClient({
           runId: request.runId,
           nonce: request.nonce,
           reaperIdentity: identity,
+          backend: "linux-cgroup",
+          reaperBootId,
           outerCgroup: `/protected/${request.epoch}-${request.runId}`,
           payloadCgroup: `/protected/${request.epoch}-${request.runId}/payload`,
           pid: 4242,
@@ -85,9 +105,14 @@ function createInjectedClient({
           epoch: request.epoch,
           runId: request.runId,
           nonceHash: hashNonce(request.nonce),
+          proofTokenHash: request.payload.proofToken
+            ? hashNonce(request.payload.proofToken)
+            : "missing",
           outerCgroup: request.payload.outerCgroup,
           populated: 0,
+          backend: "linux-cgroup",
           reaperIdentity: identity,
+          reaperBootId,
           drainedAt: "2026-07-26T00:00:00.000Z"
         };
       } else if (request.operation === "shutdown") {
@@ -98,6 +123,8 @@ function createInjectedClient({
           runId: request.runId,
           nonce: request.nonce,
           reaperIdentity: identity,
+          backend: "linux-cgroup",
+          reaperBootId,
           stopped: true
         };
       }
@@ -114,6 +141,235 @@ const launchSpec = Object.freeze({
   runId: "run-a",
   nonce: "nonce-a",
   backend: "linux-cgroup"
+});
+
+test("atomic registry authenticates the complete record before returning it", async () => {
+  const registryPath = await fs.mkdtemp(path.join(os.tmpdir(), "cdx-registry-"));
+  await fs.chmod(registryPath, 0o700);
+  try {
+    const expectedUid = (await fs.stat(registryPath)).uid;
+    const registry = createAtomicReaperRegistry(registryPath, {
+      authenticationKey: Buffer.alloc(32, 7),
+      reaperBootId: "boot-test",
+      expectedUid,
+      enforcePosixMetadata: false
+    });
+    const entry = {
+      backend: "linux-cgroup",
+      reaperBootId: "boot-test",
+      epoch: "epoch-a",
+      runId: "run-a",
+      nonceHash: hashNonce("nonce-a"),
+      harnessPid: 123,
+      harnessStartTime: "456",
+      outerCgroup: "/protected/epoch-a-run-a",
+      payloadCgroup: "/protected/epoch-a-run-a/payload",
+      state: "running"
+    };
+    await registry.write(entry);
+    assert.deepEqual(await registry.list(), [entry]);
+
+    const [name] = await fs.readdir(registryPath);
+    const file = path.join(registryPath, name);
+    const forged = JSON.parse(await fs.readFile(file, "utf8"));
+    forged.outerCgroup = "/attacker/forged";
+    await fs.writeFile(file, JSON.stringify(forged));
+    await fs.chmod(file, 0o600);
+
+    await assert.rejects(
+      registry.list(),
+      (error) => error?.code === "REGISTRY_AUTHENTICATION_FAILED"
+    );
+  } finally {
+    await fs.chmod(registryPath, 0o700).catch(() => {});
+    await fs.rm(registryPath, { recursive: true, force: true });
+  }
+});
+
+test("Linux registry refuses symlinks and unsafe protected-directory metadata", {
+  skip: process.platform !== "linux"
+}, async () => {
+  const registryPath = await fs.mkdtemp(path.join(os.tmpdir(), "cdx-registry-linux-"));
+  await fs.chmod(registryPath, 0o700);
+  try {
+    const expectedUid = (await fs.stat(registryPath)).uid;
+    const registry = createAtomicReaperRegistry(registryPath, {
+      authenticationKey: Buffer.alloc(32, 9),
+      reaperBootId: "boot-linux",
+      expectedUid
+    });
+    const entry = {
+      backend: "linux-cgroup",
+      reaperBootId: "boot-linux",
+      epoch: "epoch-a",
+      runId: "run-a",
+      nonceHash: hashNonce("nonce-a"),
+      proofTokenHash: hashNonce("proof-a"),
+      proofConsumed: false,
+      harnessPid: 123,
+      harnessStartTime: "456",
+      outerCgroup: "/protected/epoch-a-run-a",
+      payloadCgroup: "/protected/epoch-a-run-a/payload",
+      state: "running"
+    };
+    await registry.write(entry);
+    const [target] = (await fs.readdir(registryPath))
+      .filter((name) => name.endsWith(".json"));
+    await fs.symlink(target, path.join(registryPath, "forged.json"));
+    await assert.rejects(
+      registry.list(),
+      (error) => error?.code === "REGISTRY_INSECURE"
+    );
+    await fs.unlink(path.join(registryPath, "forged.json"));
+    await fs.chmod(registryPath, 0o755);
+    await assert.rejects(
+      registry.list(),
+      (error) => error?.code === "REGISTRY_INSECURE"
+    );
+  } finally {
+    await fs.chmod(registryPath, 0o700).catch(() => {});
+    await fs.rm(registryPath, { recursive: true, force: true });
+  }
+});
+
+test("protected reaper restart reloads one durable boot authority", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cdx-authority-"));
+  const authorityPath = path.join(directory, "authority.json");
+  try {
+    const first = await loadOrCreateReaperAuthority(authorityPath, {
+      enforcePosixMetadata: false
+    });
+    const second = await loadOrCreateReaperAuthority(authorityPath, {
+      enforcePosixMetadata: false
+    });
+
+    assert.equal(first.reaperBootId, second.reaperBootId);
+    assert.deepEqual(first.authenticationKey, second.authenticationKey);
+    assert.match(first.reaperBootId, /^[A-Za-z0-9._-]+$/);
+    assert.equal(first.authenticationKey.length, 32);
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("protected shim bounds hostile streaming output before accumulation", async () => {
+  const breaches = [];
+  const startedAt = Date.now();
+  const root = await runBoundedPayload({
+    payload: {
+      command: process.execPath,
+      args: ["-e", "setInterval(()=>process.stdout.write('x'.repeat(4096)),0)"],
+      env: process.env,
+      maxBuffer: 1024,
+      timeout: 5000
+    },
+    onBoundaryBreach(reason) {
+      breaches.push(reason);
+    }
+  });
+
+  assert.equal(root.error?.code, "ENOBUFS");
+  assert.ok(root.stdout.length <= 1024);
+  assert.ok(root.stderr.length <= 1024);
+  assert.deepEqual(breaches, ["output-limit"]);
+  assert.ok(Date.now() - startedAt < 3000);
+});
+
+test("protected shim enforces a hard runtime cap for a never-exit payload", async () => {
+  const breaches = [];
+  const startedAt = Date.now();
+  const root = await runBoundedPayload({
+    payload: {
+      command: process.execPath,
+      args: ["-e", "setInterval(()=>{},1000)"],
+      env: process.env,
+      maxBuffer: 1024,
+      timeout: 50
+    },
+    onBoundaryBreach(reason) {
+      breaches.push(reason);
+    }
+  });
+
+  assert.equal(root.error?.code, "ETIMEDOUT");
+  assert.deepEqual(breaches, ["runtime-limit"]);
+  assert.ok(Date.now() - startedAt < 1000);
+});
+
+test("pidfd watcher accepts only a complete bounded READY line", async () => {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.kill = () => true;
+  const watcherPromise = createPidfdHarnessWatcher({
+    entry: {
+      harnessPid: 123,
+      harnessStartTime: "456"
+    },
+    onDeath() {},
+    spawnWatcher() {
+      return child;
+    },
+    readyLimit: 16,
+    readyTimeoutMs: 1000
+  });
+  child.stdout.write("RE");
+  await new Promise((resolve) => setImmediate(resolve));
+  child.stdout.write("ADY\n");
+
+  const watcher = await watcherPromise;
+
+  assert.equal(typeof watcher.close, "function");
+  watcher.close();
+});
+
+test("strict capability probe performs the complete disposable boundary itself", async () => {
+  const events = [];
+  const result = await performProtectedBoundaryProbe({
+    protectedRoot: "/protected",
+    accessControllers: async () => events.push("controllers"),
+    cgroups: {
+      async createRun() { events.push("create"); },
+      async hasCgroupKill() { events.push("cgroup.kill"); return true; },
+      async spawnBlockedShim() {
+        events.push("spawn");
+        return {
+          pid: 77,
+          launcherPid: 76,
+          ready: { reaperVisible: false, cgroupWritable: false },
+          root: new Promise(() => {})
+        };
+      },
+      async migrateBlockedShim() { events.push("migrate"); },
+      async validatePayloadMembership() { events.push("membership"); return true; },
+      async validateRestrictedNamespace() { events.push("namespace"); return true; },
+      async releaseShim() { events.push("release"); },
+      async killOuter() { events.push("kill"); },
+      async readOuterEvents() { events.push("populated"); return { populated: 0 }; },
+      async removeRun() { events.push("remove"); }
+    },
+    readStartTime: async () => "start-77",
+    async watchHarness(entry) {
+      events.push(`pidfd:${entry.harnessStartTime}`);
+      return { close() { events.push("watch-close"); } };
+    }
+  });
+
+  assert.deepEqual(result, REQUIRED_CHECKS);
+  assert.deepEqual(events, [
+    "controllers",
+    "create",
+    "cgroup.kill",
+    "spawn",
+    "migrate",
+    "membership",
+    "namespace",
+    "pidfd:start-77",
+    "release",
+    "kill",
+    "populated",
+    "watch-close",
+    "remove"
+  ]);
 });
 
 test("writable delegation without protected isolation is unavailable", async () => {
@@ -218,20 +474,37 @@ test("nonce or epoch mismatch poisons the backend", async () => {
   }
 });
 
+test("cross-boot cleanup proof poisons the backend", async () => {
+  const client = createInjectedClient({
+    mutateResponse(response, request) {
+      return request.operation === "cleanup"
+        ? { ...response, reaperBootId: "attacker-boot" }
+        : response;
+    }
+  });
+  const backend = createLinuxCgroupBackend({
+    platform: "linux",
+    reaperClient: client
+  });
+  assert.equal((await backend.probe()).available, true);
+  const launched = await backend.launch(launchSpec);
+
+  await assert.rejects(
+    launched.cleanup(),
+    (error) => [
+      "PROTOCOL_IDENTITY_MISMATCH",
+      "CLEANUP_UNPROVEN"
+    ].includes(error?.code)
+  );
+  assert.throws(() => backend.assertHealthy());
+});
+
 test("leaf populated zero is insufficient when the outer cgroup remains populated", async () => {
   const client = createInjectedClient({
-    cleanupProof: {
-      version: 1,
-      operation: "cleanup",
-      level: "kernel-drained",
-      epoch: launchSpec.epoch,
-      runId: launchSpec.runId,
-      nonceHash: hashNonce(launchSpec.nonce),
-      outerCgroup: `/protected/${launchSpec.epoch}-${launchSpec.runId}`,
-      payloadPopulated: 0,
-      populated: 1,
-      reaperIdentity: "protected-reaper:injected",
-      drainedAt: "2026-07-26T00:00:00.000Z"
+    mutateResponse(response, request) {
+      return request.operation === "cleanup"
+        ? { ...response, payloadPopulated: 0, populated: 1 }
+        : response;
     }
   });
   const backend = createLinuxCgroupBackend({
@@ -261,6 +534,9 @@ test("cleanup accepts only authenticated outer-cgroup populated zero", async () 
   const launched = await backend.launch(launchSpec);
 
   const proof = await launched.cleanup();
+  const launchedRequest = client.requests.find(
+    (item) => item.operation === "launch" && item.runId === launchSpec.runId
+  );
 
   assert.deepEqual(proof, {
     backend: "linux-cgroup",
@@ -268,11 +544,41 @@ test("cleanup accepts only authenticated outer-cgroup populated zero", async () 
     epoch: launchSpec.epoch,
     runId: launchSpec.runId,
     nonceHash: hashNonce(launchSpec.nonce),
+    proofTokenHash: hashNonce(launchedRequest.payload.proofToken),
     outerCgroup: `/protected/${launchSpec.epoch}-${launchSpec.runId}`,
     populated: 0,
+    reaperBootId: "boot-injected",
     reaperIdentity: client.identity,
     drainedAt: "2026-07-26T00:00:00.000Z"
   });
+});
+
+test("protected reaper consumes each cleanup proof token exactly once", async () => {
+  const { reaper } = createReaperHarness();
+  await reaper.handleRequest(request("probe"));
+  await reaper.handleRequest(request("recover"));
+  await reaper.handleRequest(request("launch", {
+    payload: {
+      command: process.execPath,
+      args: [],
+      harnessPid: 111,
+      harnessStartTime: "222",
+      proofToken: "one-time-proof-token"
+    }
+  }));
+  const cleanup = request("cleanup", {
+    payload: {
+      outerCgroup: "/protected/epoch-a-run-a",
+      proofToken: "one-time-proof-token"
+    }
+  });
+
+  const proof = await reaper.handleRequest(cleanup);
+  assert.equal(proof.proofTokenHash, hashNonce("one-time-proof-token"));
+  await assert.rejects(
+    reaper.handleRequest(cleanup),
+    (error) => error?.code === "PROOF_REPLAYED"
+  );
 });
 
 test("target payload never receives the private registry path or reaper credential", async () => {
@@ -359,7 +665,9 @@ test("real reaper transport acknowledges launch before root completion", async (
 
 function createReaperHarness({
   registryEntries = [],
-  checks = REQUIRED_CHECKS
+  checks = REQUIRED_CHECKS,
+  cgroupOverrides = {},
+  reaperBootId = "boot-test"
 } = {}) {
   const events = [];
   const entries = new Map(
@@ -397,7 +705,8 @@ function createReaperHarness({
     },
     async removeRun(entry) {
       events.push(`remove:${entry.runId}`);
-    }
+    },
+    ...cgroupOverrides
   };
   const registry = {
     async list() {
@@ -410,6 +719,7 @@ function createReaperHarness({
   };
   const reaper = createProtectedLinuxReaper({
     reaperIdentity: "protected-reaper:test",
+    reaperBootId,
     protectedRoot: "/protected",
     checks: async () => ({ ...checks }),
     cgroups,
@@ -429,7 +739,16 @@ function request(operation, {
   nonce = "nonce-a",
   payload = {}
 } = {}) {
-  return { version: 1, operation, epoch, runId, nonce, payload };
+  return {
+    version: 1,
+    operation,
+    epoch,
+    runId,
+    nonce,
+    payload: ["launch", "cleanup"].includes(operation)
+      ? { proofToken: "default-one-time-proof-token", ...payload }
+      : payload
+  };
 }
 
 test("coordinator death causes independent reaper cleanup", async () => {
@@ -445,18 +764,109 @@ test("coordinator death causes independent reaper cleanup", async () => {
     }
   }));
 
-  await watchers.get("run-a")();
+  watchers.get("run-a")();
+  const deadline = Date.now() + 1000;
+  while (entries.get("run-a")?.state !== "drained" && Date.now() < deadline) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
 
   assert.ok(events.includes("kill:run-a"));
   assert.ok(events.includes("events:run-a"));
   assert.equal(entries.get("run-a").state, "drained");
 });
 
+test("simultaneous cleanup and harness death join one idempotent drain", async () => {
+  const { reaper, events, watchers } = createReaperHarness();
+  await reaper.handleRequest(request("probe"));
+  await reaper.handleRequest(request("recover"));
+  await reaper.handleRequest(request("launch", {
+    payload: {
+      command: process.execPath,
+      args: [],
+      harnessPid: 111,
+      harnessStartTime: "222"
+    }
+  }));
+
+  await Promise.all([
+    watchers.get("run-a")(),
+    reaper.handleRequest(request("cleanup", {
+      payload: { outerCgroup: "/protected/epoch-a-run-a" }
+    }))
+  ]);
+
+  assert.equal(events.filter((event) => event === "kill:run-a").length, 1);
+  assert.equal(events.filter((event) => event === "events:run-a").length, 1);
+  assert.equal(events.filter((event) => event === "remove:run-a").length, 1);
+});
+
+test("watcher drain failure is handled and latched without an exposed rejection", async () => {
+  const { reaper, watchers } = createReaperHarness({
+    cgroupOverrides: {
+      async removeRun() {
+        throw new Error("injected removal failure");
+      }
+    }
+  });
+  await reaper.handleRequest(request("probe"));
+  await reaper.handleRequest(request("recover"));
+  await reaper.handleRequest(request("launch", {
+    payload: {
+      command: process.execPath,
+      args: [],
+      harnessPid: 111,
+      harnessStartTime: "222"
+    }
+  }));
+
+  const returned = watchers.get("run-a")();
+  returned?.catch?.(() => {});
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(returned, undefined);
+  assert.throws(
+    () => reaper.assertHealthy(),
+    /injected removal failure/
+  );
+});
+
+test("payload runtime or output breach drains the outer cgroup before terminal proof", async () => {
+  const { reaper, events, entries } = createReaperHarness();
+  await reaper.handleRequest(request("probe"));
+  await reaper.handleRequest(request("recover"));
+  const launched = await reaper.handleRequest(request("launch", {
+    payload: {
+      command: process.execPath,
+      args: [],
+      harnessPid: 111,
+      harnessStartTime: "222",
+      root: {
+        status: null,
+        signal: "SIGKILL",
+        stdout: Buffer.alloc(0),
+        stderr: Buffer.alloc(0),
+        error: { code: "ENOBUFS", message: "bounded" },
+        boundaryBreach: "output-limit"
+      }
+    }
+  }));
+
+  const root = await launched.root;
+
+  assert.equal(root.error.code, "ENOBUFS");
+  assert.ok(events.includes("kill:run-a"));
+  assert.equal(entries.get("run-a").state, "drained");
+});
+
 test("stale registry recovery completes before a new launch", async () => {
   const stale = {
+    backend: "linux-cgroup",
+    reaperBootId: "boot-test",
     epoch: "old-epoch",
     runId: "old-run",
     nonceHash: hashNonce("old-nonce"),
+    proofTokenHash: hashNonce("old-proof-token"),
+    proofConsumed: false,
     harnessPid: 12,
     harnessStartTime: "34",
     outerCgroup: "/protected/old-epoch-old-run",
@@ -485,10 +895,52 @@ test("stale registry recovery completes before a new launch", async () => {
   assert.ok(events.indexOf("kill:old-run") < events.indexOf("create:run-a"));
 });
 
+test("recovery rejects cross-boundary registry records before privileged cleanup", async () => {
+  const base = {
+    backend: "linux-cgroup",
+    reaperBootId: "boot-test",
+    epoch: "old-epoch",
+    runId: "old-run",
+    nonceHash: hashNonce("old-nonce"),
+    proofTokenHash: hashNonce("old-proof-token"),
+    proofConsumed: false,
+    harnessPid: 12,
+    harnessStartTime: "34",
+    outerCgroup: "/protected/old-epoch-old-run",
+    payloadCgroup: "/protected/old-epoch-old-run/payload",
+    state: "running"
+  };
+  for (const forged of [
+    { ...base, backend: "other-backend" },
+    { ...base, reaperBootId: "other-boot" },
+    { ...base, outerCgroup: "/attacker/forged" },
+    { ...base, payloadCgroup: "/protected/sibling" },
+    { ...base, runId: "../../../escape" }
+  ]) {
+    const { reaper, events } = createReaperHarness({
+      registryEntries: [forged]
+    });
+    await reaper.handleRequest(request("probe"));
+
+    await assert.rejects(
+      reaper.handleRequest(request("recover")),
+      (error) => [
+        "REGISTRY_INVALID",
+        "REGISTRY_AUTHENTICATION_FAILED"
+      ].includes(error?.code)
+    );
+    assert.equal(
+      events.some((event) => event.startsWith("kill:")),
+      false
+    );
+  }
+});
+
 test("payload migration attempt is rejected and drains the run", async () => {
   const harness = createReaperHarness();
   harness.reaper = createProtectedLinuxReaper({
     reaperIdentity: "protected-reaper:test",
+    reaperBootId: "boot-test",
     protectedRoot: "/protected",
     checks: async () => ({ ...REQUIRED_CHECKS }),
     registry: {
@@ -553,7 +1005,8 @@ test("Linux strict mode requires a live protected runner", {
   skip: process.env.CDX_RELAY_TEST_LINUX_STRICT !== "1"
 }, async () => {
   assert.equal(process.platform, "linux", "strict mode requires Linux");
-  const backend = createLinuxCgroupBackend();
+  let backend = createLinuxCgroupBackend();
+  const client = createUnixLinuxReaperClient();
   const probe = await backend.probe();
   assert.equal(
     probe.available,
@@ -568,31 +1021,143 @@ test("Linux strict mode requires a live protected runner", {
     cleanupProof: "kernel-drained",
     supportsDetachedDescendants: true
   });
-  const client = createUnixLinuxReaperClient();
   const stat = await import("node:fs/promises").then(({ readFile }) =>
     readFile(`/proc/${process.pid}/stat`, "utf8"));
   const harnessStartTime = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+  const audit = async (runId) => {
+    const result = await client.request(request("probe", {
+      epoch: `audit-${Date.now()}`,
+      runId: `audit-${process.pid}`,
+      nonce: `audit-nonce-${Date.now()}`
+    }));
+    return {
+      probe: result,
+      entry: result.registry?.find((candidate) => candidate.runId === runId)
+    };
+  };
+  const waitFor = async (predicate, message, timeout = 10_000) => {
+    const deadline = Date.now() + timeout;
+    let observed;
+    while (Date.now() < deadline) {
+      observed = await predicate();
+      if (observed) return observed;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.fail(`${message}; last observation: ${JSON.stringify(observed)}`);
+  };
+  const initialReaperProbe = (await audit("__no-active-run__")).probe;
+
+  await assert.rejects(
+    client.request(request("launch", {
+      epoch: `pid-mismatch-${Date.now()}`,
+      runId: `pid-mismatch-${process.pid}`,
+      nonce: `pid-mismatch-nonce-${Date.now()}`,
+      payload: {
+        command: process.execPath,
+        args: ["-e", ""],
+        env: {},
+        harnessPid: process.pid,
+        harnessStartTime: `${harnessStartTime}-wrong`
+      }
+    })),
+    (error) => error?.code === "HARNESS_WATCH_UNAVAILABLE"
+  );
+
   const staleIdentity = {
     epoch: `stale-${Date.now()}`,
     runId: `stale-${process.pid}`,
     nonce: `stale-nonce-${Date.now()}`
   };
-  await client.request(request("launch", {
+  const staleLaunch = await client.request(request("launch", {
     ...staleIdentity,
     payload: {
       command: process.execPath,
-      args: ["-e", ""],
+      args: ["-e", "setInterval(()=>{},1000)"],
       env: {},
       harnessPid: process.pid,
       harnessStartTime
     }
   }));
+  void staleLaunch.root.catch(() => {});
+  const liveStale = await waitFor(async () => {
+    const state = (await audit(staleIdentity.runId)).entry;
+    return state?.state === "running" && state.populated === 1 &&
+      state.pids?.length > 0 ? state : undefined;
+  }, "stale run never became observably populated");
+  const oldReaperPid = Number(
+    initialReaperProbe.reaperIdentity.split(":").at(-1)
+  );
+  assert.equal(Number.isSafeInteger(oldReaperPid), true);
+  const killed = spawnSync("sudo", ["-n", "kill", "-9", String(oldReaperPid)], {
+    encoding: "utf8"
+  });
+  assert.equal(killed.status, 0, killed.stderr);
+
+  const reaperScript = fileURLToPath(new URL(
+    "./process-supervisor/native/linux/reaper.mjs",
+    import.meta.url
+  ));
+  const requiredReaperEnvironment = [
+    "CDX_RELAY_LINUX_REAPER_ENDPOINT",
+    "CDX_RELAY_LINUX_REAPER_CREDENTIAL",
+    "CDX_RELAY_LINUX_PROTECTED_ROOT",
+    "CDX_RELAY_LINUX_REAPER_REGISTRY",
+    "CDX_RELAY_LINUX_PAYLOAD_UID",
+    "CDX_RELAY_LINUX_PAYLOAD_GID",
+    "CDX_RELAY_LINUX_SOCKET_UID",
+    "CDX_RELAY_LINUX_SOCKET_GID"
+  ];
+  const environmentArguments = requiredReaperEnvironment.map((name) => {
+    assert.notEqual(process.env[name], undefined, `${name} must be configured`);
+    return `${name}=${process.env[name]}`;
+  });
+  const restartedReaper = spawn("sudo", [
+    "-n",
+    "env",
+    ...environmentArguments,
+    process.execPath,
+    reaperScript,
+    "--serve"
+  ], {
+    detached: true,
+    stdio: "ignore"
+  });
+  restartedReaper.unref();
+  const restartedProbe = await waitFor(async () => {
+    try {
+      return (await audit(staleIdentity.runId)).probe;
+    } catch {
+      return undefined;
+    }
+  }, "replacement reaper did not become ready");
+  assert.notEqual(
+    restartedProbe.reaperIdentity,
+    initialReaperProbe.reaperIdentity
+  );
+  assert.equal(
+    restartedProbe.reaperBootId,
+    initialReaperProbe.reaperBootId
+  );
+
   const recovery = await client.request(request("recover", {
     epoch: `recovery-${Date.now()}`,
     runId: `recovery-${process.pid}`,
     nonce: `recovery-nonce-${Date.now()}`
   }));
   assert.ok(recovery.drained.includes(staleIdentity.runId));
+  const recoveredStale = (await audit(staleIdentity.runId)).entry;
+  assert.deepEqual(recoveredStale, {
+    epoch: staleIdentity.epoch,
+    runId: staleIdentity.runId,
+    state: "drained",
+    populated: 0,
+    pids: []
+  });
+  for (const pid of liveStale.pids) {
+    await assert.rejects(fs.access(`/proc/${pid}`), { code: "ENOENT" });
+  }
+  backend = createLinuxCgroupBackend();
+  assert.equal((await backend.probe()).available, true);
 
   const identity = {
     epoch: `live-${Date.now()}`,
@@ -614,18 +1179,28 @@ test("Linux strict mode requires a live protected runner", {
   assert.equal(proof.populated, 0);
   assert.equal(proof.outerCgroup.endsWith(`${identity.epoch}-${identity.runId}`), true);
 
-  const migration = await backend.launch({
-    command: process.execPath,
-    args: ["-e", [
-      "const fs=require('node:fs');",
-      "try{fs.writeFileSync('/sys/fs/cgroup/cgroup.procs',String(process.pid));",
-      "process.stdout.write('writable')}catch{process.stdout.write('denied')}"
-    ].join("")],
-    shell: false,
+  const migrationIdentity = {
     epoch: `migration-${Date.now()}`,
     runId: `migration-${process.pid}`,
     nonce: `migration-nonce-${Date.now()}`,
     backend: "linux-cgroup"
+  };
+  const migration = await backend.launch({
+    command: process.execPath,
+    args: ["-e", [
+      "const fs=require('node:fs');",
+      "try{fs.writeFileSync(process.env.ATTEMPT_CGROUP,String(process.pid));",
+      "process.stdout.write('writable')}catch{process.stdout.write('denied')}"
+    ].join("")],
+    env: {
+      ATTEMPT_CGROUP: path.join(
+        process.env.CDX_RELAY_LINUX_PROTECTED_ROOT,
+        `${migrationIdentity.epoch}-${migrationIdentity.runId}`,
+        "cgroup.procs"
+      )
+    },
+    shell: false,
+    ...migrationIdentity
   });
   assert.equal(Buffer.from((await migration.root).stdout).toString(), "denied");
   assert.equal((await migration.cleanup()).populated, 0);
@@ -639,18 +1214,24 @@ test("Linux strict mode requires a live protected runner", {
     runId: `death-${process.pid}`,
     nonce: `death-nonce-${Date.now()}`
   };
+  const forkingPayload = [
+    "const {spawn}=require('node:child_process');",
+    "spawn(process.execPath,['-e','setInterval(()=>{},1000)'],",
+    "{detached:true,stdio:'ignore'}).unref();",
+    "setInterval(()=>{},1000)"
+  ].join("");
   const source = [
     `import { createLinuxCgroupBackend } from ${JSON.stringify(backendUrl)};`,
     `const backend=createLinuxCgroupBackend();`,
     `await backend.probe();`,
-    `await backend.launch(${JSON.stringify({
+    `const launched=await backend.launch(${JSON.stringify({
       command: process.execPath,
-      args: ["-e", ""],
+      args: ["-e", forkingPayload],
       shell: false,
       backend: "linux-cgroup",
       ...deathIdentity
     })});`,
-    "process.send('launched');"
+    "process.send({outerCgroup:launched.outerCgroup});"
   ].join("\n");
   const coordinator = spawn(process.execPath, [
     "--input-type=module",
@@ -664,19 +1245,20 @@ test("Linux strict mode requires a live protected runner", {
     coordinator.once("error", reject);
     coordinator.once("message", resolve);
   });
-  coordinator.disconnect();
+  const liveDeath = await waitFor(async () => {
+    const state = (await audit(deathIdentity.runId)).entry;
+    return state?.state === "running" && state.populated === 1 &&
+      state.pids?.length >= 2 ? state : undefined;
+  }, "forking workload never became observably populated");
+  coordinator.kill("SIGKILL");
   await new Promise((resolve) => coordinator.once("exit", resolve));
-  const deadline = Date.now() + 5000;
-  let deathState;
-  while (Date.now() < deadline) {
-    const audit = await client.request(request("probe", {
-      epoch: `audit-${Date.now()}`,
-      runId: `audit-${process.pid}`,
-      nonce: `audit-nonce-${Date.now()}`
-    }));
-    deathState = audit.registry?.find((entry) => entry.runId === deathIdentity.runId);
-    if (deathState?.state === "drained") break;
-    await new Promise((resolve) => setTimeout(resolve, 25));
+  const deathState = await waitFor(async () => {
+    const state = (await audit(deathIdentity.runId)).entry;
+    return state?.state === "drained" && state.populated === 0 &&
+      state.pids?.length === 0 ? state : undefined;
+  }, "coordinator death did not drain the forking workload");
+  assert.equal(deathState.state, "drained");
+  for (const pid of liveDeath.pids) {
+    await assert.rejects(fs.access(`/proc/${pid}`), { code: "ENOENT" });
   }
-  assert.equal(deathState?.state, "drained");
 });
