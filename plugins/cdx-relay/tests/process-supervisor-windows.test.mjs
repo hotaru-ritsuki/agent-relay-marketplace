@@ -1421,6 +1421,51 @@ test("Windows cleanup rejects mismatch and replay for every ownership tuple fiel
   await backend.shutdown();
 });
 
+test("public Windows backend preserves fixed supervisor ownership through tombstone replay", {
+  skip: process.platform !== "win32"
+}, async () => {
+  const ownership = Object.freeze({
+    epoch: "task3-sentinel-epoch-7f4d",
+    runId: "task3-sentinel-run-92a1",
+    nonce: "task3-sentinel-nonce-c5e8",
+    backend: "windows-job"
+  });
+  const backend = createWindowsBackend();
+  try {
+    const launched = await backend.launch({
+      command: process.execPath,
+      args: ["-e", "process.stdout.write('sentinel-owned')"],
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 2000,
+      ...ownership
+    });
+    const leaseSymbol = Object.getOwnPropertySymbols(launched.child)
+      .find((symbol) => symbol.description === "windows-job-lease");
+    assert.ok(leaseSymbol, "native launch acknowledgement must retain its lease");
+    assert.deepEqual(launched.child[leaseSymbol].ownership, ownership);
+    await launched.root;
+
+    const expectedProof = {
+      backend: ownership.backend,
+      level: "kernel-drained",
+      controllerEpoch: ownership.epoch,
+      runId: ownership.runId,
+      nonce: ownership.nonce,
+      terminalState: "stopped",
+      activeProcesses: 0
+    };
+    assert.deepEqual(launched.cleanup(), expectedProof);
+    assert.deepEqual(
+      launched.cleanup(),
+      expectedProof,
+      "native tombstone replay must preserve the original supervisor tuple"
+    );
+  } finally {
+    await backend.shutdown();
+  }
+});
+
 test("Windows cleanup rejects native proof mismatch for every ownership tuple field", {
   skip: process.platform !== "win32"
 }, async () => {
