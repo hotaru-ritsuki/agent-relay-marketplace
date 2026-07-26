@@ -8,6 +8,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
+  createNetRegistrationChannel,
   createPosixProcessGroupBackend,
   decodeSupervisorToken
 } from "./process-supervisor/backends/posix-process-group.mjs";
@@ -774,7 +775,7 @@ test("real broker spawn preserves exact no-token env and adds only an active tok
   try {
     process.env.TASK4_PARENT_ONLY = "must-not-leak";
     delete process.env.CDX_RELAY_SUPERVISOR_TOKEN;
-    spawnBrokerProcess({
+    const noTokenChild = spawnBrokerProcess({
       scriptPath,
       cwd: directory,
       endpoint: "unused",
@@ -789,10 +790,13 @@ test("real broker spawn preserves exact no-token env and adds only an active tok
     assert.equal(noTokenEnv.ONLY_CALLER_ENV, "present");
     assert.equal(noTokenEnv.CDX_RELAY_SUPERVISOR_TOKEN, undefined);
     assert.equal(noTokenEnv.TASK4_PARENT_ONLY, undefined);
+    if (noTokenChild.exitCode === null) {
+      await new Promise((resolve) => noTokenChild.once("exit", resolve));
+    }
 
     fs.rmSync(outputPath);
     process.env.CDX_RELAY_SUPERVISOR_TOKEN = "active-token";
-    spawnBrokerProcess({
+    const tokenChild = spawnBrokerProcess({
       scriptPath,
       cwd: directory,
       endpoint: "unused",
@@ -807,6 +811,9 @@ test("real broker spawn preserves exact no-token env and adds only an active tok
     assert.equal(tokenEnv.ONLY_CALLER_ENV, "present");
     assert.equal(tokenEnv.CDX_RELAY_SUPERVISOR_TOKEN, "active-token");
     assert.equal(tokenEnv.TASK4_PARENT_ONLY, undefined);
+    if (tokenChild.exitCode === null) {
+      await new Promise((resolve) => tokenChild.once("exit", resolve));
+    }
   } finally {
     if (originalToken === undefined) {
       delete process.env.CDX_RELAY_SUPERVISOR_TOKEN;
@@ -819,5 +826,128 @@ test("real broker spawn preserves exact no-token env and adds only an active tok
       process.env.TASK4_PARENT_ONLY = originalParentOnly;
     }
     fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("real shim exit without an authenticated root frame rejects PROTOCOL_LOST", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "cdx-no-root-"));
+  const shimPath = path.join(directory, "no-root.mjs");
+  fs.writeFileSync(shimPath, "process.exit(0);");
+  let channel;
+  const backend = createPosixProcessGroupBackend({
+    platform: "linux",
+    shimPath,
+    async createRegistrationChannel() {
+      channel = await listenOnTestPipe(() => {});
+      return channel;
+    },
+    async inspectProcess(pid) {
+      return { pid, startTime: "100", executable: process.execPath };
+    },
+    killGroup() {},
+    async waitForDrain() {
+      return false;
+    },
+    graceMs: 1,
+    forceMs: 1,
+    terminalFrameMs: 25
+  });
+  const launched = await backend.launch({
+    ...identity,
+    command: process.execPath,
+    args: ["-e", ""],
+    env: process.env,
+    shell: false
+  });
+  try {
+    await assert.rejects(
+      launched.root,
+      (error) => error.code === "PROTOCOL_LOST"
+    );
+  } finally {
+    await channel.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("authenticated root frame already in transport wins its race with shim exit", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "cdx-root-race-"));
+  const shimPath = path.join(directory, "root-race.mjs");
+  fs.writeFileSync(shimPath, [
+    "import net from 'node:net';",
+    "import process from 'node:process';",
+    "const t=JSON.parse(Buffer.from(process.env.CDX_RELAY_SUPERVISOR_TOKEN,'base64url'));",
+    "const s=net.createConnection({path:t.endpoint.slice(5)});s.setEncoding('utf8');",
+    "await new Promise((resolve,reject)=>{let p='';s.once('error',reject);",
+    "s.on('data',c=>{p+=c;if(p.includes('\\n'))resolve();});",
+    "s.write(JSON.stringify({type:'hello',version:1,epoch:t.epoch,runId:t.runId,nonce:t.nonce,backend:'posix-cooperative',pid:process.pid,parentPid:process.ppid})+'\\n');});",
+    "s.write(JSON.stringify({type:'root',version:1,epoch:t.epoch,runId:t.runId,nonce:t.nonce,backend:'posix-cooperative',status:17,signal:null})+'\\n',()=>process.exit(0));"
+  ].join(""));
+  let channel;
+  let registeredPid;
+  const backend = createPosixProcessGroupBackend({
+    platform: "linux",
+    shimPath,
+    async createRegistrationChannel(handlers) {
+      channel = await listenOnTestPipe(async (message, socket) => {
+        if (message.type === "hello") {
+          registeredPid = message.pid;
+          await handlers.hello(message);
+          socket.write(`${JSON.stringify({ type: "release", version: 1 })}\n`);
+        } else {
+          setTimeout(() => handlers.root(message), 10);
+        }
+      }, () => handlers.closed(registeredPid));
+      return channel;
+    },
+    async inspectProcess(pid) {
+      return { pid, startTime: "100", executable: process.execPath };
+    },
+    terminalFrameMs: 50
+  });
+  const launched = await backend.launch({
+    ...identity,
+    command: process.execPath,
+    args: ["-e", ""],
+    env: process.env,
+    shell: false
+  });
+  try {
+    const result = await launched.root;
+    assert.equal(result.status, 17);
+    assert.equal(result.backend, "posix-cooperative");
+  } finally {
+    await channel.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("server hello deadline is absolute despite slow-drip activity", async () => {
+  const pipe = `\\\\.\\pipe\\cdx-slow-drip-${process.pid}-${Date.now()}`;
+  let lostError;
+  const channel = await createNetRegistrationChannel({
+    async hello() {},
+    root() {},
+    async closed() {},
+    lost(error) {
+      lostError = error;
+    }
+  }, {
+    handshakeMs: 35,
+    socketPath: pipe
+  });
+  const started = Date.now();
+  const socket = net.createConnection({ path: pipe });
+  socket.on("error", () => {});
+  const closed = new Promise((resolve) => socket.once("close", resolve));
+  const drip = setInterval(() => socket.write("{"), 10);
+  try {
+    await closed;
+    assert.equal(lostError?.code, "PROTOCOL_HANDSHAKE_TIMEOUT");
+    assert.ok(Date.now() - started < 80);
+  } finally {
+    clearInterval(drip);
+    socket.destroy();
+    await channel.close();
   }
 });

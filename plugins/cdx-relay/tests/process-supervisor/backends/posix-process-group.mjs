@@ -108,26 +108,26 @@ function endpointPath(endpoint) {
   return endpoint.slice("unix:".length);
 }
 
-async function createNetRegistrationChannel(handlers, {
-  handshakeMs = 5000
-} = {}) {
-  const socketPath = path.join(
+export async function createNetRegistrationChannel(handlers, {
+  handshakeMs = 5000,
+  socketPath = path.join(
     os.tmpdir(),
     `cdx-relay-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`
-  );
+  )
+} = {}) {
   let closing = false;
   const sockets = new Set();
   const server = net.createServer((socket) => {
     sockets.add(socket);
     let pending = "";
     let registeredPid = null;
-    socket.setEncoding("utf8");
-    socket.setTimeout(handshakeMs, () => {
+    const handshakeTimer = setTimeout(() => {
       socket.destroy(fail(
         "PROTOCOL_HANDSHAKE_TIMEOUT",
         "Registration hello deadline expired."
       ));
-    });
+    }, handshakeMs);
+    socket.setEncoding("utf8");
     socket.on("data", async (chunk) => {
       pending += chunk;
       if (Buffer.byteLength(pending) > MAX_FRAME_BYTES) {
@@ -147,7 +147,7 @@ async function createNetRegistrationChannel(handlers, {
           if (message.type === "hello") {
             await handlers.hello(message);
             registeredPid = message.pid;
-            socket.setTimeout(0);
+            clearTimeout(handshakeTimer);
             socket.write(`${JSON.stringify({ type: "release", version: 1 })}\n`);
           } else if (message.type === "root") {
             handlers.root(message);
@@ -160,6 +160,7 @@ async function createNetRegistrationChannel(handlers, {
       }
     });
     socket.on("close", () => {
+      clearTimeout(handshakeTimer);
       sockets.delete(socket);
       if (registeredPid !== null) {
         void handlers.closed(registeredPid).catch(handlers.lost);
@@ -203,7 +204,8 @@ export function createPosixProcessGroupBackend({
   now = Date.now,
   graceMs = 1000,
   forceMs = 1000,
-  handshakeMs = 5000
+  handshakeMs = 5000,
+  terminalFrameMs = 100
 } = {}) {
   const leases = new Map();
   let protocolFailure = null;
@@ -379,6 +381,8 @@ export function createPosixProcessGroupBackend({
     let resolveRoot;
     let rejectRoot;
     let rootSettled = false;
+    let rootAuthenticated = false;
+    let terminalFrameTimer;
     const root = new Promise((resolve, reject) => {
       resolveRoot = resolve;
       rejectRoot = reject;
@@ -426,7 +430,9 @@ export function createPosixProcessGroupBackend({
           rejectRoot(error);
           return;
         }
+        rootAuthenticated = true;
         rootSettled = true;
+        clearTimeout(terminalFrameTimer);
         resolveRoot({
           backend: BACKEND,
           status: message.status ?? null,
@@ -439,6 +445,10 @@ export function createPosixProcessGroupBackend({
       async closed(pid) {
         const registered = registry.get(pid);
         if (!registered) return;
+        if (pid === lease.rootPid && rootAuthenticated) {
+          registry.delete(pid);
+          return;
+        }
         const actual = await inspectProcess(pid);
         if (!actual) {
           registry.delete(pid);
@@ -492,18 +502,26 @@ export function createPosixProcessGroupBackend({
       );
     }
     leases.set(spec.runId, lease);
-    child.once?.("error", (error) => rejectRoot(error));
-    child.once?.("exit", (status, signal) => {
+    child.once?.("error", (error) => {
+      protocolFailure ??= fail(
+        "PROTOCOL_LOST",
+        "Trusted launch shim failed before authenticated root completion.",
+        error
+      );
+      rejectRoot(protocolFailure);
+    });
+    child.once?.("exit", () => {
       if (rootSettled) return;
-      rootSettled = true;
-      resolveRoot({
-        backend: BACKEND,
-        status,
-        signal,
-        stdout: undefined,
-        stderr: undefined,
-        error: undefined
-      });
+      terminalFrameTimer = setTimeout(() => {
+        if (rootSettled) return;
+        rootSettled = true;
+        protocolFailure ??= fail(
+          "PROTOCOL_LOST",
+          "Trusted launch shim exited without an authenticated root frame."
+        );
+        rejectRoot(protocolFailure);
+      }, terminalFrameMs);
+      terminalFrameTimer.unref?.();
     });
     return {
       child,
