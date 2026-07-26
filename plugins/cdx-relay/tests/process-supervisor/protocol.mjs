@@ -22,6 +22,16 @@ export function assertBoundedFrame(buffer) {
 
 export function serializeBounded(value) {
   const json = JSON.stringify(value, (_key, item) => {
+    if (ArrayBuffer.isView(item) && !Buffer.isBuffer(item)) {
+      return {
+        type: "Buffer",
+        data: Buffer.from(
+          item.buffer,
+          item.byteOffset,
+          item.byteLength
+        ).toString("base64")
+      };
+    }
     if (Buffer.isBuffer(item)) {
       return { type: "Buffer", data: item.toString("base64") };
     }
@@ -128,13 +138,14 @@ export function validateRoot(message, expected) {
   }
   for (const field of ["stdout", "stderr"]) {
     const value = message[field];
-    if (value !== undefined && typeof value !== "string" && !Buffer.isBuffer(value)) {
+    if (value !== undefined && value !== null &&
+        typeof value !== "string" && !Buffer.isBuffer(value)) {
       throw protocolError(
         "PROTOCOL_INVALID_MESSAGE",
-        `root.${field} must be bytes, a string, or undefined.`
+        `root.${field} must be bytes, a string, null, or undefined.`
       );
     }
-    if (value !== undefined) {
+    if (value !== undefined && value !== null) {
       assertBoundedFrame(Buffer.isBuffer(value) ? value : Buffer.from(value));
     }
   }

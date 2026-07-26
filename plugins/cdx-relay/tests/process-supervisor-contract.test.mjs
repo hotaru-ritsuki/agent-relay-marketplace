@@ -92,6 +92,27 @@ test("host-strict rejects a cooperative backend", async () => {
   );
 });
 
+test("host-strict synchronous preflight refuses before invoking the bridge", () => {
+  let launches = 0;
+  const supervisor = createProcessSupervisor({
+    platform: "test",
+    mode: "host-strict",
+    minimumGuarantee: "host-strict",
+    backendFactories: [() => fakeBackend({ mode: "host-strict" })],
+    syncBridge() {
+      launches += 1;
+      throw new Error("must not launch");
+    },
+    syncBackendSelection: { type: "child-process" }
+  });
+
+  assert.throws(
+    () => supervisor.run({ command: "tool", args: [] }),
+    (error) => error.code === "CAPABILITY_UNAVAILABLE"
+  );
+  assert.equal(launches, 0);
+});
+
 test("run is synchronous and returns a nonzero target status without throwing", () => {
   const supervisor = createFakeSupervisor({
     root: {
@@ -479,6 +500,130 @@ test("bounded synchronous worker removes secret files and exits", () => {
   const after = fs.readdirSync(os.tmpdir())
     .filter((name) => name.startsWith("process-supervisor-"));
   assert.deepEqual(after.filter((name) => !before.has(name)), []);
+});
+
+test("forced synchronous Worker termination settles before secret deletion", () => {
+  const before = new Set(
+    fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith("process-supervisor-"))
+  );
+  const lifecycle = new Int32Array(new SharedArrayBuffer(
+    Int32Array.BYTES_PER_ELEMENT * 3
+  ));
+
+  assert.throws(
+    () => runSynchronous({
+      spec: {
+        command: "unused",
+        args: [],
+        env: { SECRET: "forced-termination-secret" },
+        shell: false
+      },
+      backendSelection: { type: "child-process" },
+      platform: process.platform,
+      mode: "auto",
+      minimumGuarantee: "cooperative",
+      epoch: "epoch",
+      runId: "stuck",
+      nonce: "nonce"
+    }, {
+      operationTimeout: 50,
+      executorUrl: new URL("./process-supervisor/stuck-worker.mjs", import.meta.url),
+      lifecycleBuffer: lifecycle.buffer
+    }),
+    (error) => error.code === "SYNC_BRIDGE_FAILED"
+  );
+
+  const after = fs.readdirSync(os.tmpdir())
+    .filter((name) => name.startsWith("process-supervisor-"));
+  assert.deepEqual(after.filter((name) => !before.has(name)), []);
+  assert.deepEqual(
+    [...lifecycle.subarray(0, 2)],
+    [1, 2],
+    "executor termination must settle before secret files are removed"
+  );
+});
+
+test("synchronous worker decodes Buffer and typed-array input byte-exactly", () => {
+  for (const [name, input] of [
+    ["Buffer", Buffer.from([0, 1, 127, 128, 255])],
+    ["Uint8Array", new Uint8Array([255, 128, 127, 1, 0])]
+  ]) {
+    const result = runSynchronous({
+      spec: {
+        command: process.execPath,
+        args: [
+          "-e",
+          "process.stdin.on('data',b=>process.stdout.write(b.toString('hex')))"
+        ],
+        input,
+        shell: false,
+        encoding: "utf8"
+      },
+      backendSelection: { type: "child-process" },
+      platform: process.platform,
+      mode: "auto",
+      minimumGuarantee: "cooperative",
+      epoch: "epoch",
+      runId: `input-${name}`,
+      nonce: "nonce"
+    });
+
+    assert.equal(result.root.stdout, Buffer.from(input).toString("hex"), name);
+  }
+});
+
+test("synchronous worker preserves null output for inherited and ignored stdio", () => {
+  for (const stdio of ["inherit", "ignore"]) {
+    const supervisor = createProcessSupervisor({
+      platform: process.platform,
+      backendFactories: [() => ({
+        async probe() {
+          return {
+            available: true,
+            capabilities: {
+              platform: process.platform,
+              backend: "child-process",
+              mode: "cooperative",
+              containment: "cooperative",
+              cleanupProof: "registered-drained",
+              supportsDetachedDescendants: false
+            }
+          };
+        }
+      })],
+      syncBackendSelection: { type: "child-process" }
+    });
+
+    const result = supervisor.run({
+      command: process.execPath,
+      args: ["-e", ""],
+      shell: false,
+      stdio
+    });
+
+    assert.equal(result.stdout, null, stdio);
+    assert.equal(result.stderr, null, stdio);
+  }
+});
+
+test("oversized maxBuffer is rejected before invoking the synchronous bridge", () => {
+  let launches = 0;
+  const supervisor = createFakeSupervisor({}, {
+    syncBridge() {
+      launches += 1;
+      throw new Error("must not launch");
+    }
+  });
+
+  assert.throws(
+    () => supervisor.run({
+      command: "tool",
+      args: [],
+      maxBuffer: MAX_FRAME_BYTES + 1
+    }),
+    (error) => error.code === "INVALID_LAUNCH_SPEC"
+  );
+  assert.equal(launches, 0);
 });
 
 test("parent teardown revalidates every synchronous terminal proof", async () => {

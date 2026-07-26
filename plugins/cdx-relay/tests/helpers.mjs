@@ -183,7 +183,10 @@ function normalizeSpawnArgs(command, args = [], options = {}) {
   };
 }
 
-function compatibilityBackend() {
+export function compatibilityBackend({
+  spawnTrackedImpl = async (command, args, options) =>
+    trackChild(spawn(command, args, options))
+} = {}) {
   return {
     async probe() {
       return {
@@ -199,11 +202,11 @@ function compatibilityBackend() {
       };
     },
     async launch(spec) {
-      const child = trackChild(spawn(
+      const child = await spawnTrackedImpl(
         spec.command,
         spec.args ?? [],
         spec
-      ));
+      );
       let spawnError;
       const root = new Promise((resolve) => {
         child.once("error", (error) => {
@@ -237,8 +240,8 @@ function compatibilityBackend() {
         pid: child.pid,
         root,
         kill(signal) {
-          child.kill(signal);
-          return { backend: "child-process", stopped: true };
+          const stopped = child.kill(signal);
+          return { backend: "child-process", stopped };
         },
         cleanup: async () => {
           await legacyCleanupTrackedChildren();

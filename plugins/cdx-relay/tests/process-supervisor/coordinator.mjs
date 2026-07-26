@@ -4,6 +4,7 @@ import { EventEmitter } from "node:events";
 import { SupervisorInfrastructureError } from "./errors.mjs";
 import {
   PROTOCOL_VERSION,
+  MAX_FRAME_BYTES,
   assertBoundedFrame,
   validateCleanup,
   validateLaunch,
@@ -39,6 +40,15 @@ function validateSpec(spec) {
     throw new SupervisorInfrastructureError(
       "SHELL_UNSAFE",
       "Supervised processes require shell: false."
+    );
+  }
+  if (spec.maxBuffer !== undefined &&
+      (!Number.isSafeInteger(spec.maxBuffer) ||
+       spec.maxBuffer < 0 ||
+       spec.maxBuffer > MAX_FRAME_BYTES)) {
+    throw new SupervisorInfrastructureError(
+      "INVALID_LAUNCH_SPEC",
+      `maxBuffer must be an integer between 0 and ${MAX_FRAME_BYTES}.`
     );
   }
   return { ...spec, shell: false };
@@ -295,6 +305,13 @@ export function createProcessSupervisor({
   function run(inputSpec) {
     assertCanLaunch();
     const spec = validateSpec(inputSpec);
+    if (syncBackendSelection?.type === "child-process" &&
+        (mode === "host-strict" || minimumGuarantee === "host-strict")) {
+      throw latch(new SupervisorInfrastructureError(
+        "CAPABILITY_UNAVAILABLE",
+        `The child-process synchronous backend cannot provide ${minimumGuarantee}.`
+      ));
+    }
     const identity = {
       epoch,
       runId: randomUUID(),
