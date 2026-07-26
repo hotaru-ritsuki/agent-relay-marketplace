@@ -5,7 +5,14 @@ import process from "node:process";
 import { spawn, spawnSync } from "node:child_process";
 
 import { resolveStateDir } from "../scripts/lib/state.mjs";
-import { createProcessSupervisor } from "./process-supervisor/index.mjs";
+import {
+  assertSupervisorHealthy as assertSharedSupervisorHealthy,
+  cleanupTrackedChildren as cleanupSharedSupervisor,
+  createProcessSupervisor,
+  run as runSharedSupervisor,
+  shutdown as shutdownSharedSupervisor,
+  spawnTracked as spawnSharedSupervisor
+} from "./process-supervisor/index.mjs";
 
 process.env.CLAUDE_PLUGIN_DATA = fs.mkdtempSync(
   path.join(os.tmpdir(), "codex-plugin-cc-tests-"),
@@ -118,8 +125,58 @@ export function writeExecutable(filePath, source) {
   fs.writeFileSync(filePath, source, { encoding: "utf8", mode: 0o755 });
 }
 
-export function resolveTestCommand(command) {
-  if (process.platform !== "win32" || path.isAbsolute(command)) {
+function isValidatedNpmCli(filePath) {
+  if (typeof filePath !== "string" ||
+      path.basename(filePath).toLowerCase() !== "npm-cli.js") {
+    return false;
+  }
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile() || stat.size < 1 || stat.size > 16 * 1024 * 1024) {
+      return false;
+    }
+    const descriptor = fs.openSync(filePath, "r");
+    try {
+      const sample = Buffer.alloc(Math.min(stat.size, 4096));
+      fs.readSync(descriptor, sample, 0, sample.length, 0);
+      return !sample.includes(0);
+    } finally {
+      fs.closeSync(descriptor);
+    }
+  } catch {
+    return false;
+  }
+}
+
+function resolveWindowsNpmCli(environment) {
+  if (isValidatedNpmCli(environment.npm_execpath)) {
+    return fs.realpathSync.native(environment.npm_execpath);
+  }
+  const pathValue = environment.Path ?? environment.PATH ?? "";
+  for (const entry of pathValue.split(path.delimiter)) {
+    if (!entry) continue;
+    const directory = path.resolve(entry.replace(/^"|"$/g, ""));
+    const candidates = [
+      path.join(directory, "node_modules", "npm", "bin", "npm-cli.js"),
+      path.join(directory, "npm-cli.js")
+    ];
+    for (const candidate of candidates) {
+      if (isValidatedNpmCli(candidate)) {
+        return fs.realpathSync.native(candidate);
+      }
+    }
+  }
+  throw new Error(
+    "Could not resolve a validated npm-cli.js from npm_execpath or PATH."
+  );
+}
+
+export function resolveTestCommand(
+  command,
+  platform = process.platform,
+  environment = process.env
+) {
+  if (platform !== "win32" || path.isAbsolute(command)) {
     return { command, shell: false };
   }
   if (command === "node") {
@@ -128,14 +185,23 @@ export function resolveTestCommand(command) {
   if (command === "git") {
     return { command: "git.exe", shell: false };
   }
+  if (command === "npm") {
+    const npmCli = resolveWindowsNpmCli(environment);
+    return { command: process.execPath, argsPrefix: [npmCli], shell: false };
+  }
   return { command, shell: true };
 }
 
 function legacyRun(command, args, options = {}) {
+  const platform = options.platform ?? process.platform;
   const invocation = options.shell === undefined
-    ? resolveTestCommand(command)
+    ? resolveTestCommand(command, platform, options.env ?? process.env)
     : { command, shell: options.shell };
-  const result = spawnSync(invocation.command, args, {
+  if (platform === "win32") {
+    return runSharedSupervisor(command, args, options);
+  }
+  const spawnSyncImpl = options.spawnSyncImpl ?? spawnSync;
+  const result = spawnSyncImpl(invocation.command, args, {
     cwd: options.cwd,
     env: options.env,
     encoding: "utf8",
@@ -149,9 +215,16 @@ function legacyRun(command, args, options = {}) {
 
 function normalizeRunArgs(command, args = [], options = {}) {
   if (command && typeof command === "object" && !Array.isArray(command)) {
+    if (command.shell !== undefined && command.shell !== false) {
+      throw new TypeError("Supervised commands require shell: false.");
+    }
     return { ...command, shell: false };
   }
-  const invocation = resolveTestCommand(command);
+  const invocation = resolveTestCommand(
+    command,
+    options.platform ?? process.platform,
+    options.env ?? process.env
+  );
   if (invocation.shell !== false) {
     throw new TypeError(
       `Supervised test command ${command} must resolve without a shell.`
@@ -160,16 +233,23 @@ function normalizeRunArgs(command, args = [], options = {}) {
   return {
     ...options,
     command: invocation.command,
-    args,
+    args: [...(invocation.argsPrefix ?? []), ...args],
     shell: false
   };
 }
 
 function normalizeSpawnArgs(command, args = [], options = {}) {
   if (command && typeof command === "object" && !Array.isArray(command)) {
+    if (command.shell !== undefined && command.shell !== false) {
+      throw new TypeError("Supervised commands require shell: false.");
+    }
     return { ...command, shell: false };
   }
-  const invocation = resolveTestCommand(command);
+  const invocation = resolveTestCommand(
+    command,
+    options.platform ?? process.platform,
+    options.env ?? process.env
+  );
   if (invocation.shell !== false) {
     throw new TypeError(
       `Supervised test command ${command} must resolve without a shell.`
@@ -178,7 +258,7 @@ function normalizeSpawnArgs(command, args = [], options = {}) {
   return {
     ...options,
     command: invocation.command,
-    args,
+    args: [...(invocation.argsPrefix ?? []), ...args],
     shell: false
   };
 }
@@ -272,26 +352,56 @@ const testSupervisor = createProcessSupervisor({
 });
 
 export const run = (...args) => {
+  const options = args[2] ?? {};
+  if (options.spawnSyncImpl ||
+      (options.platform !== undefined && options.platform !== process.platform)) {
+    return legacyRun(...args);
+  }
   const spec = normalizeRunArgs(...args);
-  const result = testSupervisor.run(spec);
+  const result = process.platform === "win32" && options.shell !== true
+    ? runSharedSupervisor(spec)
+    : testSupervisor.run(spec);
   registerRecordedChildren(spec.cwd);
   return result;
 };
-export const spawnTracked = (...args) =>
-  testSupervisor.spawnTracked(normalizeSpawnArgs(...args));
-export const cleanupTrackedChildren = () => testSupervisor.cleanupAll();
-export const assertSupervisorHealthy = () => testSupervisor.assertHealthy();
+export const spawnTracked = (...args) => process.platform === "win32"
+  ? spawnSharedSupervisor(...args)
+  : testSupervisor.spawnTracked(normalizeSpawnArgs(...args));
+export const cleanupTrackedChildren = async () => {
+  await testSupervisor.cleanupAll();
+  return process.platform === "win32"
+    ? cleanupSharedSupervisor()
+    : { cleaned: true };
+};
+export const assertSupervisorHealthy = () => {
+  testSupervisor.assertHealthy();
+  if (process.platform === "win32") assertSharedSupervisorHealthy();
+};
 
 export function installSupervisorTeardown(afterHook) {
   afterHook(async () => {
-    let shutdownError;
+    const shutdownErrors = [];
+    if (process.platform === "win32") {
+      try {
+        await shutdownSharedSupervisor();
+      } catch (error) {
+        shutdownErrors.push(error);
+      }
+    }
     try {
       await testSupervisor.shutdown();
     } catch (error) {
-      shutdownError = error;
+      shutdownErrors.push(error);
+    }
+    if (process.platform === "win32") {
+      try {
+        assertSharedSupervisorHealthy();
+      } catch (error) {
+        shutdownErrors.push(error);
+      }
     }
     testSupervisor.assertHealthy();
-    if (shutdownError) throw shutdownError;
+    if (shutdownErrors.length > 0) throw shutdownErrors[0];
   });
 }
 

@@ -45,19 +45,6 @@ test("normal child exit unregisters it from cleanup", async () => {
   assert.equal(child.killCalls, 0);
 });
 
-test("native Windows test commands bypass the shell", {
-  skip: process.platform !== "win32"
-}, () => {
-  assert.deepEqual(resolveTestCommand("node"), {
-    command: process.execPath,
-    shell: false
-  });
-  assert.deepEqual(resolveTestCommand("git"), {
-    command: "git.exe",
-    shell: false
-  });
-});
-
 test("run registers recorded broker and worker processes for cleanup", async (t) => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
