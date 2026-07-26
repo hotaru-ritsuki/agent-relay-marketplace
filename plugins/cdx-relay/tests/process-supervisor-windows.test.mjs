@@ -1443,7 +1443,8 @@ test("public Windows backend preserves fixed supervisor ownership through tombst
     const leaseSymbol = Object.getOwnPropertySymbols(launched.child)
       .find((symbol) => symbol.description === "windows-job-lease");
     assert.ok(leaseSymbol, "native launch acknowledgement must retain its lease");
-    assert.deepEqual(launched.child[leaseSymbol].ownership, ownership);
+    const lease = launched.child[leaseSymbol];
+    assert.deepEqual(lease.ownership, ownership);
     await launched.root;
 
     const expectedProof = {
@@ -1456,6 +1457,22 @@ test("public Windows backend preserves fixed supervisor ownership through tombst
       activeProcesses: 0
     };
     assert.deepEqual(launched.cleanup(), expectedProof);
+    const nativeReplay =
+      backend.test.replayNativeWindowsJobTombstoneForTest(lease);
+    assert.deepEqual({
+      epoch: nativeReplay.epoch,
+      runId: nativeReplay.runId,
+      nonce: nativeReplay.nonce,
+      backend: nativeReplay.backend,
+      status: nativeReplay.status,
+      activeProcesses: nativeReplay.activeProcesses,
+      tombstone: nativeReplay.tombstone
+    }, {
+      ...ownership,
+      status: "stopped",
+      activeProcesses: 0,
+      tombstone: true
+    });
     assert.deepEqual(
       launched.cleanup(),
       expectedProof,

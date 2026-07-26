@@ -594,6 +594,29 @@ function cleanupWindowsJobForTest(leaseOrLaunchId) {
   return proof;
 }
 
+function replayNativeWindowsJobTombstoneForTest(lease) {
+  validateWindowsJobLease(lease);
+  const proof = requestWindowsJobWorker(
+    "cleanup",
+    {
+      lease,
+      controlTimeout: lease.controlTimeout ?? 7000
+    },
+    (lease.controlTimeout ?? 7000) + 500
+  );
+  if (
+    !sameOwnership(proof, lease.ownership) ||
+    proof.launchId !== lease.launchId ||
+    proof.status !== "stopped" ||
+    proof.activeProcesses !== 0 ||
+    proof.tombstone !== true
+  ) {
+    poisonWindowsJobWorker();
+    throw new Error("Windows native tombstone replay returned invalid proof.");
+  }
+  return proof;
+}
+
 
 function normalizeWindowsChildSignal(signal) {
   if (signal === 0) return { probe: true, requested: 0, reported: null };
@@ -954,7 +977,8 @@ function stopInfrastructure(faults = {}) {
     test: {
       runWindowsJobForTest,
       cleanupWindowsJobForTest,
-      getWindowsJobLeaseCount
+      getWindowsJobLeaseCount,
+      replayNativeWindowsJobTombstoneForTest
     }
   };
 }
