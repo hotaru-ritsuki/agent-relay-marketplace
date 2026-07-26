@@ -1,0 +1,76 @@
+name: Portable process supervisor
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  linux-strict:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CDX_RELAY_TEST_LINUX_STRICT: "1"
+      CDX_RELAY_LINUX_REAPER_ENDPOINT: /run/cdx-relay-reaper/reaper.sock
+      CDX_RELAY_LINUX_PROTECTED_ROOT: /sys/fs/cgroup/cdx-relay-strict
+      CDX_RELAY_LINUX_REAPER_REGISTRY: /run/cdx-relay-reaper/registry
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Verify protected-boundary prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f /sys/fs/cgroup/cgroup.controllers
+          test "$(stat -fc %T /sys/fs/cgroup)" = cgroup2fs
+          sudo unshare --pid --fork --mount-proc sh -ceu \
+            'test ! -e "/proc/$1"' cdx-relay "$$"
+          sudo unshare --mount sh -ceu \
+            'mount -o remount,ro /sys/fs/cgroup; ! sh -c "echo \$\$ > /sys/fs/cgroup/cgroup.procs"'
+          sudo python3 - <<'PY'
+          import os
+          fd = os.pidfd_open(os.getpid())
+          os.close(fd)
+          PY
+          echo "CDX_RELAY_LINUX_PID_NAMESPACE_VERIFIED=1" >> "$GITHUB_ENV"
+          echo "CDX_RELAY_LINUX_CGROUP_RO_VERIFIED=1" >> "$GITHUB_ENV"
+          echo "CDX_RELAY_LINUX_PIDFD_VERIFIED=1" >> "$GITHUB_ENV"
+      - name: Start independent protected reaper
+        shell: bash
+        run: |
+          set -euo pipefail
+          credential="$(openssl rand -hex 32)"
+          echo "::add-mask::$credential"
+          echo "CDX_RELAY_LINUX_REAPER_CREDENTIAL=$credential" >> "$GITHUB_ENV"
+          sudo install -d -m 0755 "$CDX_RELAY_LINUX_PROTECTED_ROOT"
+          sudo install -d -m 0711 "$(dirname "$CDX_RELAY_LINUX_REAPER_ENDPOINT")"
+          sudo install -d -m 0700 "$CDX_RELAY_LINUX_REAPER_REGISTRY"
+          sudo env \
+            CDX_RELAY_LINUX_REAPER_ENDPOINT="$CDX_RELAY_LINUX_REAPER_ENDPOINT" \
+            CDX_RELAY_LINUX_REAPER_CREDENTIAL="$credential" \
+            CDX_RELAY_LINUX_PROTECTED_ROOT="$CDX_RELAY_LINUX_PROTECTED_ROOT" \
+            CDX_RELAY_LINUX_REAPER_REGISTRY="$CDX_RELAY_LINUX_REAPER_REGISTRY" \
+            CDX_RELAY_LINUX_PID_NAMESPACE_VERIFIED=1 \
+            CDX_RELAY_LINUX_CGROUP_RO_VERIFIED=1 \
+            CDX_RELAY_LINUX_PIDFD_VERIFIED=1 \
+            CDX_RELAY_LINUX_PAYLOAD_UID="$(id -u)" \
+            CDX_RELAY_LINUX_PAYLOAD_GID="$(id -g)" \
+            CDX_RELAY_LINUX_SOCKET_UID="$(id -u)" \
+            CDX_RELAY_LINUX_SOCKET_GID="$(id -g)" \
+            node plugins/cdx-relay/tests/process-supervisor/native/linux/reaper.mjs --serve \
+            >"$RUNNER_TEMP/cdx-relay-reaper.log" 2>&1 &
+          for attempt in $(seq 1 100); do
+            test -S "$CDX_RELAY_LINUX_REAPER_ENDPOINT" && exit 0
+            sleep 0.05
+          done
+          cat "$RUNNER_TEMP/cdx-relay-reaper.log"
+          exit 1
+      - run: node --test --test-concurrency=1 --test-timeout=600000 plugins/cdx-relay/tests/process-supervisor-linux.test.mjs
+      - run: npm --prefix plugins/cdx-relay test

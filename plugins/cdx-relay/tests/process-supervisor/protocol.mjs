@@ -2,6 +2,13 @@ import { SupervisorInfrastructureError } from "./errors.mjs";
 
 export const PROTOCOL_VERSION = 1;
 export const MAX_FRAME_BYTES = 1024 * 1024;
+export const REAPER_OPERATIONS = Object.freeze([
+  "probe",
+  "launch",
+  "cleanup",
+  "recover",
+  "shutdown"
+]);
 
 function protocolError(code, message, options) {
   return new SupervisorInfrastructureError(code, message, options);
@@ -189,6 +196,83 @@ export function validateProof(message, expected) {
     );
   }
   return message;
+}
+
+export function validateReaperRequest(message, expected) {
+  serializeBounded(message);
+  if (!message || typeof message !== "object" || Array.isArray(message)) {
+    throw protocolError(
+      "PROTOCOL_INVALID_MESSAGE",
+      "reaper request must be an object."
+    );
+  }
+  if (message.version !== PROTOCOL_VERSION) {
+    throw protocolError(
+      "PROTOCOL_VERSION_UNSUPPORTED",
+      `reaper request uses unsupported protocol version ${message.version}.`
+    );
+  }
+  if (!REAPER_OPERATIONS.includes(message.operation)) {
+    throw protocolError(
+      "PROTOCOL_INVALID_MESSAGE",
+      "reaper request operation is unsupported."
+    );
+  }
+  for (const field of ["epoch", "runId", "nonce"]) {
+    if (typeof message[field] !== "string" || message[field].length === 0) {
+      throw protocolError(
+        "PROTOCOL_INVALID_MESSAGE",
+        `reaper request ${field} must be a nonempty string.`
+      );
+    }
+    if (expected?.[field] && message[field] !== expected[field]) {
+      throw protocolError(
+        "PROTOCOL_IDENTITY_MISMATCH",
+        `reaper request ${field} does not match the active lease.`
+      );
+    }
+    if ((field === "epoch" || field === "runId") &&
+        (!/^[A-Za-z0-9._-]+$/.test(message[field]) ||
+         message[field].length > 128)) {
+      throw protocolError(
+        "PROTOCOL_INVALID_MESSAGE",
+        `reaper request ${field} is not a safe identity component.`
+      );
+    }
+  }
+  if (!message.payload || typeof message.payload !== "object" ||
+      Array.isArray(message.payload)) {
+    throw protocolError(
+      "PROTOCOL_INVALID_MESSAGE",
+      "reaper request payload must be an object."
+    );
+  }
+  return message;
+}
+
+export function validateKernelDrainedProof(proof, expected) {
+  serializeBounded(proof);
+  const valid = proof &&
+    typeof proof === "object" &&
+    !Array.isArray(proof) &&
+    proof.version === PROTOCOL_VERSION &&
+    proof.operation === "cleanup" &&
+    proof.level === "kernel-drained" &&
+    proof.epoch === expected.epoch &&
+    proof.runId === expected.runId &&
+    proof.nonceHash === expected.nonceHash &&
+    proof.outerCgroup === expected.outerCgroup &&
+    proof.populated === 0 &&
+    proof.reaperIdentity === expected.reaperIdentity &&
+    typeof proof.drainedAt === "string" &&
+    Number.isFinite(Date.parse(proof.drainedAt));
+  if (!valid) {
+    throw protocolError(
+      "CLEANUP_UNPROVEN",
+      "The protected outer cgroup did not provide authenticated populated-zero proof."
+    );
+  }
+  return proof;
 }
 
 export const validators = Object.freeze({

@@ -12,6 +12,8 @@ export {
   validateHello,
   validateLaunch,
   validateProof,
+  validateKernelDrainedProof,
+  validateReaperRequest,
   validateRoot,
   validateStop,
   validators
@@ -35,6 +37,14 @@ export {
   encodeSupervisorToken
 } from "./backends/posix-process-group.mjs";
 export { createMacosBackend } from "./backends/macos.mjs";
+export {
+  createLinuxCgroupBackend,
+  createUnixLinuxReaperClient
+} from "./backends/linux-cgroup.mjs";
+export {
+  createAtomicReaperRegistry,
+  createProtectedLinuxReaper
+} from "./native/linux/reaper.mjs";
 
 import { createProcessSupervisor } from "./coordinator.mjs";
 import { createMacosBackend } from "./backends/macos.mjs";
