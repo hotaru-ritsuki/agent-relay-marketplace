@@ -17,6 +17,12 @@ if (!token || token.version !== 1 ||
 if (!token.endpoint.startsWith("unix:")) {
   throw new Error("The POSIX launch shim requires a Unix registration socket.");
 }
+const rootCredential = process.env.CDX_RELAY_ROOT_REPORT_CREDENTIAL;
+if (typeof rootCredential !== "string" ||
+    !/^[A-Za-z0-9_-]{43}$/.test(rootCredential)) {
+  throw new Error("Invalid CDX_RELAY_ROOT_REPORT_CREDENTIAL.");
+}
+delete process.env.CDX_RELAY_ROOT_REPORT_CREDENTIAL;
 const target = JSON.parse(
   Buffer.from(process.argv[2] ?? "", "base64url").toString("utf8")
 );
@@ -81,7 +87,8 @@ await new Promise((resolve, reject) => {
     nonce: token.nonce,
     backend: "posix-cooperative",
     pid: process.pid,
-    parentPid: process.ppid
+    parentPid: process.ppid,
+    rootCredential
   })}\n`);
 });
 socket.on("error", () => {});
@@ -136,6 +143,7 @@ await new Promise((resolve, reject) => {
     runId: token.runId,
     nonce: token.nonce,
     backend: "posix-cooperative",
+    rootCredential,
     status,
     signal,
     error: rootError

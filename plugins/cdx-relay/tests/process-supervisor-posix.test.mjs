@@ -131,6 +131,7 @@ function heldRootBackend(platform) {
   ]);
   const groupSignals = [];
   let registrationHandlers;
+  let rootCredential;
   const child = {
     pid: 4312,
     stdout: null,
@@ -142,7 +143,8 @@ function heldRootBackend(platform) {
   };
   const cooperative = createPosixProcessGroupBackend({
     platform,
-    spawn() {
+    spawn(_command, _args, options) {
+      rootCredential = options.env.CDX_RELAY_ROOT_REPORT_CREDENTIAL;
       return child;
     },
     async createRegistrationChannel(handlers) {
@@ -179,6 +181,7 @@ function heldRootBackend(platform) {
     groupSignals,
     handlers: () => registrationHandlers,
     processes,
+    rootCredential: () => rootCredential,
     registerBackground(pid = 4500) {
       let detached;
       spawnBackgroundProcess(process.execPath, ["background.mjs"], {
@@ -270,6 +273,16 @@ test("launch token binds version, lease identity, nonce, and registration endpoi
       endpoint: "unix:/tmp/cdx-supervisor.sock"
     }
   );
+  assert.match(
+    fixture.calls[0].options.env.CDX_RELAY_ROOT_REPORT_CREDENTIAL,
+    /^[A-Za-z0-9_-]{43}$/
+  );
+  assert.equal(
+    JSON.stringify(decodeSupervisorToken(
+      fixture.calls[0].options.env.CDX_RELAY_SUPERVISOR_TOKEN
+    )).includes(fixture.calls[0].options.env.CDX_RELAY_ROOT_REPORT_CREDENTIAL),
+    false
+  );
 });
 
 test("spawn throw closes the provisional registration channel without publishing ownership", async () => {
@@ -351,6 +364,170 @@ test("post-spawn identity failure closes the blocked shim channel and awaits its
   assert.equal(exited, true);
 });
 
+test("authenticated hello identity drains a released group when parent inspection later fails", async () => {
+  let handlers;
+  let closes = 0;
+  let released = false;
+  let alive = true;
+  let resolveHello;
+  const helloComplete = new Promise((resolve) => {
+    resolveHello = resolve;
+  });
+  const signals = [];
+  const child = new EventEmitter();
+  child.pid = 4312;
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  let inspection = 0;
+  const authenticatedIdentity = {
+    pid: 4312,
+    processGroupId: 4312,
+    startTime: "authenticated-start",
+    executable: "/usr/bin/node"
+  };
+  const backend = createPosixProcessGroupBackend({
+    platform: "linux",
+    spawn(_command, _args, options) {
+      queueMicrotask(async () => {
+        await handlers.hello({
+          type: "hello",
+          version: 1,
+          ...identity,
+          pid: 4312,
+          parentPid: 4000,
+          rootCredential: options.env.CDX_RELAY_ROOT_REPORT_CREDENTIAL
+        });
+        released = true;
+        resolveHello();
+      });
+      return child;
+    },
+    async createRegistrationChannel(nextHandlers) {
+      handlers = nextHandlers;
+      return {
+        endpoint: "unix:/tmp/cdx-hello-race.sock",
+        async close() {
+          closes += 1;
+        }
+      };
+    },
+    async inspectProcess() {
+      inspection += 1;
+      if (inspection === 1) {
+        await helloComplete;
+        return null;
+      }
+      return alive ? authenticatedIdentity : null;
+    },
+    killGroup(pid, signal) {
+      assert.equal(released, true, "the authenticated hello was released");
+      signals.push({ pid, signal });
+      alive = false;
+    },
+    async waitForDrain() {
+      return true;
+    },
+    handshakeMs: 25
+  });
+
+  await assert.rejects(
+    backend.launch({
+      ...identity,
+      command: "/usr/bin/true",
+      args: [],
+      env: {},
+      shell: false
+    }),
+    (error) => error.code === "PROCESS_IDENTITY_UNAVAILABLE"
+  );
+  assert.deepEqual(signals, [{ pid: 4312, signal: "SIGTERM" }]);
+  assert.equal(alive, false, "simulated owned group survivors");
+  assert.equal(closes, 1, "the provisional channel is closed exactly once");
+  assert.deepEqual(await backend.cleanupAll(), {
+    backend: "posix-cooperative",
+    level: "registered-drained",
+    registered: 0
+  });
+});
+
+test("parent identity mismatch after authenticated hello fails closed without signaling", async () => {
+  let handlers;
+  let closes = 0;
+  let resolveHello;
+  const helloComplete = new Promise((resolve) => {
+    resolveHello = resolve;
+  });
+  let groupSignals = 0;
+  const child = new EventEmitter();
+  child.pid = 4312;
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  let inspection = 0;
+  const authenticatedIdentity = {
+    pid: 4312,
+    processGroupId: 4312,
+    startTime: "authenticated-start",
+    executable: "/usr/bin/node"
+  };
+  const mismatchedIdentity = {
+    ...authenticatedIdentity,
+    startTime: "reused-start"
+  };
+  const backend = createPosixProcessGroupBackend({
+    platform: "linux",
+    spawn(_command, _args, options) {
+      queueMicrotask(async () => {
+        await handlers.hello({
+          type: "hello",
+          version: 1,
+          ...identity,
+          pid: 4312,
+          parentPid: 4000,
+          rootCredential: options.env.CDX_RELAY_ROOT_REPORT_CREDENTIAL
+        });
+        resolveHello();
+      });
+      return child;
+    },
+    async createRegistrationChannel(nextHandlers) {
+      handlers = nextHandlers;
+      return {
+        endpoint: "unix:/tmp/cdx-hello-mismatch.sock",
+        async close() {
+          closes += 1;
+        }
+      };
+    },
+    async inspectProcess() {
+      inspection += 1;
+      if (inspection === 1) {
+        await helloComplete;
+        return mismatchedIdentity;
+      }
+      return inspection === 2 ? authenticatedIdentity : mismatchedIdentity;
+    },
+    killGroup() {
+      groupSignals += 1;
+    },
+    handshakeMs: 25
+  });
+
+  await assert.rejects(
+    backend.launch({
+      ...identity,
+      command: "/usr/bin/true",
+      args: [],
+      env: {},
+      shell: false
+    }),
+    (error) => error.code === "PROCESS_IDENTITY_MISMATCH"
+  );
+  assert.equal(groupSignals, 0, "a mismatched identity is never signaled");
+  assert.equal(closes, 1);
+});
+
 test("root completion does not wait for descendant-held stdout to close", async () => {
   const fixture = controlledBackend();
   const launched = await fixture.backend.launch({
@@ -365,6 +542,8 @@ test("root completion does not wait for descendant-held stdout to close", async 
     type: "root",
     version: 1,
     ...identity,
+    rootCredential:
+      fixture.calls[0].options.env.CDX_RELAY_ROOT_REPORT_CREDENTIAL,
     status: 0,
     signal: null
   });
@@ -640,6 +819,7 @@ for (const platform of ["linux", "darwin"]) {
       type: "root",
       version: 1,
       ...identity,
+      rootCredential: fixture.rootCredential(),
       status: 0,
       signal: null
     });
@@ -863,6 +1043,7 @@ test("cancellation requests an authenticated root stop before owned-group cleanu
     }
   ]]);
   let handlers;
+  let rootCredential;
   const frames = [];
   const child = new EventEmitter();
   child.pid = 4312;
@@ -871,7 +1052,8 @@ test("cancellation requests an authenticated root stop before owned-group cleanu
   child.stderr = new PassThrough();
   const backend = createPosixProcessGroupBackend({
     platform: "linux",
-    spawn() {
+    spawn(_command, _args, options) {
+      rootCredential = options.env.CDX_RELAY_ROOT_REPORT_CREDENTIAL;
       return child;
     },
     async createRegistrationChannel(nextHandlers) {
@@ -884,6 +1066,7 @@ test("cancellation requests an authenticated root stop before owned-group cleanu
             type: "root",
             version: 1,
             ...identity,
+            rootCredential,
             status: null,
             signal: frame.signal
           });
@@ -1259,6 +1442,227 @@ test("authenticated malformed control traffic still poisons protocol health", as
   await channel.close();
 });
 
+test("root frames require the authenticated hello connection", async () => {
+  const pipe = `\\\\.\\pipe\\cdx-root-authority-${process.pid}-${Date.now()}`;
+  const credential = "trusted-root-report-credential";
+  const roots = [];
+  const channel = await createNetRegistrationChannel({
+    async hello(message) {
+      return {
+        rootReporter: message.pid === 4312 &&
+          message.rootCredential === credential
+      };
+    },
+    root(message) {
+      roots.push(message);
+    },
+    async closed() {},
+    lost(error) {
+      assert.fail(error);
+    }
+  }, {
+    socketPath: pipe,
+    handshakeMs: 1000
+  });
+  const writeForeignRoot = async (status) => {
+    const socket = net.createConnection({ path: pipe });
+    socket.resume();
+    await new Promise((resolve, reject) => {
+      socket.once("error", reject);
+      socket.once("close", resolve);
+      socket.once("connect", () => socket.end(`${JSON.stringify({
+        type: "root",
+        version: 1,
+        ...identity,
+        rootCredential: credential,
+        status,
+        signal: null
+      })}\n`));
+    });
+  };
+
+  try {
+    await writeForeignRoot(91);
+    const shim = net.createConnection({ path: pipe });
+    shim.setEncoding("utf8");
+    await new Promise((resolve, reject) => {
+      let pending = "";
+      shim.once("error", reject);
+      shim.on("data", (chunk) => {
+        pending += chunk;
+        if (pending.includes("\n")) resolve();
+      });
+      shim.write(`${JSON.stringify({
+        type: "hello",
+        version: 1,
+        ...identity,
+        pid: 4312,
+        parentPid: 4000,
+        rootCredential: credential
+      })}\n`);
+    });
+    await writeForeignRoot(92);
+    shim.write(`${JSON.stringify({
+      type: "root",
+      version: 1,
+      ...identity,
+      rootCredential: credential,
+      status: 0,
+      signal: null
+    })}\n`);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(roots.map((message) => message.status), [0]);
+    shim.destroy();
+  } finally {
+    await channel.close();
+  }
+});
+
+test("registration channel bounds frames queued behind a slow hello", async () => {
+  const pipe = `\\\\.\\pipe\\cdx-queued-frames-${process.pid}-${Date.now()}`;
+  let releaseHello;
+  const helloGate = new Promise((resolve) => {
+    releaseHello = resolve;
+  });
+  const channel = await createNetRegistrationChannel({
+    async hello() {
+      await helloGate;
+      return { rootReporter: true };
+    },
+    root() {
+      assert.fail("queued oversized traffic must be rejected before root handling");
+    },
+    async closed() {},
+    lost() {}
+  }, {
+    socketPath: pipe,
+    handshakeMs: 1000
+  });
+  const socket = net.createConnection({ path: pipe });
+  socket.resume();
+  const closed = new Promise((resolve, reject) => {
+    socket.once("error", () => {});
+    socket.once("close", resolve);
+    setTimeout(() => reject(new Error("queued frame cap did not close the socket")), 500);
+  });
+  const rootFrame = `${JSON.stringify({
+    type: "root",
+    version: 1,
+    ...identity,
+    rootCredential: "forged",
+    status: 0,
+    signal: null,
+    padding: "x".repeat(600 * 1024)
+  })}\n`;
+
+  try {
+    await new Promise((resolve) => socket.once("connect", resolve));
+    socket.write(`${JSON.stringify({
+      type: "hello",
+      version: 1,
+      ...identity,
+      pid: 4312,
+      parentPid: 4000,
+      rootCredential: "forged"
+    })}\n`);
+    socket.write(rootFrame);
+    socket.write(rootFrame);
+    await closed;
+  } finally {
+    releaseHello();
+    socket.destroy();
+    await channel.close();
+  }
+});
+
+test("real target cannot forge root and never receives the root-report credential", async () => {
+  const pipe = `\\\\.\\pipe\\cdx-target-forgery-${process.pid}-${Date.now()}`;
+  let channel;
+  const writeForeignRoot = async (status) => {
+    const socket = net.createConnection({ path: pipe });
+    socket.resume();
+    await new Promise((resolve, reject) => {
+      socket.once("error", reject);
+      socket.once("close", resolve);
+      socket.once("connect", () => socket.end(`${JSON.stringify({
+        type: "root",
+        version: 1,
+        ...identity,
+        rootCredential: "forged",
+        status,
+        signal: null
+      })}\n`));
+    });
+  };
+  const backend = createPosixProcessGroupBackend({
+    platform: "linux",
+    async createRegistrationChannel(handlers) {
+      channel = await createNetRegistrationChannel(handlers, {
+        socketPath: pipe,
+        handshakeMs: 1000
+      });
+      await writeForeignRoot(91);
+      return channel;
+    },
+    async inspectProcess(pid) {
+      try {
+        process.kill(pid, 0);
+      } catch (error) {
+        if (error?.code === "ESRCH") return null;
+        throw error;
+      }
+      return {
+        pid,
+        processGroupId: pid,
+        startTime: String(pid),
+        executable: process.execPath
+      };
+    },
+    terminalFrameMs: 1000
+  });
+  const targetSource = [
+    "const net=require('node:net');",
+    "const t=JSON.parse(Buffer.from(process.env.CDX_RELAY_SUPERVISOR_TOKEN,'base64url'));",
+    "const seen={ordinaryToken:Boolean(process.env.CDX_RELAY_SUPERVISOR_TOKEN),",
+    "rootCredential:process.env.CDX_RELAY_ROOT_REPORT_CREDENTIAL};",
+    "const s=net.createConnection({path:t.endpoint.slice(5)});",
+    "s.resume();",
+    "s.once('error',error=>{console.error(error);process.exitCode=2;});",
+    "s.once('connect',()=>s.end(JSON.stringify({type:'root',version:1,",
+    "epoch:t.epoch,runId:t.runId,nonce:t.nonce,backend:'posix-cooperative',",
+    "rootCredential:'forged',status:97,signal:null})+'\\n'));",
+    "s.once('close',()=>process.stdout.write(JSON.stringify(seen)));"
+  ].join("");
+  const launched = await backend.launch({
+    ...identity,
+    command: process.execPath,
+    args: ["-e", targetSource],
+    env: process.env,
+    shell: false
+  });
+
+  try {
+    const completed = await launched.root;
+    assert.equal(completed.status, 0);
+    if (launched.child.exitCode === null) {
+      await new Promise((resolve) => launched.child.once("exit", resolve));
+    }
+    const targetOutput = [];
+    for await (const chunk of launched.stdout) targetOutput.push(chunk);
+    assert.deepEqual(JSON.parse(Buffer.concat(targetOutput).toString()), {
+      ordinaryToken: true
+    });
+    assert.deepEqual(await launched.cleanup(), {
+      backend: "posix-cooperative",
+      level: "registered-drained",
+      registered: 0
+    });
+  } finally {
+    await channel?.close();
+    await backend.shutdown().catch(() => {});
+  }
+});
+
 test("default POSIX control socket is private, resists foreign malformed clients, and leaves no residue", {
   skip: process.platform === "win32"
 }, async () => {
@@ -1300,6 +1704,7 @@ test("default POSIX control socket is private, resists foreign malformed clients
 });
 
 test("real launch shim reports root exit while a descendant holds stdout open", async () => {
+  const rootCredential = "A".repeat(43);
   let resolveRoot;
   const rootMessage = new Promise((resolve) => {
     resolveRoot = resolve;
@@ -1329,7 +1734,11 @@ test("real launch shim reports root exit while a descendant holds stdout open", 
     args: ["-e", targetSource]
   })).toString("base64url");
   const shim = spawn(process.execPath, [launchShimPath, target], {
-    env: { ...process.env, CDX_RELAY_SUPERVISOR_TOKEN: token },
+    env: {
+      ...process.env,
+      CDX_RELAY_SUPERVISOR_TOKEN: token,
+      CDX_RELAY_ROOT_REPORT_CREDENTIAL: rootCredential
+    },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true
   });
@@ -1528,11 +1937,12 @@ test("authenticated root frame already in transport wins its race with shim exit
     "import net from 'node:net';",
     "import process from 'node:process';",
     "const t=JSON.parse(Buffer.from(process.env.CDX_RELAY_SUPERVISOR_TOKEN,'base64url'));",
+    "const c=process.env.CDX_RELAY_ROOT_REPORT_CREDENTIAL;",
     "const s=net.createConnection({path:t.endpoint.slice(5)});s.setEncoding('utf8');",
     "await new Promise((resolve,reject)=>{let p='';s.once('error',reject);",
     "s.on('data',c=>{p+=c;if(p.includes('\\n'))resolve();});",
-    "s.write(JSON.stringify({type:'hello',version:1,epoch:t.epoch,runId:t.runId,nonce:t.nonce,backend:'posix-cooperative',pid:process.pid,parentPid:process.ppid})+'\\n');});",
-    "s.write(JSON.stringify({type:'root',version:1,epoch:t.epoch,runId:t.runId,nonce:t.nonce,backend:'posix-cooperative',status:17,signal:null})+'\\n',()=>process.exit(0));"
+    "s.write(JSON.stringify({type:'hello',version:1,epoch:t.epoch,runId:t.runId,nonce:t.nonce,backend:'posix-cooperative',pid:process.pid,parentPid:process.ppid,rootCredential:c})+'\\n');});",
+    "s.write(JSON.stringify({type:'root',version:1,epoch:t.epoch,runId:t.runId,nonce:t.nonce,backend:'posix-cooperative',rootCredential:c,status:17,signal:null})+'\\n',()=>process.exit(0));"
   ].join(""));
   let channel;
   let registeredPid;

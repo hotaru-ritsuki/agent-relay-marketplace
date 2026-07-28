@@ -1,4 +1,5 @@
 import { spawn as nodeSpawn } from "node:child_process";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
@@ -17,6 +18,7 @@ import {
 
 const BACKEND = "posix-cooperative";
 const TOKEN_ENV = "CDX_RELAY_SUPERVISOR_TOKEN";
+const ROOT_REPORT_ENV = "CDX_RELAY_ROOT_REPORT_CREDENTIAL";
 const DEFAULT_SHIM = fileURLToPath(new URL("../launch-shim.mjs", import.meta.url));
 
 function fail(code, message, cause) {
@@ -49,6 +51,14 @@ function sameProcess(left, right) {
     left.pid === right.pid &&
     left.startTime === right.startTime &&
     left.executable === right.executable;
+}
+
+function sameCredential(left, right) {
+  if (typeof left !== "string" || typeof right !== "string") return false;
+  const leftBytes = Buffer.from(left);
+  const rightBytes = Buffer.from(right);
+  return leftBytes.length === rightBytes.length &&
+    timingSafeEqual(leftBytes, rightBytes);
 }
 
 async function inspectLinuxProcess(pid) {
@@ -141,6 +151,10 @@ export async function createNetRegistrationChannel(handlers, {
     sockets.add(socket);
     let pending = "";
     let registeredPid = null;
+    let rootReporter = false;
+    let rejectedUnauthorizedRoot = false;
+    let processing = Promise.resolve();
+    let queuedBytes = 0;
     const handshakeTimer = setTimeout(() => {
       socket.destroy(fail(
         "PROTOCOL_HANDSHAKE_TIMEOUT",
@@ -148,37 +162,61 @@ export async function createNetRegistrationChannel(handlers, {
       ));
     }, handshakeMs);
     socket.setEncoding("utf8");
-    socket.on("data", async (chunk) => {
+    socket.on("data", (chunk) => {
       pending += chunk;
-      if (Buffer.byteLength(pending) > MAX_FRAME_BYTES) {
+      if (queuedBytes + Buffer.byteLength(pending) > MAX_FRAME_BYTES) {
         socket.destroy(fail(
           "PROTOCOL_FRAME_TOO_LARGE",
           `Registration frame exceeds ${MAX_FRAME_BYTES} bytes.`
         ));
         return;
       }
+      const frames = [];
       for (;;) {
         const newline = pending.indexOf("\n");
         if (newline < 0) break;
         const raw = pending.slice(0, newline);
+        const bytes = Buffer.byteLength(raw) + 1;
+        frames.push({ raw, bytes });
+        queuedBytes += bytes;
         pending = pending.slice(newline + 1);
-        try {
-          const message = JSON.parse(raw);
-          if (message.type === "hello") {
-            await handlers.hello(message);
-            registeredPid = message.pid;
-            socketsByPid.set(message.pid, socket);
-            clearTimeout(handshakeTimer);
-            socket.write(`${JSON.stringify({ type: "release", version: 1 })}\n`);
-          } else if (message.type === "root") {
-            handlers.root(message);
-          } else {
-            throw fail("PROTOCOL_INVALID_MESSAGE", "Unknown registration message.");
-          }
-        } catch (error) {
-          socket.destroy(error);
-        }
       }
+      processing = processing.then(async () => {
+        for (const frame of frames) {
+          try {
+            const message = JSON.parse(frame.raw);
+            if (message.type === "hello") {
+              if (registeredPid !== null) {
+                throw fail(
+                  "PROTOCOL_INVALID_MESSAGE",
+                  "A registration connection may authenticate only once."
+                );
+              }
+              const authorization = await handlers.hello(message);
+              registeredPid = message.pid;
+              rootReporter = authorization?.rootReporter === true;
+              socketsByPid.set(message.pid, socket);
+              clearTimeout(handshakeTimer);
+              socket.write(`${JSON.stringify({ type: "release", version: 1 })}\n`);
+            } else if (message.type === "root") {
+              if (!rootReporter) {
+                rejectedUnauthorizedRoot = true;
+                socket.end(`${JSON.stringify({
+                  type: "rejected",
+                  version: PROTOCOL_VERSION,
+                  code: "PROTOCOL_UNAUTHORIZED_ROOT"
+                })}\n`);
+                return;
+              }
+              await handlers.root(message);
+            } else {
+              throw fail("PROTOCOL_INVALID_MESSAGE", "Unknown registration message.");
+            }
+          } finally {
+            queuedBytes -= frame.bytes;
+          }
+        }
+      }).catch((error) => socket.destroy(error));
     });
     socket.on("close", () => {
       clearTimeout(handshakeTimer);
@@ -186,12 +224,14 @@ export async function createNetRegistrationChannel(handlers, {
       if (registeredPid !== null && socketsByPid.get(registeredPid) === socket) {
         socketsByPid.delete(registeredPid);
       }
-      if (registeredPid !== null) {
+      if (registeredPid !== null && !rejectedUnauthorizedRoot) {
         void handlers.closed(registeredPid).catch(handlers.lost);
       }
     });
     socket.on("error", (error) => {
-      if (!closing && registeredPid !== null) handlers.lost(error);
+      if (!closing && registeredPid !== null && !rejectedUnauthorizedRoot) {
+        handlers.lost(error);
+      }
     });
   });
   server.on("error", (error) => {
@@ -499,7 +539,8 @@ export function createPosixProcessGroupBackend({
       stdoutChunks: [],
       stderrChunks: [],
       capturedBytes: 0,
-      stopRequested: false
+      stopRequested: false,
+      rootCredential: randomBytes(32).toString("base64url")
     };
     const expected = {
       epoch: spec.epoch,
@@ -525,12 +566,41 @@ export function createPosixProcessGroupBackend({
             "Registered process is outside the owned process group."
           );
         }
+        const isRootReporter = message.pid === lease.rootPid;
+        if (isRootReporter &&
+            !sameCredential(message.rootCredential, lease.rootCredential)) {
+          throw fail(
+            "PROTOCOL_UNAUTHORIZED_ROOT",
+            "The trusted launch shim did not present its root-report credential."
+          );
+        }
+        if (isRootReporter && lease.rootIdentity &&
+            (!sameProcess(processIdentity, lease.rootIdentity) ||
+             processIdentity.processGroupId !== lease.rootIdentity.processGroupId)) {
+          throw fail(
+            "PROCESS_IDENTITY_MISMATCH",
+            "Authenticated hello identity does not match the inspected launch shim."
+          );
+        }
+        if (isRootReporter) {
+          lease.rootIdentity = processIdentity;
+          lease.rootIdentityAuthenticated = true;
+        }
         registry.set(message.pid, processIdentity);
+        return { rootReporter: isRootReporter };
       },
       root(message) {
         try {
           validateRoot(message, expected);
+          if (!sameCredential(message.rootCredential, lease.rootCredential)) {
+            throw fail(
+              "PROTOCOL_UNAUTHORIZED_ROOT",
+              "Root terminal evidence lacks the trusted shim credential."
+            );
+          }
         } catch (error) {
+          rootSettled = true;
+          protocolFailure ??= error;
           rejectRoot(error);
           return;
         }
@@ -593,7 +663,11 @@ export function createPosixProcessGroupBackend({
     try {
       child = spawn(process.execPath, [shimPath, target], {
         cwd: spec.cwd,
-        env: { ...(spec.env ?? process.env), [TOKEN_ENV]: token },
+        env: {
+          ...(spec.env ?? process.env),
+          [TOKEN_ENV]: token,
+          [ROOT_REPORT_ENV]: lease.rootCredential
+        },
         detached: true,
         shell: false,
         stdio: spec.stdio ?? ["pipe", "pipe", "pipe"],
@@ -625,18 +699,27 @@ export function createPosixProcessGroupBackend({
         }, terminalFrameMs);
         terminalFrameTimer.unref?.();
       });
-      lease.rootIdentity = await inspectProcess(child.pid);
+      const inspectedRootIdentity = await inspectProcess(child.pid);
       if (lease.provisionalError) throw lease.provisionalError;
-      if (!lease.rootIdentity) {
+      if (!inspectedRootIdentity) {
         throw fail("PROCESS_IDENTITY_UNAVAILABLE", "Root process identity is unavailable.");
       }
-      if (lease.rootIdentity.processGroupId !== undefined &&
-          lease.rootIdentity.processGroupId !== child.pid) {
+      if (inspectedRootIdentity.processGroupId !== undefined &&
+          inspectedRootIdentity.processGroupId !== child.pid) {
         throw fail(
           "PROCESS_GROUP_MISMATCH",
           "Trusted launch shim did not become the process-group leader."
         );
       }
+      if (lease.rootIdentity &&
+          (!sameProcess(inspectedRootIdentity, lease.rootIdentity) ||
+           inspectedRootIdentity.processGroupId !== lease.rootIdentity.processGroupId)) {
+        throw fail(
+          "PROCESS_IDENTITY_MISMATCH",
+          "Parent inspection does not match the authenticated launch-shim identity."
+        );
+      }
+      lease.rootIdentity ??= inspectedRootIdentity;
     } catch (error) {
       if (child && lease.rootIdentity?.processGroupId === child.pid) {
         let cleanupError;
