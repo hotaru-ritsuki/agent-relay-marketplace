@@ -1,5 +1,23 @@
-import { spawnSync } from "node:child_process";
+import { spawn as nodeSpawn, spawnSync } from "node:child_process";
 import process from "node:process";
+
+function shouldDetachBackgroundProcess(env = process.env) {
+  return !env?.CDX_RELAY_SUPERVISOR_TOKEN;
+}
+
+export function spawnBackgroundProcess(
+  command,
+  args = [],
+  options = {},
+  { spawn = nodeSpawn } = {}
+) {
+  const child = spawn(command, args, {
+    ...options,
+    detached: shouldDetachBackgroundProcess(options.env ?? process.env)
+  });
+  child.unref();
+  return child;
+}
 
 export function runCommand(command, args = [], options = {}) {
   const result = spawnSync(command, args, {

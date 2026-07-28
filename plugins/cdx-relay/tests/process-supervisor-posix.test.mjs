@@ -18,6 +18,7 @@ import {
   registerControlledDescendant
 } from "./process-supervisor/coordinator.mjs";
 import { spawnBrokerProcess } from "../scripts/lib/broker-lifecycle.mjs";
+import { spawnBackgroundProcess } from "../scripts/lib/process.mjs";
 
 const identity = {
   epoch: "epoch-1",
@@ -105,6 +106,117 @@ function controlledBackend(overrides = {}) {
     child,
     handlers: () => registrationHandlers
   };
+}
+
+function heldRootBackend(platform) {
+  const processes = new Map([
+    [4312, {
+      pid: 4312,
+      processGroupId: 4312,
+      startTime: "root-start",
+      executable: "/usr/bin/node"
+    }],
+    [4400, {
+      pid: 4400,
+      processGroupId: 4312,
+      startTime: "command-start",
+      executable: "/usr/bin/node"
+    }]
+  ]);
+  const groupSignals = [];
+  let registrationHandlers;
+  const child = {
+    pid: 4312,
+    stdout: null,
+    stderr: null,
+    once() {},
+    kill() {
+      return true;
+    }
+  };
+  const cooperative = createPosixProcessGroupBackend({
+    platform,
+    spawn() {
+      return child;
+    },
+    async createRegistrationChannel(handlers) {
+      registrationHandlers = handlers;
+      return {
+        endpoint: "unix:/tmp/cdx-held-root.sock",
+        async close() {}
+      };
+    },
+    async inspectProcess(pid) {
+      return processes.get(pid) ?? null;
+    },
+    killGroup(pid, signal) {
+      groupSignals.push({ pid, signal });
+      for (const [candidatePid, candidate] of processes) {
+        if (candidate.processGroupId === pid) {
+          processes.delete(candidatePid);
+        }
+      }
+    },
+    async waitForDrain() {
+      await registrationHandlers.closed(4400);
+      await registrationHandlers.closed(4500);
+      return processes.size === 0;
+    },
+    graceMs: 1,
+    forceMs: 1
+  });
+  const backend = platform === "darwin"
+    ? createMacosBackend({ createPosixBackend: () => cooperative })
+    : cooperative;
+  return {
+    backend,
+    groupSignals,
+    handlers: () => registrationHandlers,
+    processes,
+    registerBackground(pid = 4500) {
+      let detached;
+      spawnBackgroundProcess(process.execPath, ["background.mjs"], {
+        env: { CDX_RELAY_SUPERVISOR_TOKEN: "active-token" }
+      }, {
+        spawn(_command, _args, options) {
+          detached = options.detached;
+          return { unref() {} };
+        }
+      });
+      processes.set(pid, {
+        pid,
+        processGroupId: detached ? pid : 4312,
+        startTime: "background-start",
+        executable: "/usr/bin/node"
+      });
+      return registrationHandlers.hello({
+        type: "hello",
+        version: 1,
+        ...identity,
+        pid,
+        parentPid: 4400
+      });
+    }
+  };
+}
+
+async function launchHeldRoot(fixture) {
+  const launched = await fixture.backend.launch({
+    ...identity,
+    command: process.execPath,
+    args: ["-e", ""],
+    env: { CDX_RELAY_SUPERVISOR_TOKEN: "active-token" },
+    shell: false
+  });
+  await fixture.handlers().hello({
+    type: "hello",
+    version: 1,
+    ...identity,
+    pid: 4400,
+    parentPid: 4312
+  });
+  await fixture.registerBackground();
+  return launched;
 }
 
 test("launch uses the trusted shim as a detached process-group leader and passes the exact target", async () => {
@@ -386,6 +498,54 @@ test("macOS cooperative policy reports registered-drained capability", async () 
     }
   });
 });
+
+for (const platform of ["linux", "darwin"]) {
+  test(`${platform} held root keeps a supervised background process owned through completion`, async () => {
+    const fixture = heldRootBackend(platform);
+    const launched = await launchHeldRoot(fixture);
+    fixture.handlers().root({
+      type: "root",
+      version: 1,
+      ...identity,
+      status: 0,
+      signal: null
+    });
+
+    assert.equal((await launched.root).status, 0);
+    const proof = await launched.cleanup();
+
+    assert.deepEqual(proof, {
+      backend: "posix-cooperative",
+      level: "registered-drained",
+      registered: 0
+    });
+    assert.deepEqual(fixture.groupSignals, [{ pid: 4312, signal: "SIGTERM" }]);
+    assert.equal(fixture.processes.size, 0, "supervised process survivors");
+  });
+
+  test(`${platform} held-root assertion failure still tears down with zero survivors`, async () => {
+    const fixture = heldRootBackend(platform);
+    const launched = await launchHeldRoot(fixture);
+    let assertionError;
+    let proof;
+
+    try {
+      assert.fail("deliberate held-root assertion failure");
+    } catch (error) {
+      assertionError = error;
+    } finally {
+      proof = await launched.cleanup();
+    }
+
+    assert.match(assertionError?.message ?? "", /deliberate held-root assertion failure/);
+    assert.deepEqual(proof, {
+      backend: "posix-cooperative",
+      level: "registered-drained",
+      registered: 0
+    });
+    assert.equal(fixture.processes.size, 0, "supervised process survivors");
+  });
+}
 
 test("macOS rejects host-strict locally without environment disposal claims", async () => {
   const backend = createMacosBackend({

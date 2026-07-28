@@ -3,9 +3,9 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
+import { spawnBackgroundProcess } from "./process.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
@@ -58,19 +58,27 @@ export async function sendBrokerShutdown(endpoint) {
 
 export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile, env = process.env }) {
   const logFd = fs.openSync(logFile, "a");
-  const child = spawn(process.execPath, [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile], {
+  const childEnv = process.env.CDX_RELAY_SUPERVISOR_TOKEN &&
+      env.CDX_RELAY_SUPERVISOR_TOKEN === undefined
+    ? {
+        ...env,
+        CDX_RELAY_SUPERVISOR_TOKEN: process.env.CDX_RELAY_SUPERVISOR_TOKEN
+      }
+    : env;
+  const child = spawnBackgroundProcess(process.execPath, [
+    scriptPath,
+    "serve",
+    "--endpoint",
+    endpoint,
+    "--cwd",
     cwd,
-    env: process.env.CDX_RELAY_SUPERVISOR_TOKEN &&
-        env.CDX_RELAY_SUPERVISOR_TOKEN === undefined
-      ? {
-          ...env,
-          CDX_RELAY_SUPERVISOR_TOKEN: process.env.CDX_RELAY_SUPERVISOR_TOKEN
-        }
-      : env,
-    detached: true,
+    "--pid-file",
+    pidFile
+  ], {
+    cwd,
+    env: childEnv,
     stdio: ["ignore", logFd, logFd]
   });
-  child.unref();
   fs.closeSync(logFd);
   return child;
 }
