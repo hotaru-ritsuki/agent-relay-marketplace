@@ -8,7 +8,10 @@ test("root package fixes the runtime floor and license", () => {
   assert.equal(pkg.type, "module");
   assert.equal(pkg.license, "Apache-2.0");
   assert.equal(pkg.engines.node, ">=20");
-  assert.equal(pkg.scripts.test, "node --test");
+  assert.equal(
+    pkg.scripts.test,
+    "node --test --test-concurrency=1 --test-timeout=600000",
+  );
 });
 
 test("root license is Apache-2.0", () => {
