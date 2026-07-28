@@ -18,7 +18,7 @@ import { makeTempDir, resolveTestCommand } from "./helpers.mjs";
 const windowsBackend = createWindowsBackend();
 const {
   cleanupWindowsJobForTest: cleanupBackendLaunch,
-  getWindowsJobLeaseCount: getBackendLeaseCount,
+  getBackendLeaseCount,
   runWindowsJobForTest: runBackend
 } = windowsBackend.test;
 installSupervisorTeardown(after);
@@ -1521,13 +1521,13 @@ test("two Windows backend instances isolate cleanup poison and shutdown", {
     { timeout: 2000 }
   );
 
-  assert.equal(first.test.getWindowsJobLeaseCount(), 1);
-  assert.equal(second.test.getWindowsJobLeaseCount(), 1);
+  assert.equal(first.test.getBackendLeaseCount(), 1);
+  assert.equal(second.test.getBackendLeaseCount(), 1);
   assert.throws(
     () => first.test.cleanupWindowsJobForTest(firstRun.lease),
     /invalid (?:ownership )?terminal proof/i
   );
-  assert.equal(second.test.getWindowsJobLeaseCount(), 1);
+  assert.equal(second.test.getBackendLeaseCount(), 1);
   process.kill(secondRun.controllerPid, 0);
 
   await first.shutdown();
@@ -1545,7 +1545,7 @@ test("Windows backend shutdown stops infrastructure after cleanup failure", {
   const faults = {};
   const backend = createWindowsBackend({ faults });
   const {
-    getWindowsJobLeaseCount: leaseCount,
+    getBackendLeaseCount: leaseCount,
     runWindowsJobForTest: backendRun
   } = backend.test;
   const result = backendRun(

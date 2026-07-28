@@ -1,13 +1,19 @@
 import fs from "node:fs";
 import path from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
-import { makeTempDir, run } from "./helpers.mjs";
+import {
+  installSupervisorTeardown,
+  makeTempDir,
+  run
+} from "./helpers.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "tooling", "bump-version.mjs");
+
+installSupervisorTeardown(after);
 
 function writeJson(filePath, json) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });

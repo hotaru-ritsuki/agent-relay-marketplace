@@ -730,7 +730,11 @@ test("helpers expose explicit health and suite teardown wrappers", async () => {
     { shell: true }
   );
   assert.equal(normalizedShell.status, 0);
-  assert.equal(normalizedShell.supervisor.backend, "child-process");
+  assert.equal(typeof normalizedShell.supervisor.backend, "string");
+  assert.equal(
+    normalizedShell.supervisor.cleanup.backend,
+    normalizedShell.supervisor.backend
+  );
 
   let teardown;
   helpers.installSupervisorTeardown((callback) => {

@@ -1,10 +1,17 @@
 import fs from "node:fs";
 import path from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 
 import { collectReviewContext, resolveReviewTarget } from "../scripts/lib/git.mjs";
-import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import {
+  initGitRepo,
+  installSupervisorTeardown,
+  makeTempDir,
+  run
+} from "./helpers.mjs";
+
+installSupervisorTeardown(after);
 
 test("resolveReviewTarget prefers working tree when repo is dirty", () => {
   const cwd = makeTempDir();

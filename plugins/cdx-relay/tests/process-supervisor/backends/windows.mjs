@@ -644,7 +644,7 @@ function normalizeWindowsChildSignal(signal) {
 
 async function legacySpawnTracked(command, args, options = {}) {
   if (process.platform !== "win32") {
-    return trackChild(spawn(command, args, options));
+    throw new Error("The Windows job backend is only available on Windows.");
   }
   const stdio = options.stdio ?? ["pipe", "pipe", "pipe"];
   let stdoutPiped;
@@ -760,7 +760,7 @@ async function legacySpawnTracked(command, args, options = {}) {
   return child;
 }
 
-function getWindowsJobLeaseCount() {
+function getBackendLeaseCount() {
   return windowsJobLeases.size;
 }
 
@@ -977,7 +977,7 @@ function stopInfrastructure(faults = {}) {
     test: {
       runWindowsJobForTest,
       cleanupWindowsJobForTest,
-      getWindowsJobLeaseCount,
+      getBackendLeaseCount,
       replayNativeWindowsJobTombstoneForTest
     }
   };

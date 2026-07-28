@@ -1,84 +1,88 @@
-import test from "node:test";
-import assert from "node:assert/strict";
-import { EventEmitter } from "node:events";
-import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import test, { after } from "node:test";
+import assert from "node:assert/strict";
+import { fileURLToPath } from "node:url";
 
 import {
-  cleanupTrackedChildren,
-  makeTempDir,
+  assertSupervisorHealthy,
+  installSupervisorTeardown,
   resolveTestCommand,
   run,
-  trackChild
+  spawnTracked
 } from "./helpers.mjs";
-import { resolveStateDir } from "../scripts/lib/state.mjs";
 
-function fakeChild() {
-  const child = new EventEmitter();
-  child.exitCode = null;
-  child.killCalls = 0;
-  child.kill = () => {
-    child.killCalls += 1;
-    child.exitCode = 0;
-    child.emit("exit", 0);
-    return true;
-  };
-  return child;
-}
+const TEST_ROOT = path.dirname(fileURLToPath(import.meta.url));
 
-test("cleanup terminates a tracked child that is still running", async () => {
-  const child = trackChild(fakeChild());
+installSupervisorTeardown(after);
 
-  await cleanupTrackedChildren();
-
-  assert.equal(child.killCalls, 1);
+test("ordinary suites use only the portable supervisor facade", () => {
+  const ordinaryBypasses = new RegExp([
+    "process\\.platform",
+    "runInWindows" + "Job",
+    "track" + "Child",
+    "windows-job-"
+  ].join("|"));
+  const helperBypasses = new RegExp([
+    "runInWindows" + "Job",
+    "cleanupWindows" + "JobLaunch",
+    "getWindows" + "JobLeaseCount",
+    "before" + "Exit"
+  ].join("|"));
+  const ordinaryFiles = [
+    "build-config.test.mjs",
+    "bump-version.test.mjs",
+    "git.test.mjs",
+    "runtime.test.mjs",
+    "state.test.mjs"
+  ];
+  for (const file of ordinaryFiles) {
+    const source = fs.readFileSync(path.join(TEST_ROOT, file), "utf8");
+    assert.doesNotMatch(source, ordinaryBypasses);
+  }
+  assert.doesNotMatch(
+    fs.readFileSync(path.join(TEST_ROOT, "helpers.mjs"), "utf8"),
+    helperBypasses
+  );
 });
 
-test("normal child exit unregisters it from cleanup", async () => {
-  const child = trackChild(fakeChild());
-  child.exitCode = 0;
-  child.emit("exit", 0);
+test("run returns the portable terminal result", () => {
+  const result = run(process.execPath, ["-e", "process.stdout.write('portable')"]);
 
-  await cleanupTrackedChildren();
-
-  assert.equal(child.killCalls, 0);
+  assert.equal(result.status, 0);
+  assert.equal(result.stdout, "portable");
+  assert.equal(result.supervisor.cleanup.level === "kernel-drained" ||
+    result.supervisor.cleanup.level === "registered-drained", true);
+  assertSupervisorHealthy();
 });
 
-test("run registers recorded broker and worker processes for cleanup", async (t) => {
-  const workspace = makeTempDir();
-  const stateDir = resolveStateDir(workspace);
-  fs.mkdirSync(stateDir, { recursive: true });
-  const broker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
-  const worker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
-  const stopIfRunning = (child) => {
-    if (child.exitCode === null) child.kill();
-  };
-  t.after(() => {
-    stopIfRunning(broker);
-    stopIfRunning(worker);
-  });
-  fs.writeFileSync(
-    path.join(stateDir, "broker.json"),
-    JSON.stringify({ pid: broker.pid }),
-    "utf8"
+test("spawnTracked exposes root exit and portable completion", async () => {
+  const child = await spawnTracked(
+    process.execPath,
+    ["-e", "process.stdout.write('tracked')"],
+    { stdio: ["ignore", "pipe", "pipe"] }
   );
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    JSON.stringify({ jobs: [{ pid: worker.pid, status: "running" }] }),
-    "utf8"
-  );
-
-  run(process.execPath, ["-e", ""], { cwd: workspace });
-  await cleanupTrackedChildren();
-
-  const exited = (child) => new Promise((resolve) => {
-    if (child.exitCode !== null) {
-      resolve(true);
-      return;
-    }
-    child.once("exit", () => resolve(true));
-    setTimeout(() => resolve(false), 3000).unref();
+  let stdout = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
   });
-  assert.deepEqual(await Promise.all([exited(broker), exited(worker)]), [true, true]);
+
+  const rootStatus = await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", resolve);
+  });
+  const completion = await child.completion;
+
+  assert.equal(rootStatus, 0);
+  assert.equal(completion.status, 0);
+  assert.equal(stdout, "tracked");
+  assertSupervisorHealthy();
+});
+
+test("command resolution remains data-only without a shell", () => {
+  assert.deepEqual(resolveTestCommand("tool", "linux", {}), {
+    command: "tool",
+    shell: false
+  });
 });

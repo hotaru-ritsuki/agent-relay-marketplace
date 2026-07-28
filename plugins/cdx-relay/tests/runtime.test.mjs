@@ -1,17 +1,18 @@
 import fs from "node:fs";
 import path from "node:path";
-import test, { afterEach } from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import {
+  assertSupervisorHealthy,
   cleanupTrackedChildren,
   initGitRepo,
+  installSupervisorTeardown,
   makeTempDir,
   run,
-  trackChild
+  spawnTracked
 } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../scripts/lib/broker-lifecycle.mjs";
 import { DEFAULT_CONTINUE_PROMPT } from "../scripts/lib/codex.mjs";
@@ -23,7 +24,104 @@ const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
 
-afterEach(cleanupTrackedChildren);
+installSupervisorTeardown(after);
+
+const HELD_COMMAND_SOURCE = `
+  import fs from "node:fs";
+  import { spawn } from "node:child_process";
+  const [payloadFile, resultFile, releaseFile] = process.argv.slice(1);
+  const payload = JSON.parse(fs.readFileSync(payloadFile, "utf8"));
+  const child = spawn(payload.command, payload.args, {
+    cwd: payload.cwd,
+    env: process.env,
+    shell: false,
+    windowsHide: true,
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  const stdout = [];
+  const stderr = [];
+  child.stdout.on("data", (chunk) => stdout.push(chunk));
+  child.stderr.on("data", (chunk) => stderr.push(chunk));
+  child.stdin.end(payload.input?.type === "base64"
+    ? Buffer.from(payload.input.value, "base64")
+    : payload.input?.value ?? "");
+  const root = await new Promise((resolve) => {
+    let error;
+    child.once("error", (value) => {
+      error = {
+        message: value.message,
+        code: value.code ?? null
+      };
+    });
+    child.once("close", (status, signal) => resolve({
+      status,
+      signal,
+      error,
+      stdout: Buffer.concat(stdout).toString("utf8"),
+      stderr: Buffer.concat(stderr).toString("utf8")
+    }));
+  });
+  const temporaryResult = resultFile + "." + process.pid + ".tmp";
+  fs.writeFileSync(temporaryResult, JSON.stringify(root), "utf8");
+  fs.renameSync(temporaryResult, resultFile);
+  while (!fs.existsSync(releaseFile)) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  }
+`;
+
+async function launchTrackedCommand(command, args, options = {}) {
+  const fixtureDir = makeTempDir("cdx-held-command-");
+  const payloadFile = path.join(fixtureDir, "payload.json");
+  const resultFile = path.join(fixtureDir, "result.json");
+  const releaseFile = path.join(fixtureDir, "release");
+  const input = Buffer.isBuffer(options.input)
+    ? { type: "base64", value: options.input.toString("base64") }
+    : { type: "string", value: options.input ?? "" };
+  fs.writeFileSync(payloadFile, JSON.stringify({
+    command,
+    args,
+    cwd: options.cwd,
+    input
+  }), "utf8");
+  const child = await spawnTracked(process.execPath, [
+    "--input-type=module",
+    "-e",
+    HELD_COMMAND_SOURCE,
+    payloadFile,
+    resultFile,
+    releaseFile
+  ], {
+    cwd: options.cwd,
+    env: options.env,
+    stdio: "ignore"
+  });
+  await waitFor(() => fs.existsSync(resultFile), {
+    timeoutMs: options.timeout ?? 30_000,
+    intervalMs: 20
+  });
+  return {
+    child,
+    releaseFile,
+    result: JSON.parse(fs.readFileSync(resultFile, "utf8"))
+  };
+}
+
+async function finishTrackedCommand(command) {
+  fs.writeFileSync(command.releaseFile, "release", "utf8");
+  const completion = await command.child.completion;
+  await cleanupTrackedChildren();
+  assertSupervisorHealthy();
+  return completion;
+}
+
+function installTrackedCommandCleanup(t, command) {
+  t.after(async () => {
+    fs.writeFileSync(command.releaseFile, "release", "utf8");
+    await cleanupTrackedChildren();
+    await command.child.completion;
+    assertSupervisorHealthy();
+  });
+}
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   const start = Date.now();
@@ -38,10 +136,6 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
 }
 
 function installTaskkillFixture(binDir) {
-  if (process.platform !== "win32") {
-    return;
-  }
-
   const fixture = path.join(binDir, "fake-taskkill.mjs");
   fs.writeFileSync(
     fixture,
@@ -106,7 +200,7 @@ test("setup reports ready when fake codex is installed and authenticated", () =>
 test("setup is ready without npm when Codex is already installed and authenticated", () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
-  const nodeName = process.platform === "win32" ? "node.exe" : "node";
+  const nodeName = path.basename(process.execPath);
   fs.symlinkSync(process.execPath, path.join(binDir, nodeName));
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
@@ -1106,7 +1200,7 @@ test("task can finish after subagent work even if the parent turn/completed even
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
-test("task using the shared broker still completes when Codex spawns subagents", () => {
+test("task using the shared broker still completes when Codex spawns subagents", async (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir, "with-subagent");
@@ -1117,10 +1211,12 @@ test("task using the shared broker still completes when Codex spawns subagents",
   fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
 
   const env = buildEnv(binDir);
-  const review = run("node", [SCRIPT, "review"], {
+  const reviewCommand = await launchTrackedCommand(process.execPath, [SCRIPT, "review"], {
     cwd: repo,
     env
   });
+  installTrackedCommandCleanup(t, reviewCommand);
+  const review = reviewCommand.result;
   assert.equal(review.status, 0, review.stderr);
 
   if (!loadBrokerSession(repo)) {
@@ -1134,9 +1230,17 @@ test("task using the shared broker still completes when Codex spawns subagents",
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+  assert.equal(cleanup.status, 0, cleanup.stderr);
+  const completion = await finishTrackedCommand(reviewCommand);
+  assert.equal(completion.status, 0);
 });
 
-test("task --background enqueues a detached worker and exposes per-job status", async () => {
+test("task --background enqueues a detached worker and exposes per-job status", async (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir, "slow-task");
@@ -1145,10 +1249,16 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate the failing test"], {
-    cwd: repo,
-    env: buildEnv(binDir)
-  });
+  const launchedCommand = await launchTrackedCommand(
+    "node",
+    [SCRIPT, "task", "--background", "--json", "investigate the failing test"],
+    {
+      cwd: repo,
+      env: buildEnv(binDir)
+    }
+  );
+  installTrackedCommandCleanup(t, launchedCommand);
+  const launched = launchedCommand.result;
 
   assert.equal(launched.status, 0, launched.stderr);
   const launchPayload = JSON.parse(launched.stdout);
@@ -1183,9 +1293,11 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.equal(resultPayload.job.id, launchPayload.jobId);
   assert.equal(resultPayload.job.status, "completed");
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
+  const completion = await finishTrackedCommand(launchedCommand);
+  assert.equal(completion.status, 0);
 });
 
-test("task --resume-id background round-trip preserves the exact thread", () => {
+test("task --resume-id background round-trip preserves the exact thread", async (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   const statePath = path.join(binDir, "fake-codex-state.json");
@@ -1193,11 +1305,13 @@ test("task --resume-id background round-trip preserves the exact thread", () => 
   initGitRepo(repo);
   seedFakeCodexThread(statePath, repo);
 
-  const launched = run(
+  const launchedCommand = await launchTrackedCommand(
     "node",
     [SCRIPT, "task", "--background", "--json", "--resume-id", "thr_exact", "continue exact thread"],
     { cwd: repo, env: buildEnv(binDir) }
   );
+  installTrackedCommandCleanup(t, launchedCommand);
+  const launched = launchedCommand.result;
 
   assert.equal(launched.status, 0, launched.stderr);
   const launchPayload = JSON.parse(launched.stdout);
@@ -1216,6 +1330,8 @@ test("task --resume-id background round-trip preserves the exact thread", () => 
   const jobPath = path.join(resolveStateDir(repo), "jobs", `${launchPayload.jobId}.json`);
   const finishedJob = JSON.parse(fs.readFileSync(jobPath, "utf8"));
   assert.equal(finishedJob.request.resumeId, "thr_exact");
+  const completion = await finishTrackedCommand(launchedCommand);
+  assert.equal(completion.status, 0);
 });
 
 test("task worker waits for both job-file and index publication", async () => {
@@ -1231,7 +1347,7 @@ test("task worker waits for both job-file and index publication", async () => {
   const logFile = path.join(stateDir, "jobs", `${jobId}.log`);
   fs.mkdirSync(path.dirname(logFile), { recursive: true });
   fs.writeFileSync(logFile, "", "utf8");
-  const child = trackChild(spawn(
+  const child = await spawnTracked(
     process.execPath,
     [SCRIPT, "task-worker", "--cwd", repo, "--job-id", jobId],
     {
@@ -1241,13 +1357,13 @@ test("task worker waits for both job-file and index publication", async () => {
       windowsHide: true,
       shell: false
     }
-  ));
+  );
   let stderr = "";
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => {
     stderr += chunk;
   });
-  const exitPromise = new Promise((resolve) => child.once("exit", resolve));
+  const completionPromise = child.completion;
 
   await new Promise((resolve) => setTimeout(resolve, 1500));
   const queuedRecord = {
@@ -1278,8 +1394,9 @@ test("task worker waits for both job-file and index publication", async () => {
   writeJobFile(repo, jobId, queuedRecord);
   upsertJob(repo, queuedRecord);
 
-  const exitCode = await exitPromise;
-  assert.equal(exitCode, 0, stderr);
+  const completion = await completionPromise;
+  assert.equal(completion.status, 0, stderr);
+  assertSupervisorHealthy();
   const status = run("node", [SCRIPT, "status", jobId, "--json"], {
     cwd: repo,
     env: buildEnv(binDir)
@@ -1305,7 +1422,7 @@ test("task worker rejects stale index identity", async () => {
   const logFile = path.join(stateDir, "jobs", `${jobId}.log`);
   fs.mkdirSync(path.dirname(logFile), { recursive: true });
   fs.writeFileSync(logFile, "", "utf8");
-  const child = trackChild(spawn(
+  const child = await spawnTracked(
     process.execPath,
     [SCRIPT, "task-worker", "--cwd", repo, "--job-id", jobId],
     {
@@ -1315,13 +1432,13 @@ test("task worker rejects stale index identity", async () => {
       windowsHide: true,
       shell: false
     }
-  ));
+  );
   let stderr = "";
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => {
     stderr += chunk;
   });
-  const exitPromise = new Promise((resolve) => child.once("exit", resolve));
+  const completionPromise = child.completion;
   const queuedRecord = {
     id: jobId,
     kind: "task",
@@ -1361,8 +1478,9 @@ test("task worker rejects stale index identity", async () => {
   assert.equal(beforeCurrentIndex.status, "queued");
 
   upsertJob(repo, queuedRecord);
-  const exitCode = await exitPromise;
-  assert.equal(exitCode, 0, stderr);
+  const completion = await completionPromise;
+  assert.equal(completion.status, 0, stderr);
+  assertSupervisorHealthy();
   const status = run("node", [SCRIPT, "status", jobId, "--json"], {
     cwd: repo,
     env: buildEnv(binDir)
@@ -1387,7 +1505,7 @@ test("task worker rejects malformed index state", async () => {
   fs.mkdirSync(path.dirname(logFile), { recursive: true });
   fs.writeFileSync(logFile, "", "utf8");
   const startedAt = Date.now();
-  const child = trackChild(spawn(
+  const child = await spawnTracked(
     process.execPath,
     [SCRIPT, "task-worker", "--cwd", repo, "--job-id", jobId],
     {
@@ -1397,7 +1515,7 @@ test("task worker rejects malformed index state", async () => {
       windowsHide: true,
       shell: false
     }
-  ));
+  );
   let stderr = "";
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => {
@@ -1430,9 +1548,10 @@ test("task worker rejects malformed index state", async () => {
   writeJobFile(repo, jobId, queuedRecord);
   fs.writeFileSync(path.join(stateDir, "state.json"), "{ malformed", "utf8");
 
-  const exitCode = await new Promise((resolve) => child.once("exit", resolve));
+  const completion = await child.completion;
 
-  assert.equal(exitCode, 1);
+  assert.equal(completion.status, 1);
+  assertSupervisorHealthy();
   assert.ok(Date.now() - startedAt < 2000, "corruption must bypass the publication timeout");
   assert.match(stderr, /ERR_STATE_INDEX_CORRUPT/);
   assert.match(stderr, /malformed JSON/);
@@ -1449,7 +1568,7 @@ test("task worker rejects mismatched stored request identity", async () => {
   const logFile = path.join(stateDir, "jobs", `${jobId}.log`);
   fs.mkdirSync(path.dirname(logFile), { recursive: true });
   fs.writeFileSync(logFile, "", "utf8");
-  const child = trackChild(spawn(
+  const child = await spawnTracked(
     process.execPath,
     [SCRIPT, "task-worker", "--cwd", repo, "--job-id", jobId],
     {
@@ -1459,13 +1578,13 @@ test("task worker rejects mismatched stored request identity", async () => {
       windowsHide: true,
       shell: false
     }
-  ));
+  );
   let stderr = "";
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => {
     stderr += chunk;
   });
-  const exitPromise = new Promise((resolve) => child.once("exit", resolve));
+  const completionPromise = child.completion;
   const queuedRecord = {
     id: jobId,
     kind: "task",
@@ -1493,8 +1612,9 @@ test("task worker rejects mismatched stored request identity", async () => {
   writeJobFile(repo, jobId, queuedRecord);
   upsertJob(repo, queuedRecord);
 
-  const exitCode = await exitPromise;
-  assert.equal(exitCode, 1);
+  const completion = await completionPromise;
+  assert.equal(completion.status, 1);
+  assertSupervisorHealthy();
   assert.match(
     stderr,
     /Stored task request task-other-request-id does not match requested job task-mismatched-request-id/
@@ -1531,7 +1651,7 @@ test("task worker rejects a published job record with a mismatched id", async ()
   assert.match(worker.stderr, /Stored job task-different-id does not match requested job task-requested-id/);
 });
 
-test("task --resume-id background without a prompt uses the default continue prompt", () => {
+test("task --resume-id background without a prompt uses the default continue prompt", async (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   const statePath = path.join(binDir, "fake-codex-state.json");
@@ -1539,11 +1659,13 @@ test("task --resume-id background without a prompt uses the default continue pro
   initGitRepo(repo);
   seedFakeCodexThread(statePath, repo);
 
-  const launched = run(
+  const launchedCommand = await launchTrackedCommand(
     "node",
     [SCRIPT, "task", "--background", "--json", "--resume-id", "thr_exact"],
     { cwd: repo, env: buildEnv(binDir) }
   );
+  installTrackedCommandCleanup(t, launchedCommand);
+  const launched = launchedCommand.result;
 
   assert.equal(launched.status, 0, launched.stderr);
   const launchPayload = JSON.parse(launched.stdout);
@@ -1563,6 +1685,8 @@ test("task --resume-id background without a prompt uses the default continue pro
   const finishedJob = JSON.parse(fs.readFileSync(jobPath, "utf8"));
   assert.equal(finishedJob.request.resumeId, "thr_exact");
   assert.equal(finishedJob.request.prompt, "");
+  const completion = await finishTrackedCommand(launchedCommand);
+  assert.equal(completion.status, 0);
 });
 
 test("review rejects focus text because it is native-review only", () => {
@@ -2143,11 +2267,11 @@ test("cancel stops an active background job and marks it cancelled", async () =>
   const jobsDir = path.join(stateDir, "jobs");
   fs.mkdirSync(jobsDir, { recursive: true });
 
-  const sleeper = trackChild(spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  const sleeper = await spawnTracked(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
     cwd: workspace,
     detached: true,
     stdio: "ignore"
-  }));
+  });
   sleeper.unref();
 
   const logFile = path.join(jobsDir, "task-live.log");
@@ -2213,6 +2337,8 @@ test("cancel stops an active background job and marks it cancelled", async () =>
       return error?.code === "ESRCH";
     }
   });
+  await sleeper.completion;
+  assertSupervisorHealthy();
 
   const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
   const cancelled = state.jobs.find((job) => job.id === "task-live");
@@ -2327,13 +2453,11 @@ test("cancel with a job id can still target an active job from another Claude se
   assert.equal(state.jobs[0].status, "cancelled");
 });
 
-test("cancel sends turn interrupt to the shared app-server before killing a brokered task", async () => {
+test("cancel sends turn interrupt to the shared app-server before killing a brokered task", async (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");
-  if (process.platform === "win32") {
-    fs.writeFileSync(path.join(binDir, "taskkill.cmd"), "@exit /b 0\r\n");
-  }
+  fs.writeFileSync(path.join(binDir, "taskkill.cmd"), "@exit /b 0\r\n");
   installFakeCodex(binDir, "interruptible-slow-task");
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
@@ -2341,10 +2465,13 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
   const env = buildEnv(binDir);
-  const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate the flaky worker timeout"], {
-    cwd: repo,
-    env
-  });
+  const launchedCommand = await launchTrackedCommand(
+    process.execPath,
+    [SCRIPT, "task", "--background", "--json", "investigate the flaky worker timeout"],
+    { cwd: repo, env }
+  );
+  installTrackedCommandCleanup(t, launchedCommand);
+  const launched = launchedCommand.result;
 
   assert.equal(launched.status, 0, launched.stderr);
   const launchPayload = JSON.parse(launched.stdout);
@@ -2392,6 +2519,8 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
     })
   });
   assert.equal(cleanup.status, 0, cleanup.stderr);
+  const completion = await finishTrackedCommand(launchedCommand);
+  assert.equal(completion.status, 0);
 });
 
 test("session end fully cleans up jobs for the ending session", async () => {
@@ -2417,11 +2546,11 @@ test("session end fully cleans up jobs for the ending session", async () => {
   fs.writeFileSync(completedJobFile, JSON.stringify({ id: "review-completed" }, null, 2), "utf8");
   fs.writeFileSync(otherJobFile, JSON.stringify({ id: "review-other" }, null, 2), "utf8");
 
-  const sleeper = trackChild(spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  const sleeper = await spawnTracked(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
     cwd: repo,
     detached: true,
     stdio: "ignore"
-  }));
+  });
   sleeper.unref();
   fs.writeFileSync(runningJobFile, JSON.stringify({ id: "review-running" }, null, 2), "utf8");
 
@@ -2497,6 +2626,8 @@ test("session end fully cleans up jobs for the ending session", async () => {
       return error?.code === "ESRCH";
     }
   });
+  await sleeper.completion;
+  assertSupervisorHealthy();
 
   const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
   assert.deepEqual(state.jobs.map((job) => job.id), ["review-other"]);
@@ -2697,7 +2828,7 @@ test("stop hook runs the actual task when auth status looks stale", () => {
   assert.match(payload.reason, /Missing empty-state guard/i);
 });
 
-test("commands lazily start and reuse one shared app-server after first use", async () => {
+test("commands lazily start and reuse one shared app-server after first use", async (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");
@@ -2711,10 +2842,12 @@ test("commands lazily start and reuse one shared app-server after first use", as
 
   const env = buildEnv(binDir);
 
-  const review = run("node", [SCRIPT, "review"], {
+  const reviewCommand = await launchTrackedCommand(process.execPath, [SCRIPT, "review"], {
     cwd: repo,
     env
   });
+  installTrackedCommandCleanup(t, reviewCommand);
+  const review = reviewCommand.result;
   assert.equal(review.status, 0, review.stderr);
 
   const brokerSession = loadBrokerSession(repo);
@@ -2740,9 +2873,11 @@ test("commands lazily start and reuse one shared app-server after first use", as
     })
   });
   assert.equal(cleanup.status, 0, cleanup.stderr);
+  const completion = await finishTrackedCommand(reviewCommand);
+  assert.equal(completion.status, 0);
 });
 
-test("setup reuses an existing shared app-server without starting another one", () => {
+test("setup reuses an existing shared app-server without starting another one", async (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");
@@ -2756,10 +2891,12 @@ test("setup reuses an existing shared app-server without starting another one", 
 
   const env = buildEnv(binDir);
 
-  const review = run("node", [SCRIPT, "review"], {
+  const reviewCommand = await launchTrackedCommand(process.execPath, [SCRIPT, "review"], {
     cwd: repo,
     env
   });
+  installTrackedCommandCleanup(t, reviewCommand);
+  const review = reviewCommand.result;
   assert.equal(review.status, 0, review.stderr);
 
   const brokerSession = loadBrokerSession(repo);
@@ -2785,9 +2922,11 @@ test("setup reuses an existing shared app-server without starting another one", 
     })
   });
   assert.equal(cleanup.status, 0, cleanup.stderr);
+  const completion = await finishTrackedCommand(reviewCommand);
+  assert.equal(completion.status, 0);
 });
 
-test("status reports shared session runtime when a lazy broker is active", () => {
+test("status reports shared session runtime when a lazy broker is active", async (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
@@ -2797,10 +2936,13 @@ test("status reports shared session runtime when a lazy broker is active", () =>
   run("git", ["commit", "-m", "init"], { cwd: repo });
   fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
 
-  const review = run("node", [SCRIPT, "review"], {
+  const env = buildEnv(binDir);
+  const reviewCommand = await launchTrackedCommand(process.execPath, [SCRIPT, "review"], {
     cwd: repo,
-    env: buildEnv(binDir)
+    env
   });
+  installTrackedCommandCleanup(t, reviewCommand);
+  const review = reviewCommand.result;
   assert.equal(review.status, 0, review.stderr);
 
   if (!loadBrokerSession(repo)) {
@@ -2814,6 +2956,14 @@ test("status reports shared session runtime when a lazy broker is active", () =>
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Session runtime: shared session/);
+  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+  assert.equal(cleanup.status, 0, cleanup.stderr);
+  const completion = await finishTrackedCommand(reviewCommand);
+  assert.equal(completion.status, 0);
 });
 
 test("setup and status honor --cwd when reading shared session runtime", () => {

@@ -8,7 +8,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node --test --test-concurrency=1 --test-timeout=600000 tests/broker-endpoint.test.mjs tests/build-config.test.mjs tests/build-tooling.test.mjs tests/bump-version.test.mjs tests/commands.test.mjs tests/git.test.mjs tests/helpers.test.mjs tests/process-supervisor-contract.test.mjs tests/process-supervisor-windows.test.mjs tests/process.test.mjs tests/render.test.mjs tests/runtime.test.mjs tests/state.test.mjs",
+    "test": "node --test --test-concurrency=1 --test-timeout=600000 tests/broker-endpoint.test.mjs tests/build-config.test.mjs tests/build-tooling.test.mjs tests/bump-version.test.mjs tests/commands.test.mjs tests/git.test.mjs tests/helpers.test.mjs tests/process-supervisor-contract.test.mjs tests/process-supervisor-windows.test.mjs tests/process-supervisor-posix.test.mjs tests/process-supervisor-linux.test.mjs tests/process.test.mjs tests/render.test.mjs tests/runtime.test.mjs tests/state.test.mjs",
     "generate-types": "node tooling/generate-app-server-types.mjs",
     "build": "npm run generate-types && tsc -p tsconfig.app-server.json"
   }

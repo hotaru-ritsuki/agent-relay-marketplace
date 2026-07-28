@@ -1,11 +1,15 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 
-import { makeTempDir } from "./helpers.mjs";
+import {
+  assertSupervisorHealthy,
+  installSupervisorTeardown,
+  makeTempDir,
+  spawnTracked
+} from "./helpers.mjs";
 import {
   readStateIndexStrict,
   readJobFile,
@@ -17,6 +21,8 @@ import {
   validateStateIndexPublicationCandidate,
   writeJobFile
 } from "../scripts/lib/state.mjs";
+
+installSupervisorTeardown(after);
 
 async function waitForFile(filePath) {
   const deadline = Date.now() + 10_000;
@@ -82,7 +88,7 @@ test("state index and job JSON publish atomically while a concurrent reader poll
       id: ${JSON.stringify(jobId)}, status: "running", generation: "new"
     });
   `;
-  const child = spawn(process.execPath, ["--input-type=module", "-e", source], {
+  const child = await spawnTracked(process.execPath, ["--input-type=module", "-e", source], {
     stdio: ["ignore", "ignore", "pipe"],
     shell: false
   });
@@ -92,8 +98,9 @@ test("state index and job JSON publish atomically while a concurrent reader poll
     stderr += chunk;
   });
   let exited = false;
-  child.once("exit", () => {
+  const completionPromise = child.completion.then((completion) => {
     exited = true;
+    return completion;
   });
 
   try {
@@ -107,8 +114,9 @@ test("state index and job JSON publish atomically while a concurrent reader poll
     assert.equal(readJobFile(jobFile).generation, "old");
     fs.writeFileSync(`${releaseBase}.2`, "release");
 
-    const exitCode = await new Promise((resolve) => child.once("exit", resolve));
-    assert.equal(exitCode, 0, stderr);
+    const completion = await completionPromise;
+    assert.equal(completion.status, 0, stderr);
+    assertSupervisorHealthy();
     assert.equal(readJobFile(jobFile).generation, "new");
     assert.deepEqual(
       [
@@ -126,7 +134,8 @@ test("state index and job JSON publish atomically while a concurrent reader poll
     fs.writeFileSync(`${releaseBase}.2`, "release");
     if (!exited) {
       child.kill("SIGKILL");
-      await new Promise((resolve) => child.once("exit", resolve));
+      await completionPromise;
+      assertSupervisorHealthy();
     }
   }
 });
@@ -174,7 +183,7 @@ test("atomic replacement preserves exact permission bits under a restrictive uma
       id: ${JSON.stringify(jobId)}, generation: 2
     });
   `;
-  const child = spawn(process.execPath, ["--input-type=module", "-e", source], {
+  const child = await spawnTracked(process.execPath, ["--input-type=module", "-e", source], {
     stdio: ["ignore", "ignore", "pipe"],
     shell: false
   });
@@ -184,9 +193,10 @@ test("atomic replacement preserves exact permission bits under a restrictive uma
     stderr += chunk;
   });
 
-  const exitCode = await new Promise((resolve) => child.once("exit", resolve));
+  const completion = await child.completion;
 
-  assert.equal(exitCode, 0, stderr);
+  assert.equal(completion.status, 0, stderr);
+  assertSupervisorHealthy();
   assert.equal(fs.statSync(stateFile).mode & 0o777, stateMode);
   assert.equal(fs.statSync(jobFile).mode & 0o777, jobMode);
 });
