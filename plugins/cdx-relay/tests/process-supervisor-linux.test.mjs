@@ -19,6 +19,7 @@ import {
 import {
   createPidfdHarnessWatcher,
   deriveProtectedTupleKey,
+  hasCompleteCgroupWriteDenials,
   loadOrCreateReaperAuthority,
   performProtectedBoundaryProbe,
   reportControlLoss,
@@ -193,6 +194,122 @@ test("atomic registry authenticates the complete record before returning it", as
     );
   } finally {
     await fs.chmod(registryPath, 0o700).catch(() => {});
+    await fs.rm(registryPath, { recursive: true, force: true });
+  }
+});
+
+test("strict cgroup write evidence accepts only explicit permission denials", () => {
+  assert.equal(hasCompleteCgroupWriteDenials({
+    cgroupWriteResults: {
+      procs: { result: "denied", errno: "EACCES" },
+      threads: { result: "denied", errno: "EPERM" },
+      subtreeControl: { result: "denied", errno: "EROFS" }
+    }
+  }), true);
+});
+
+for (const file of ["procs", "threads", "subtreeControl"]) {
+  for (const errno of [
+    "EINVAL",
+    "EBUSY",
+    "ENOENT",
+    "EOPNOTSUPP",
+    "UNKNOWN"
+  ]) {
+    test(`strict cgroup write evidence rejects ${errno} for ${file}`, () => {
+      const cgroupWriteResults = {
+        procs: { result: "denied", errno: "EROFS" },
+        threads: { result: "denied", errno: "EROFS" },
+        subtreeControl: { result: "denied", errno: "EROFS" }
+      };
+      cgroupWriteResults[file] = { result: "denied", errno };
+
+      assert.equal(hasCompleteCgroupWriteDenials({
+        cgroupWriteResults
+      }), false);
+    });
+  }
+}
+
+test("real atomic registry survives simultaneous cleanup and watcher writes", async () => {
+  const registryPath = await fs.mkdtemp(path.join(os.tmpdir(), "cdx-registry-race-"));
+  const originalNow = Date.now;
+  try {
+    Date.now = () => 1_722_000_000_000;
+    const registry = createAtomicReaperRegistry(registryPath, {
+      authenticationKey: Buffer.alloc(32, 11),
+      reaperBootId: "boot-test",
+      enforcePosixMetadata: false
+    });
+    let watcherDeath;
+    let releaseKill;
+    const killReleased = new Promise((resolve) => {
+      releaseKill = resolve;
+    });
+    const cgroups = {
+      async createRun() {},
+      async spawnBlockedShim(_entry, payload) {
+        return { pid: 9001, root: Promise.resolve(payload.root ?? {}) };
+      },
+      async migrateBlockedShim() {},
+      async validatePayloadMembership() {
+        return true;
+      },
+      async validateRestrictedNamespace() {
+        return true;
+      },
+      async releaseShim() {},
+      async killOuter() {
+        await killReleased;
+      },
+      async readOuterEvents() {
+        return { populated: 0 };
+      },
+      async removeRun() {}
+    };
+    const reaper = createProtectedLinuxReaper({
+      reaperIdentity: "protected-reaper:test",
+      reaperBootId: "boot-test",
+      protectedRoot: "/protected",
+      checks: async () => ({ ...REQUIRED_CHECKS }),
+      cgroups,
+      registry,
+      watchHarness(_entry, onDeath) {
+        watcherDeath = onDeath;
+        return { close() {} };
+      }
+    });
+    await reaper.handleRequest(request("probe"));
+    await reaper.handleRequest(request("recover"));
+    const launched = await reaper.handleRequest(request("launch", {
+      payload: {
+        command: process.execPath,
+        args: [],
+        harnessPid: 111,
+        harnessStartTime: "222"
+      }
+    }));
+
+    watcherDeath();
+    const cleanup = reaper.handleRequest(request("cleanup", {
+      payload: { outerCgroup: launched.outerCgroup }
+    }));
+    await new Promise((resolve) => setImmediate(resolve));
+    releaseKill();
+    const proof = await cleanup;
+
+    assert.equal(proof.level, "kernel-drained");
+    assert.doesNotThrow(() => reaper.assertHealthy());
+    const records = await registry.list();
+    assert.equal(records.length, 1);
+    assert.equal(records[0].state, "drained");
+    assert.equal(records[0].proofConsumed, true);
+    assert.deepEqual(
+      (await fs.readdir(registryPath)).filter((name) => name.endsWith(".tmp")),
+      []
+    );
+  } finally {
+    Date.now = originalNow;
     await fs.rm(registryPath, { recursive: true, force: true });
   }
 });
@@ -413,10 +530,10 @@ test("strict capability probe performs the complete disposable boundary itself",
           launcherPid: 76,
           ready: {
             reaperVisible: false,
-            cgroupWriteDenied: {
-              procs: true,
-              threads: true,
-              subtreeControl: true
+            cgroupWriteResults: {
+              procs: { result: "denied", errno: "EROFS" },
+              threads: { result: "denied", errno: "EROFS" },
+              subtreeControl: { result: "denied", errno: "EROFS" }
             }
           },
           root: new Promise(() => {})
@@ -443,7 +560,14 @@ test("strict capability probe performs the complete disposable boundary itself",
     }
   });
 
-  assert.deepEqual(result, REQUIRED_CHECKS);
+  assert.deepEqual(result, {
+    ...REQUIRED_CHECKS,
+    cgroupWriteResults: {
+      procs: { result: "denied", errno: "EROFS" },
+      threads: { result: "denied", errno: "EROFS" },
+      subtreeControl: { result: "denied", errno: "EROFS" }
+    }
+  });
   assert.deepEqual(events, [
     "controllers",
     "create",

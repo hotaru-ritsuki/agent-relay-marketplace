@@ -39,10 +39,13 @@ const PAYLOAD_RUNTIME_CAP_MS = 10 * 60 * 1000;
 const canonicalJson = (value) => JSON.stringify(Object.fromEntries(
   Object.entries(value).sort(([left], [right]) => left.localeCompare(right))
 ));
-const hasCompleteCgroupWriteDenials = (ready) =>
-  ready?.cgroupWriteDenied?.procs === true &&
-  ready.cgroupWriteDenied.threads === true &&
-  ready.cgroupWriteDenied.subtreeControl === true;
+const CGROUP_WRITE_DENIAL_ERRNOS = new Set(["EACCES", "EPERM", "EROFS"]);
+export const hasCompleteCgroupWriteDenials = (ready) =>
+  ["procs", "threads", "subtreeControl"].every((name) => {
+    const evidence = ready?.cgroupWriteResults?.[name];
+    return evidence?.result === "denied" &&
+      CGROUP_WRITE_DENIAL_ERRNOS.has(evidence.errno);
+  });
 
 export function deriveProtectedTupleKey(backend, epoch, runId) {
   if (![backend, epoch, runId].every((value) => typeof value === "string")) {
@@ -250,16 +253,20 @@ export function createAtomicReaperRegistry(registryPath, {
         registryPath,
         `${deriveProtectedTupleKey(entry.backend, entry.epoch, entry.runId)}.json`
       );
-      const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
+      const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
       const stored = { ...entry, authentication: authenticate(entry) };
-      await fs.writeFile(temporary, JSON.stringify(stored), {
-        encoding: "utf8",
-        mode: 0o600,
-        flag: "wx"
-      });
-      if (enforcePosixMetadata) await fs.chmod(temporary, 0o600);
-      await fs.rename(temporary, target);
-      if (enforcePosixMetadata) await fs.chmod(target, 0o600);
+      try {
+        await fs.writeFile(temporary, JSON.stringify(stored), {
+          encoding: "utf8",
+          mode: 0o600,
+          flag: "wx"
+        });
+        if (enforcePosixMetadata) await fs.chmod(temporary, 0o600);
+        await fs.rename(temporary, target);
+        if (enforcePosixMetadata) await fs.chmod(target, 0o600);
+      } finally {
+        await fs.rm(temporary, { force: true });
+      }
     }
   };
 }
@@ -960,6 +967,8 @@ export async function performProtectedBoundaryProbe({
     });
     void blocked.root?.catch?.(() => {});
     await cgroups.migrateBlockedShim(entry, blocked);
+    checks.cgroupWriteResults =
+      structuredClone(blocked.ready?.cgroupWriteResults ?? {});
     const member = await cgroups.validatePayloadMembership(entry, blocked);
     const restricted = await cgroups.validateRestrictedNamespace(entry, blocked);
     checks.reaperOutsidePayloadPidNamespace =
@@ -1257,17 +1266,20 @@ async function runPayloadShim() {
   const status = await fs.readFile("/proc/self/status", "utf8");
   const nspid = /^NSpid:\s+(.+)$/m.exec(status)?.[1]
     ?.trim().split(/\s+/).map(Number) ?? [process.pid];
-  const cgroupWriteDenied = {};
+  const cgroupWriteResults = {};
   for (const [name, file, value] of [
     ["procs", "cgroup.procs", String(process.pid)],
     ["threads", "cgroup.threads", String(process.pid)],
-    ["subtreeControl", "cgroup.subtree_control", "+memory"]
+    ["subtreeControl", "cgroup.subtree_control", "\n"]
   ]) {
     try {
       await fs.writeFile(path.join("/sys/fs/cgroup", file), value);
-      cgroupWriteDenied[name] = false;
-    } catch {
-      cgroupWriteDenied[name] = true;
+      cgroupWriteResults[name] = { result: "written" };
+    } catch (error) {
+      cgroupWriteResults[name] = {
+        result: "denied",
+        errno: typeof error?.code === "string" ? error.code : "UNKNOWN"
+      };
     }
   }
   let reaperVisible = true;
@@ -1279,7 +1291,7 @@ async function runPayloadShim() {
   process.stdout.write(`${JSON.stringify({
     type: "ready",
     hostPid: nspid[0],
-    cgroupWriteDenied,
+    cgroupWriteResults,
     reaperVisible
   })}\n`);
   process.kill(process.pid, "SIGSTOP");
