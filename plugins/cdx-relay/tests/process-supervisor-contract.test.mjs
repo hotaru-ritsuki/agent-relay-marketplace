@@ -190,6 +190,31 @@ test("kill is idempotent and records requested versus observed signal", async ()
   assert.equal(result.supervisor.observedSignal, "SIGKILL");
 });
 
+test("a first backend stop refusal returns false and latches supervisor health", async () => {
+  const supervisor = createFakeSupervisor({
+    launch(spec, context) {
+      return {
+        ...context.createFakeLaunch({
+          spec,
+          root: new Promise(() => {}),
+          cleanup: { level: "registered-drained" }
+        }),
+        kill() {
+          return { backend: "fake", stopped: false };
+        }
+      };
+    }
+  });
+  const child = await supervisor.spawnTracked({ command: "tool", args: [] });
+  child.completion.catch(() => {});
+
+  assert.equal(child.kill("SIGTERM"), false);
+  assert.throws(
+    () => supervisor.assertHealthy(),
+    (error) => error.code === "PROTOCOL_INVALID_MESSAGE"
+  );
+});
+
 test("concurrent cleanupAll calls share one operation", async () => {
   let cleanupCalls = 0;
   const supervisor = createFakeSupervisor({

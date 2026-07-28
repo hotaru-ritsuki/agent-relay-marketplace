@@ -23,7 +23,7 @@ repository provides the compatible Codex relay plugin and its runtime policy.
 
 - **ChatGPT subscription (incl. Free) or OpenAI API key.**
   - Usage will contribute to your Codex usage limits. [Learn more](https://developers.openai.com/codex/pricing).
-- **Node.js 18.18 or later**
+- **Node.js 20 or later**
 
 ### Test process-supervision capabilities
 

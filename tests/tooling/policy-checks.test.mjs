@@ -52,6 +52,44 @@ test("default policy targets skip absent planned plugin directories", () => {
   assert.deepEqual(existingDirectories([cdxRelay, cursorRelay]), [cdxRelay]);
 });
 
+test("default policy targets fail closed for an existing regular file", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "relay-policy-targets-"));
+  fixtureRoots.add(root);
+  const fileTarget = path.join(root, "cursor-relay");
+  fs.writeFileSync(fileTarget, "");
+
+  assert.throws(
+    () => existingDirectories([fileTarget]),
+    /policy target exists but is not a directory/i,
+  );
+});
+
+test("default policy targets fail closed for a symlink to a regular file", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "relay-policy-targets-"));
+  fixtureRoots.add(root);
+  const fileTarget = path.join(root, "cursor-relay-file");
+  const linkTarget = path.join(root, "cursor-relay");
+  fs.writeFileSync(fileTarget, "");
+  fs.symlinkSync(fileTarget, linkTarget, "file");
+
+  assert.throws(
+    () => existingDirectories([linkTarget]),
+    /policy target exists but is not a directory/i,
+  );
+});
+
+test("default policy targets fail closed for a broken link", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "relay-policy-targets-"));
+  fixtureRoots.add(root);
+  const linkTarget = path.join(root, "cursor-relay");
+  fs.symlinkSync("missing-target", linkTarget);
+
+  assert.throws(
+    () => existingDirectories([linkTarget]),
+    /policy target exists but is not a directory/i,
+  );
+});
+
 test("default policy targets include and scan a future plugin once it exists", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "relay-policy-targets-"));
   fixtureRoots.add(root);

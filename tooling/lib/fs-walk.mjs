@@ -2,9 +2,15 @@ import fs from "node:fs";
 import path from "node:path";
 
 export function existingDirectories(candidates) {
-  return candidates.filter((candidate) =>
-    fs.statSync(candidate, { throwIfNoEntry: false })?.isDirectory() === true
-  );
+  return candidates.filter((candidate) => {
+    const target = fs.statSync(candidate, { throwIfNoEntry: false });
+    if (target?.isDirectory()) return true;
+    if (target === undefined &&
+        fs.lstatSync(candidate, { throwIfNoEntry: false }) === undefined) {
+      return false;
+    }
+    throw new TypeError(`Policy target exists but is not a directory: ${candidate}`);
+  });
 }
 
 export function listFiles(rootDir) {
