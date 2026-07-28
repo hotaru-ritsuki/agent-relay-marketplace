@@ -7,6 +7,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { checkPluginIsolation } from "../../tooling/check-plugin-isolation.mjs";
 import { checkForbiddenFlags } from "../../tooling/check-forbidden-flags.mjs";
+import { existingDirectories } from "../../tooling/lib/fs-walk.mjs";
 
 const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ISOLATION_CLI = path.resolve(TEST_DIR, "../../tooling/check-plugin-isolation.mjs");
@@ -40,6 +41,32 @@ function writeFixtureFile(root, relative, source) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, source);
 }
+
+test("default policy targets skip absent planned plugin directories", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "relay-policy-targets-"));
+  fixtureRoots.add(root);
+  const cdxRelay = path.join(root, "cdx-relay");
+  const cursorRelay = path.join(root, "cursor-relay");
+  fs.mkdirSync(cdxRelay);
+
+  assert.deepEqual(existingDirectories([cdxRelay, cursorRelay]), [cdxRelay]);
+});
+
+test("default policy targets include and scan a future plugin once it exists", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "relay-policy-targets-"));
+  fixtureRoots.add(root);
+  const cdxRelay = path.join(root, "cdx-relay");
+  const cursorRelay = path.join(root, "cursor-relay");
+  fs.mkdirSync(cdxRelay);
+  writeFixtureFile(cursorRelay, "scripts/runtime.mjs", 'const defaults = ["--force"];');
+
+  const targets = existingDirectories([cdxRelay, cursorRelay]);
+  assert.deepEqual(targets, [cdxRelay, cursorRelay]);
+  assert.deepEqual(
+    targets.flatMap(checkForbiddenFlags).map(({ message }) => message),
+    ["unsafe defaults present: --force"],
+  );
+});
 
 test("isolation rejects imports that leave the plugin", () => {
   const violations = checkPluginIsolation(fixture('import "../../contracts/runtime.mjs";'));

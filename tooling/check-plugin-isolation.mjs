@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
-import { listFiles } from "./lib/fs-walk.mjs";
+import { existingDirectories, listFiles } from "./lib/fs-walk.mjs";
 import { isDirectInvocation } from "./sync-contracts.mjs";
 
 function moduleSpecifierText(node) {
@@ -114,7 +114,11 @@ if (isDirectInvocation({ moduleUrl: import.meta.url })) {
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   const pluginDirs = process.argv.length > 2
     ? process.argv.slice(2)
-    : ["cdx-relay", "cursor-relay"].map((name) => path.join(root, "plugins", name));
+    : existingDirectories(
+        ["cdx-relay", "cursor-relay"].map((name) =>
+          path.join(root, "plugins", name)
+        )
+      );
   const violations = pluginDirs.flatMap(checkPluginIsolation);
 
   if (violations.length) {
