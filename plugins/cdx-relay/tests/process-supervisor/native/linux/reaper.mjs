@@ -167,6 +167,7 @@ export function createAtomicReaperRegistry(registryPath, {
   const authenticate = (entry) => createHmac("sha256", authenticationKey)
     .update(canonicalJson(entry))
     .digest("hex");
+  const pendingWrites = new Map();
   const assertDirectory = async () => {
     await fs.mkdir(registryPath, { recursive: true, mode: 0o700 });
     const stat = await fs.lstat(registryPath);
@@ -255,17 +256,28 @@ export function createAtomicReaperRegistry(registryPath, {
       );
       const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
       const stored = { ...entry, authentication: authenticate(entry) };
+      const previous = pendingWrites.get(target) ?? Promise.resolve();
+      const operation = previous.catch(() => {}).then(async () => {
+        try {
+          await fs.writeFile(temporary, JSON.stringify(stored), {
+            encoding: "utf8",
+            mode: 0o600,
+            flag: "wx"
+          });
+          if (enforcePosixMetadata) await fs.chmod(temporary, 0o600);
+          await fs.rename(temporary, target);
+          if (enforcePosixMetadata) await fs.chmod(target, 0o600);
+        } finally {
+          await fs.rm(temporary, { force: true });
+        }
+      });
+      pendingWrites.set(target, operation);
       try {
-        await fs.writeFile(temporary, JSON.stringify(stored), {
-          encoding: "utf8",
-          mode: 0o600,
-          flag: "wx"
-        });
-        if (enforcePosixMetadata) await fs.chmod(temporary, 0o600);
-        await fs.rename(temporary, target);
-        if (enforcePosixMetadata) await fs.chmod(target, 0o600);
+        await operation;
       } finally {
-        await fs.rm(temporary, { force: true });
+        if (pendingWrites.get(target) === operation) {
+          pendingWrites.delete(target);
+        }
       }
     }
   };
