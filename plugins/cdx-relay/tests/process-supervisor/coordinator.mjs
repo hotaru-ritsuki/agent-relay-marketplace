@@ -159,6 +159,13 @@ function validateSpec(spec) {
       `maxBuffer must be an integer between 0 and ${MAX_FRAME_BYTES}.`
     );
   }
+  if (spec.timeout !== undefined &&
+      (!Number.isSafeInteger(spec.timeout) || spec.timeout < 0)) {
+    throw new SupervisorInfrastructureError(
+      "INVALID_LAUNCH_SPEC",
+      "timeout must be a non-negative integer."
+    );
+  }
   return { ...spec, shell: false };
 }
 
@@ -255,6 +262,10 @@ export function createProcessSupervisor({
       throw latch(error, "CAPABILITY_PROBE_FAILED");
     }
   })();
+  // Capability refusal is consumed by the first public operation or explicit
+  // capabilities await; importing the shared facade alone must not create an
+  // unhandled rejection.
+  void capabilities.catch(() => {});
 
   function assertCanLaunch() {
     if (shutdownStarted) {
@@ -281,9 +292,8 @@ export function createProcessSupervisor({
       backend: capabilitiesValue,
       cleanup,
       requestedSignal: identity.requestedSignal ?? null,
-      terminationCause: identity.requestedSignal
-        ? "requested-signal"
-        : "root-exit"
+      terminationCause: identity.terminationCause ??
+        (identity.requestedSignal ? "requested-signal" : "root-exit")
     });
     assertCleanupProven(result, minimumGuarantee);
     if (root.error) {
@@ -384,6 +394,7 @@ export function createProcessSupervisor({
     }
     const lease = {
       ...identity,
+      spec,
       launch: launched,
       requestedSignal: null
     };
@@ -393,10 +404,22 @@ export function createProcessSupervisor({
 
   async function settleLease(lease, completedRoot) {
     let root;
+    let rootError;
     try {
-      root = completedRoot ?? await lease.launch.root;
-      root = validateRoot(envelope("root", lease, root), lease);
+      try {
+        root = completedRoot ?? await lease.launch.root;
+        root = validateRoot(envelope("root", lease, root), lease);
+      } catch (error) {
+        rootError = error;
+      }
       const cleanup = await cleanupLease(lease);
+      if (rootError) throw rootError;
+      if (typeof lease.launch.finalizeRoot === "function") {
+        root = validateRoot(
+          envelope("root", lease, lease.launch.finalizeRoot(root)),
+          lease
+        );
+      }
       return validateTerminal(
         lease,
         root,
@@ -462,6 +485,7 @@ export function createProcessSupervisor({
     const lease = await launch(inputSpec);
     const child = new EventEmitter();
     child.pid = lease.launch.pid ?? lease.launch.child?.pid;
+    child.stdin = lease.launch.stdin ?? lease.launch.child?.stdin ?? null;
     child.stdout = lease.launch.stdout ?? lease.launch.child?.stdout ?? null;
     child.stderr = lease.launch.stderr ?? lease.launch.child?.stderr ?? null;
     child.exitCode = null;
@@ -480,12 +504,13 @@ export function createProcessSupervisor({
     };
     let killRequested = false;
     const rawKill = lease.launch.kill ?? lease.launch.child?.kill;
-    child.kill = (signal = "SIGTERM") => {
+    const requestCancellation = (signal = "SIGTERM", cause = "requested-signal") => {
       if (killRequested || child.exitCode !== null || child.signalCode !== null) {
         return false;
       }
       killRequested = true;
       lease.requestedSignal = signal;
+      lease.terminationCause = cause;
       try {
         const stopped = rawKill?.call(
           lease.launch.child ?? lease.launch,
@@ -498,6 +523,14 @@ export function createProcessSupervisor({
         return false;
       }
     };
+    child.kill = (signal = "SIGTERM") =>
+      requestCancellation(signal, "requested-signal");
+    let timeoutTimer;
+    if (lease.spec.timeout > 0) {
+      timeoutTimer = setTimeout(() => {
+        requestCancellation("SIGTERM", "timeout");
+      }, lease.spec.timeout);
+    }
 
     let resolveCompletion;
     let rejectCompletion;
@@ -506,8 +539,9 @@ export function createProcessSupervisor({
       rejectCompletion = reject;
     });
     void (async () => {
+      let rawRoot;
       try {
-        const rawRoot = await lease.launch.root;
+        rawRoot = await lease.launch.root;
         const root = validateRoot(envelope("root", lease, rawRoot), lease);
         child.exitCode = root.status;
         child.signalCode = root.signal;
@@ -517,10 +551,20 @@ export function createProcessSupervisor({
         queueMicrotask(() =>
           child.emit("close", child.exitCode, child.signalCode));
       } catch (error) {
-        const normalized = latch(error, "TRANSPORT_FAILED");
+        let terminalError = error;
+        if (leases.has(lease.runId)) {
+          try {
+            await settleLease(lease, rawRoot);
+          } catch (settlementError) {
+            terminalError = settlementError;
+          }
+        }
+        const normalized = latch(terminalError, "TRANSPORT_FAILED");
         rejectCompletion(normalized);
         queueMicrotask(() =>
           child.emit("close", child.exitCode, child.signalCode));
+      } finally {
+        clearTimeout(timeoutTimer);
       }
     })();
     return child;

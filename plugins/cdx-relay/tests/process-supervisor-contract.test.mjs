@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 
 import {
   MAX_FRAME_BYTES,
@@ -190,6 +191,111 @@ test("kill is idempotent and records requested versus observed signal", async ()
   assert.equal(result.supervisor.observedSignal, "SIGKILL");
 });
 
+test("spawnTracked exposes the backend writable stdin", async () => {
+  const stdin = new PassThrough();
+  const supervisor = createFakeSupervisor({
+    launch(_spec, context) {
+      return {
+        ...context.createFakeLaunch({
+          root: {
+            status: 0,
+            signal: null,
+            stdout: Buffer.alloc(0),
+            stderr: Buffer.alloc(0)
+          },
+          cleanup: { level: "registered-drained" }
+        }),
+        stdin
+      };
+    }
+  });
+  const child = await supervisor.spawnTracked({ command: "tool", args: [] });
+
+  assert.equal(child.stdin, stdin);
+  child.stdin.end("payload");
+  await child.completion;
+});
+
+test("spawnTracked timeout requests bounded cancellation and reports timeout cause", async () => {
+  let resolveRoot;
+  const root = new Promise((resolve) => {
+    resolveRoot = resolve;
+  });
+  const signals = [];
+  const supervisor = createFakeSupervisor({
+    launch(_spec, context) {
+      return {
+        pid: 19,
+        root,
+        cleanup: {
+          backend: "fake",
+          level: "registered-drained"
+        },
+        kill(signal) {
+          signals.push(signal);
+          resolveRoot({
+            backend: "fake",
+            status: null,
+            signal
+          });
+          return { backend: "fake", stopped: true };
+        }
+      };
+    }
+  });
+  const child = await supervisor.spawnTracked({
+    command: "tool",
+    args: [],
+    timeout: 10
+  });
+  const result = await child.completion;
+
+  assert.deepEqual(signals, ["SIGTERM"]);
+  assert.equal(result.signal, "SIGTERM");
+  assert.equal(result.supervisor.requestedSignal, "SIGTERM");
+  assert.equal(result.supervisor.terminationCause, "timeout");
+});
+
+test("explicit cancellation wins its race with timeout without a second stop", async () => {
+  let resolveRoot;
+  const root = new Promise((resolve) => {
+    resolveRoot = resolve;
+  });
+  const signals = [];
+  const supervisor = createFakeSupervisor({
+    launch() {
+      return {
+        pid: 20,
+        root,
+        cleanup: {
+          backend: "fake",
+          level: "registered-drained"
+        },
+        kill(signal) {
+          signals.push(signal);
+          resolveRoot({
+            backend: "fake",
+            status: null,
+            signal
+          });
+          return { backend: "fake", stopped: true };
+        }
+      };
+    }
+  });
+  const child = await supervisor.spawnTracked({
+    command: "tool",
+    args: [],
+    timeout: 25
+  });
+  assert.equal(child.kill("SIGINT"), true);
+  const result = await child.completion;
+  await new Promise((resolve) => setTimeout(resolve, 35));
+
+  assert.deepEqual(signals, ["SIGINT"]);
+  assert.equal(result.supervisor.terminationCause, "requested-signal");
+});
+
 test("a first backend stop refusal returns false and latches supervisor health", async () => {
   const supervisor = createFakeSupervisor({
     launch(spec, context) {
@@ -314,6 +420,37 @@ test("root errors reject completion with a structured result and latch", async (
     () => supervisor.assertHealthy(),
     (error) => error.code === "ROOT_PROCESS_ERROR"
   );
+});
+
+test("root transport failure still awaits cleanup proof before rejecting completion", async () => {
+  let cleaned = false;
+  const rootFailure = new SupervisorInfrastructureError(
+    "PROTOCOL_LOST",
+    "root channel failed"
+  );
+  const supervisor = createFakeSupervisor({
+    launch() {
+      return {
+        pid: 23,
+        root: Promise.reject(rootFailure),
+        async cleanup() {
+          await new Promise((resolve) => setImmediate(resolve));
+          cleaned = true;
+          return {
+            backend: "fake",
+            level: "registered-drained"
+          };
+        }
+      };
+    }
+  });
+  const child = await supervisor.spawnTracked({ command: "tool", args: [] });
+
+  await assert.rejects(
+    child.completion,
+    (error) => error.code === "PROTOCOL_LOST"
+  );
+  assert.equal(cleaned, true);
 });
 
 test("spawnTracked always returns a coordinator-owned facade", async () => {

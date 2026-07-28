@@ -28,24 +28,42 @@ if (typeof target.command !== "string" || !target.command ||
 
 const socket = net.createConnection({ path: token.endpoint.slice("unix:".length) });
 socket.setEncoding("utf8");
+let pending = "";
+const frames = [];
+let resolveFrame;
+const nextFrame = () => frames.length > 0
+  ? Promise.resolve(frames.shift())
+  : new Promise((resolve) => {
+      resolveFrame = resolve;
+    });
+socket.on("data", (chunk) => {
+  pending += chunk;
+  if (Buffer.byteLength(pending) > 1024 * 1024) {
+    socket.destroy(new Error("Supervisor frame exceeds 1048576 bytes."));
+    return;
+  }
+  for (;;) {
+    const newline = pending.indexOf("\n");
+    if (newline < 0) break;
+    const raw = pending.slice(0, newline);
+    pending = pending.slice(newline + 1);
+    const frame = JSON.parse(raw);
+    if (resolveFrame) {
+      const resolve = resolveFrame;
+      resolveFrame = undefined;
+      resolve(frame);
+    } else {
+      frames.push(frame);
+    }
+  }
+});
 await new Promise((resolve, reject) => {
-  let pending = "";
   const timer = setTimeout(() => {
     socket.destroy();
     reject(new Error("Supervisor release deadline expired."));
   }, 5000);
   socket.once("error", reject);
-  socket.on("data", (chunk) => {
-    pending += chunk;
-    if (Buffer.byteLength(pending) > 1024 * 1024) {
-      clearTimeout(timer);
-      reject(new Error("Supervisor release frame exceeds 1048576 bytes."));
-      socket.destroy();
-      return;
-    }
-    const newline = pending.indexOf("\n");
-    if (newline < 0) return;
-    const message = JSON.parse(pending.slice(0, newline));
+  nextFrame().then((message) => {
     if (message.type !== "release" || message.version !== 1) {
       clearTimeout(timer);
       reject(new Error("Invalid supervisor release."));
@@ -54,7 +72,7 @@ await new Promise((resolve, reject) => {
     socket.off("error", reject);
     clearTimeout(timer);
     resolve();
-  });
+  }, reject);
   socket.write(`${JSON.stringify({
     type: "hello",
     version: 1,
@@ -66,6 +84,7 @@ await new Promise((resolve, reject) => {
     parentPid: process.ppid
   })}\n`);
 });
+socket.on("error", () => {});
 
 const child = spawn(target.command, target.args, {
   cwd: process.cwd(),
@@ -76,6 +95,27 @@ const child = spawn(target.command, target.args, {
 process.stdin.pipe(child.stdin);
 child.stdout.pipe(process.stdout);
 child.stderr.pipe(process.stderr);
+let escalationTimer;
+void (async () => {
+  for (;;) {
+    const message = await nextFrame();
+    if (message.type !== "stop" ||
+        message.version !== 1 ||
+        message.epoch !== token.epoch ||
+        message.runId !== token.runId ||
+        message.nonce !== token.nonce ||
+        message.backend !== "posix-cooperative" ||
+        typeof message.signal !== "string" ||
+        !message.signal) {
+      throw new Error("Invalid authenticated supervisor stop frame.");
+    }
+    child.kill(message.signal);
+    if (message.signal !== "SIGKILL") {
+      escalationTimer = setTimeout(() => child.kill("SIGKILL"), 1000);
+    }
+    return;
+  }
+})().catch((error) => socket.destroy(error));
 
 const [status, signal, rootError] = await new Promise((resolve) => {
   child.once("error", (error) => resolve([
@@ -86,6 +126,7 @@ const [status, signal, rootError] = await new Promise((resolve) => {
   child.once("exit", (exitStatus, exitSignal) =>
     resolve([exitStatus, exitSignal, undefined]));
 });
+clearTimeout(escalationTimer);
 await new Promise((resolve, reject) => {
   socket.once("error", reject);
   socket.write(`${JSON.stringify({

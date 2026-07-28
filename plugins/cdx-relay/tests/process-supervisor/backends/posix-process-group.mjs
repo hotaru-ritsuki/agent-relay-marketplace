@@ -4,6 +4,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import { SupervisorInfrastructureError } from "../errors.mjs";
@@ -110,13 +111,32 @@ function endpointPath(endpoint) {
 
 export async function createNetRegistrationChannel(handlers, {
   handshakeMs = 5000,
-  socketPath = path.join(
-    os.tmpdir(),
-    `cdx-relay-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`
-  )
+  socketPath,
+  temporaryRoot = os.tmpdir()
 } = {}) {
+  let privateDirectory = null;
+  if (!socketPath) {
+    try {
+      privateDirectory = await fs.mkdtemp(path.join(temporaryRoot, "cdx-relay-"));
+      await fs.chmod(privateDirectory, 0o700);
+      const metadata = await fs.stat(privateDirectory);
+      if (!metadata.isDirectory() || (metadata.mode & 0o077) !== 0) {
+        throw fail(
+          "CONTROL_CHANNEL_PERMISSIONS",
+          "The POSIX control directory is not private."
+        );
+      }
+      socketPath = path.join(privateDirectory, "control.sock");
+    } catch (error) {
+      if (privateDirectory) {
+        await fs.rm(privateDirectory, { recursive: true, force: true });
+      }
+      throw error;
+    }
+  }
   let closing = false;
   const sockets = new Set();
+  const socketsByPid = new Map();
   const server = net.createServer((socket) => {
     sockets.add(socket);
     let pending = "";
@@ -147,6 +167,7 @@ export async function createNetRegistrationChannel(handlers, {
           if (message.type === "hello") {
             await handlers.hello(message);
             registeredPid = message.pid;
+            socketsByPid.set(message.pid, socket);
             clearTimeout(handshakeTimer);
             socket.write(`${JSON.stringify({ type: "release", version: 1 })}\n`);
           } else if (message.type === "root") {
@@ -162,31 +183,85 @@ export async function createNetRegistrationChannel(handlers, {
     socket.on("close", () => {
       clearTimeout(handshakeTimer);
       sockets.delete(socket);
+      if (registeredPid !== null && socketsByPid.get(registeredPid) === socket) {
+        socketsByPid.delete(registeredPid);
+      }
       if (registeredPid !== null) {
         void handlers.closed(registeredPid).catch(handlers.lost);
       }
     });
     socket.on("error", (error) => {
-      if (!closing) handlers.lost(error);
+      if (!closing && registeredPid !== null) handlers.lost(error);
     });
   });
   server.on("error", (error) => {
     if (!closing) handlers.lost(error);
   });
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(socketPath, () => {
-      server.off("error", reject);
-      resolve();
+  try {
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(socketPath, () => {
+        server.off("error", reject);
+        resolve();
+      });
     });
-  });
+  } catch (error) {
+    closing = true;
+    if (server.listening) {
+      await new Promise((resolve) => server.close(resolve));
+    }
+    if (privateDirectory) {
+      await fs.rm(privateDirectory, { recursive: true, force: true });
+    }
+    throw error;
+  }
+  if (privateDirectory) {
+    try {
+      await fs.chmod(socketPath, 0o600);
+      const metadata = await fs.stat(socketPath);
+      if (!metadata.isSocket() || (metadata.mode & 0o077) !== 0) {
+        throw fail(
+          "CONTROL_CHANNEL_PERMISSIONS",
+          "The POSIX control socket is not private."
+        );
+      }
+    } catch (error) {
+      closing = true;
+      await new Promise((resolve) => server.close(resolve));
+      await fs.rm(privateDirectory, { recursive: true, force: true });
+      throw error;
+    }
+  }
   return {
     endpoint: `unix:${socketPath}`,
+    async send(pid, message) {
+      const deadline = Date.now() + handshakeMs;
+      let socket = socketsByPid.get(pid);
+      while ((!socket || socket.destroyed) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        socket = socketsByPid.get(pid);
+      }
+      if (!socket || socket.destroyed) {
+        throw fail(
+          "PROTOCOL_LOST",
+          "The authenticated root control channel is unavailable."
+        );
+      }
+      await new Promise((resolve, reject) => {
+        socket.write(`${JSON.stringify(message)}\n`, (error) =>
+          error ? reject(error) : resolve());
+      });
+    },
     async close() {
       closing = true;
       for (const socket of sockets) socket.destroy();
-      await new Promise((resolve) => server.close(resolve));
+      if (server.listening) {
+        await new Promise((resolve) => server.close(resolve));
+      }
       await fs.rm(socketPath, { force: true });
+      if (privateDirectory) {
+        await fs.rm(privateDirectory, { recursive: true, force: true });
+      }
     }
   };
 }
@@ -232,6 +307,28 @@ export function createPosixProcessGroupBackend({
       );
     }
     return actual;
+  };
+
+  const waitForBlockedShimExit = async (child) => {
+    if (!child ||
+        (child.exitCode !== null && child.exitCode !== undefined) ||
+        (child.signalCode !== null && child.signalCode !== undefined)) {
+      return;
+    }
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(fail(
+          "CLEANUP_UNPROVEN",
+          "The blocked launch shim did not exit after its private channel closed."
+        ));
+      }, handshakeMs);
+      const settled = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      child.once?.("exit", settled);
+      child.once?.("error", settled);
+    });
   };
 
   async function signalGroup(lease, signal) {
@@ -327,47 +424,49 @@ export function createPosixProcessGroupBackend({
   async function cleanupLease(lease) {
     if (lease.cleanupPromise) return lease.cleanupPromise;
     lease.cleanupPromise = (async () => {
-      const waitForDrain = injectedWaitForDrain ?? defaultWaitForDrain;
-      const termSent = await signalGroup(lease, "SIGTERM");
-      let drained = !termSent || await waitForDrain({
-          lease,
-          deadline: now() + graceMs,
-          phase: "grace"
-        });
-      if (!drained) {
-        const killSent = await signalGroup(lease, "SIGKILL");
-        drained = !killSent || await waitForDrain({
+      try {
+        const waitForDrain = injectedWaitForDrain ?? defaultWaitForDrain;
+        const termSent = await signalGroup(lease, "SIGTERM");
+        let drained = !termSent || await waitForDrain({
             lease,
-            deadline: now() + forceMs,
-            phase: "force"
+            deadline: now() + graceMs,
+            phase: "grace"
           });
-      }
-      if (!drained) {
-        if (protocolFailure) throw protocolFailure;
-        for (const [pid, registered] of lease.registry) {
-          await inspectOwned(registered);
-          try {
-            killProcess(pid, "SIGKILL");
-          } catch (error) {
-            if (error?.code !== "ESRCH") throw error;
+        if (!drained) {
+          const killSent = await signalGroup(lease, "SIGKILL");
+          drained = !killSent || await waitForDrain({
+              lease,
+              deadline: now() + forceMs,
+              phase: "force"
+            });
+        }
+        if (!drained) {
+          for (const [pid, registered] of lease.registry) {
+            await inspectOwned(registered);
+            try {
+              killProcess(pid, "SIGKILL");
+            } catch (error) {
+              if (error?.code !== "ESRCH") throw error;
+            }
           }
         }
+        if (!await pollForVerifiedDrain(lease, now() + forceMs)) {
+          throw fail(
+            "CLEANUP_UNPROVEN",
+            "Owned POSIX processes remain after bounded escalation."
+          );
+        }
+        if (protocolFailure) throw protocolFailure;
+        assertHealthy();
+        return {
+          backend: BACKEND,
+          level: "registered-drained",
+          registered: lease.registry.size
+        };
+      } finally {
+        await lease.channel.close();
+        leases.delete(lease.runId);
       }
-      if (protocolFailure) throw protocolFailure;
-      if (!await pollForVerifiedDrain(lease, now() + forceMs)) {
-        throw fail(
-          "CLEANUP_UNPROVEN",
-          "Owned POSIX processes remain after bounded escalation."
-        );
-      }
-      assertHealthy();
-      await lease.channel.close();
-      leases.delete(lease.runId);
-      return {
-        backend: BACKEND,
-        level: "registered-drained",
-        registered: lease.registry.size
-      };
     })();
     return lease.cleanupPromise;
   }
@@ -395,7 +494,12 @@ export function createPosixProcessGroupBackend({
       rootIdentity: null,
       rootGone: false,
       cleanupPromise: null,
-      channel: null
+      channel: null,
+      outputFailure: null,
+      stdoutChunks: [],
+      stderrChunks: [],
+      capturedBytes: 0,
+      stopRequested: false
     };
     const expected = {
       epoch: spec.epoch,
@@ -433,14 +537,19 @@ export function createPosixProcessGroupBackend({
         rootAuthenticated = true;
         rootSettled = true;
         clearTimeout(terminalFrameTimer);
-        resolveRoot({
+        const completed = {
           backend: BACKEND,
           status: message.status ?? null,
           signal: message.signal ?? null,
-          stdout: message.stdout,
-          stderr: message.stderr,
+          stdout: Buffer.concat(lease.stdoutChunks),
+          stderr: Buffer.concat(lease.stderrChunks),
           error: message.error
-        });
+        };
+        if (lease.outputFailure) {
+          rejectRoot(lease.outputFailure);
+        } else {
+          resolveRoot(completed);
+        }
       },
       async closed(pid) {
         const registered = registry.get(pid);
@@ -468,6 +577,7 @@ export function createPosixProcessGroupBackend({
         rejectRoot(protocolFailure);
       }
     }, { handshakeMs });
+    leases.set(spec.runId, lease);
     const token = encodeSupervisorToken({
       version: PROTOCOL_VERSION,
       epoch: spec.epoch,
@@ -479,60 +589,151 @@ export function createPosixProcessGroupBackend({
       command: spec.command,
       args: spec.args ?? []
     })).toString("base64url");
-    const child = spawn(process.execPath, [shimPath, target], {
-      cwd: spec.cwd,
-      env: { ...(spec.env ?? process.env), [TOKEN_ENV]: token },
-      detached: true,
-      shell: false,
-      stdio: spec.stdio ?? ["pipe", "pipe", "pipe"],
-      windowsHide: spec.windowsHide
-    });
-    lease.rootPid = child.pid;
-    lease.rootIdentity = await inspectProcess(child.pid);
-    if (!lease.rootIdentity) {
-      await lease.channel.close();
-      throw fail("PROCESS_IDENTITY_UNAVAILABLE", "Root process identity is unavailable.");
-    }
-    if (lease.rootIdentity.processGroupId !== undefined &&
-        lease.rootIdentity.processGroupId !== child.pid) {
-      await lease.channel.close();
-      throw fail(
-        "PROCESS_GROUP_MISMATCH",
-        "Trusted launch shim did not become the process-group leader."
-      );
-    }
-    leases.set(spec.runId, lease);
-    child.once?.("error", (error) => {
-      protocolFailure ??= fail(
-        "PROTOCOL_LOST",
-        "Trusted launch shim failed before authenticated root completion.",
-        error
-      );
-      rejectRoot(protocolFailure);
-    });
-    child.once?.("exit", () => {
-      if (rootSettled) return;
-      terminalFrameTimer = setTimeout(() => {
-        if (rootSettled) return;
-        rootSettled = true;
+    let child;
+    try {
+      child = spawn(process.execPath, [shimPath, target], {
+        cwd: spec.cwd,
+        env: { ...(spec.env ?? process.env), [TOKEN_ENV]: token },
+        detached: true,
+        shell: false,
+        stdio: spec.stdio ?? ["pipe", "pipe", "pipe"],
+        windowsHide: spec.windowsHide
+      });
+      lease.rootPid = child.pid;
+      child.once?.("error", (error) => {
+        if (!lease.rootIdentity) {
+          lease.provisionalError = error;
+          return;
+        }
         protocolFailure ??= fail(
           "PROTOCOL_LOST",
-          "Trusted launch shim exited without an authenticated root frame."
+          "Trusted launch shim failed before authenticated root completion.",
+          error
         );
         rejectRoot(protocolFailure);
-      }, terminalFrameMs);
-      terminalFrameTimer.unref?.();
-    });
+      });
+      child.once?.("exit", () => {
+        if (rootSettled) return;
+        terminalFrameTimer = setTimeout(() => {
+          if (rootSettled) return;
+          rootSettled = true;
+          protocolFailure ??= fail(
+            "PROTOCOL_LOST",
+            "Trusted launch shim exited without an authenticated root frame."
+          );
+          rejectRoot(protocolFailure);
+        }, terminalFrameMs);
+        terminalFrameTimer.unref?.();
+      });
+      lease.rootIdentity = await inspectProcess(child.pid);
+      if (lease.provisionalError) throw lease.provisionalError;
+      if (!lease.rootIdentity) {
+        throw fail("PROCESS_IDENTITY_UNAVAILABLE", "Root process identity is unavailable.");
+      }
+      if (lease.rootIdentity.processGroupId !== undefined &&
+          lease.rootIdentity.processGroupId !== child.pid) {
+        throw fail(
+          "PROCESS_GROUP_MISMATCH",
+          "Trusted launch shim did not become the process-group leader."
+        );
+      }
+    } catch (error) {
+      if (child && lease.rootIdentity?.processGroupId === child.pid) {
+        let cleanupError;
+        try {
+          await cleanupLease(lease);
+        } catch (caught) {
+          cleanupError = caught;
+        }
+        leases.delete(spec.runId);
+        if (cleanupError) throw cleanupError;
+      } else {
+        const blockedExit = child ? waitForBlockedShimExit(child) : null;
+        await lease.channel.close();
+        if (blockedExit) await blockedExit;
+      }
+      leases.delete(spec.runId);
+      throw error;
+    }
+    const capture = (stream, chunks) => {
+      if (!stream?.on) return null;
+      const limit = spec.maxBuffer ?? MAX_FRAME_BYTES;
+      const exposed = new PassThrough({
+        highWaterMark: Math.max(1, Math.min(limit, 64 * 1024))
+      });
+      stream.on("data", (chunk) => {
+        const value = Buffer.from(chunk);
+        const remaining = Math.max(0, limit - lease.capturedBytes);
+        if (remaining > 0) {
+          const retained = value.subarray(0, remaining);
+          chunks.push(retained);
+          exposed.write(retained);
+        }
+        lease.capturedBytes += value.length;
+        if (lease.capturedBytes > limit && !lease.outputFailure) {
+          lease.outputFailure = fail(
+            "OUTPUT_LIMIT_EXCEEDED",
+            `POSIX output exceeded ${limit} bytes.`
+          );
+          rootSettled = true;
+          rejectRoot(lease.outputFailure);
+          if (rootAuthenticated) {
+            void cleanupLease(lease).catch(() => {});
+          } else {
+            void requestStop("SIGTERM");
+          }
+        }
+      });
+      stream.once?.("end", () => exposed.end());
+      stream.once?.("close", () => {
+        if (!exposed.readableEnded) exposed.end();
+      });
+      return exposed;
+    };
+    const stdout = capture(child.stdout, lease.stdoutChunks);
+    const stderr = capture(child.stderr, lease.stderrChunks);
+    if (spec.input !== undefined) {
+      child.stdin?.end(spec.input);
+    }
+    const requestStop = async (signal = "SIGTERM") => {
+      if (lease.stopRequested) return;
+      lease.stopRequested = true;
+      try {
+        await lease.channel.send(lease.rootPid, {
+          type: "stop",
+          version: PROTOCOL_VERSION,
+          ...expected,
+          signal
+        });
+      } catch (error) {
+        protocolFailure ??= fail(
+          "PROTOCOL_LOST",
+          "Authenticated cancellation could not reach the launch shim.",
+          error
+        );
+        if (!rootSettled) {
+          rootSettled = true;
+          rejectRoot(protocolFailure);
+        }
+      }
+    };
     return {
       child,
       pid: child.pid,
-      stdout: child.stdout,
-      stderr: child.stderr,
+      stdin: child.stdin,
+      stdout,
+      stderr,
       root,
+      finalizeRoot(completed) {
+        if (lease.outputFailure) throw lease.outputFailure;
+        return {
+          ...completed,
+          stdout: Buffer.concat(lease.stdoutChunks),
+          stderr: Buffer.concat(lease.stderrChunks)
+        };
+      },
       kill(signal = "SIGTERM") {
-        void cleanupLease(lease).catch((error) => {
-          protocolFailure ??= error;
-        });
+        void requestStop(signal);
         return { backend: BACKEND, stopped: true };
       },
       cleanup: () => cleanupLease(lease)
@@ -540,23 +741,35 @@ export function createPosixProcessGroupBackend({
   }
 
   async function cleanupAll() {
-    assertHealthy();
-    const recorded = await discoverRecordedProcesses();
-    for (const record of recorded) {
-      const lease = leases.get(record.runId);
-      const registered = lease?.registry.get(record.pid);
-      if (!lease ||
-          lease.epoch !== record.epoch ||
-          lease.nonce !== record.nonce ||
-          record.backend !== BACKEND ||
-          !registered) {
-        throw fail(
-          "UNREGISTERED_RECORDED_PROCESS",
-          "Recorded process state has no matching cooperative registration."
-        );
+    let validationFailure;
+    try {
+      const recorded = await discoverRecordedProcesses();
+      for (const record of recorded) {
+        const lease = leases.get(record.runId);
+        const registered = lease?.registry.get(record.pid);
+        if (!lease ||
+            lease.epoch !== record.epoch ||
+            lease.nonce !== record.nonce ||
+            record.backend !== BACKEND ||
+            !registered) {
+          throw fail(
+            "UNREGISTERED_RECORDED_PROCESS",
+            "Recorded process state has no matching cooperative registration."
+          );
+        }
       }
+    } catch (error) {
+      validationFailure = error;
     }
-    await Promise.all([...leases.values()].map(cleanupLease));
+    const cleanupResults = await Promise.allSettled(
+      [...leases.values()].map(cleanupLease)
+    );
+    if (validationFailure) throw validationFailure;
+    const rejected = cleanupResults.find((result) => result.status === "rejected");
+    if (rejected) throw rejected.reason;
+    if (protocolFailure) {
+      throw protocolFailure;
+    }
     return { backend: BACKEND, level: "registered-drained", registered: 0 };
   }
 

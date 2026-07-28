@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -14,6 +16,7 @@ import {
 } from "./process-supervisor/backends/posix-process-group.mjs";
 import { createMacosBackend } from "./process-supervisor/backends/macos.mjs";
 import {
+  createProcessSupervisor,
   inheritSupervisorEnvironment,
   registerControlledDescendant
 } from "./process-supervisor/coordinator.mjs";
@@ -88,6 +91,9 @@ function controlledBackend(overrides = {}) {
       registrationHandlers = handlers;
       return {
         endpoint: "unix:/tmp/cdx-supervisor.sock",
+        async send(pid, frame) {
+          calls.push({ type: "control", pid, frame });
+        },
         async close() {}
       };
     },
@@ -266,6 +272,85 @@ test("launch token binds version, lease identity, nonce, and registration endpoi
   );
 });
 
+test("spawn throw closes the provisional registration channel without publishing ownership", async () => {
+  let closes = 0;
+  const backend = createPosixProcessGroupBackend({
+    platform: "linux",
+    spawn() {
+      throw Object.assign(new Error("spawn failed"), { code: "EACCES" });
+    },
+    async createRegistrationChannel() {
+      return {
+        endpoint: "unix:/tmp/cdx-provisional-spawn.sock",
+        async close() {
+          closes += 1;
+        }
+      };
+    }
+  });
+
+  await assert.rejects(
+    backend.launch({
+      ...identity,
+      command: "/missing",
+      args: [],
+      env: {},
+      shell: false
+    }),
+    { code: "EACCES" }
+  );
+  assert.equal(closes, 1);
+  assert.deepEqual(await backend.cleanupAll(), {
+    backend: "posix-cooperative",
+    level: "registered-drained",
+    registered: 0
+  });
+});
+
+test("post-spawn identity failure closes the blocked shim channel and awaits its exit", async () => {
+  let closes = 0;
+  let exited = false;
+  const child = new EventEmitter();
+  child.pid = 4312;
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  const backend = createPosixProcessGroupBackend({
+    platform: "linux",
+    spawn() {
+      return child;
+    },
+    async createRegistrationChannel() {
+      return {
+        endpoint: "unix:/tmp/cdx-provisional-identity.sock",
+        async close() {
+          closes += 1;
+          queueMicrotask(() => {
+            exited = true;
+            child.emit("exit", 1, null);
+          });
+        }
+      };
+    },
+    async inspectProcess() {
+      return null;
+    },
+    handshakeMs: 50
+  });
+
+  await assert.rejects(
+    backend.launch({
+      ...identity,
+      command: "/usr/bin/true",
+      args: [],
+      env: {},
+      shell: false
+    }),
+    (error) => error.code === "PROCESS_IDENTITY_UNAVAILABLE"
+  );
+  assert.equal(closes, 1);
+  assert.equal(exited, true);
+});
+
 test("root completion does not wait for descendant-held stdout to close", async () => {
   const fixture = controlledBackend();
   const launched = await fixture.backend.launch({
@@ -291,8 +376,8 @@ test("root completion does not wait for descendant-held stdout to close", async 
     backend: "posix-cooperative",
     status: 0,
     signal: null,
-    stdout: undefined,
-    stderr: undefined,
+    stdout: Buffer.alloc(0),
+    stderr: Buffer.alloc(0),
     error: undefined
   });
 });
@@ -428,7 +513,20 @@ test("identity mismatch fails closed before individual fallback termination", as
 });
 
 test("lost registration channel rejects cleanup proof with PROTOCOL_LOST", async () => {
-  const fixture = controlledBackend();
+  let alive = true;
+  const fixture = controlledBackend({
+    async inspectProcess(pid) {
+      return alive
+        ? { pid, startTime: "100", executable: "/usr/bin/node" }
+        : null;
+    },
+    killGroup() {
+      alive = false;
+    },
+    async waitForDrain() {
+      return true;
+    }
+  });
   const launched = await fixture.backend.launch({
     ...identity,
     command: "/usr/bin/true",
@@ -442,6 +540,41 @@ test("lost registration channel rejects cleanup proof with PROTOCOL_LOST", async
     launched.cleanup(),
     (error) => error.code === "PROTOCOL_LOST"
   );
+});
+
+test("cleanupAll still drains owned groups after protocol health is lost", async () => {
+  let alive = true;
+  const signals = [];
+  const fixture = controlledBackend({
+    async inspectProcess(pid) {
+      return alive
+        ? { pid, startTime: "100", executable: "/usr/bin/node" }
+        : null;
+    },
+    killGroup(pid, signal) {
+      signals.push({ pid, signal });
+      alive = false;
+    },
+    async waitForDrain() {
+      return true;
+    }
+  });
+  await fixture.backend.launch({
+    ...identity,
+    command: "/usr/bin/true",
+    args: [],
+    env: {},
+    shell: false
+  });
+  fixture.handlers().lost(new Error("socket closed"));
+
+  await assert.rejects(
+    fixture.backend.cleanupAll(),
+    (error) => error.code === "PROTOCOL_LOST"
+  );
+  assert.deepEqual(signals, [
+    { pid: 4312, signal: "SIGTERM" }
+  ]);
 });
 
 test("unregistered recorded state rejects with UNREGISTERED_RECORDED_PROCESS", async () => {
@@ -627,7 +760,20 @@ test("controlled child spawn environment preserves the supervisor token", () => 
 });
 
 test("clean registration close while the process is live latches PROTOCOL_LOST", async () => {
-  const fixture = controlledBackend();
+  let alive = true;
+  const fixture = controlledBackend({
+    async inspectProcess(pid) {
+      return alive
+        ? { pid, startTime: pid === 4312 ? "100" : "200", executable: "/usr/bin/node" }
+        : null;
+    },
+    killGroup() {
+      alive = false;
+    },
+    async waitForDrain() {
+      return true;
+    }
+  });
   const launched = await fixture.backend.launch({
     ...identity,
     command: "/usr/bin/true",
@@ -671,7 +817,7 @@ test("cleanup refuses registered-drained while identities remain alive after esc
   );
 });
 
-test("public kill routes through process-group cleanup instead of raw child kill", async () => {
+test("public kill routes through authenticated control instead of raw child or PID kill", async () => {
   const fixture = controlledBackend();
   let rawKills = 0;
   fixture.child.kill = () => {
@@ -694,10 +840,266 @@ test("public kill routes through process-group cleanup instead of raw child kill
     stopped: true
   });
   assert.equal(rawKills, 0);
-  assert.equal(
-    fixture.calls.some((call) =>
-      call.type === "kill" && call.pid === 4312 && call.signal === "SIGTERM"),
-    true
+  assert.deepEqual(fixture.calls.at(-1), {
+    type: "control",
+    pid: 4312,
+    frame: {
+      type: "stop",
+      version: 1,
+      ...identity,
+      signal: "SIGTERM"
+    }
+  });
+});
+
+test("cancellation requests an authenticated root stop before owned-group cleanup", async () => {
+  const processes = new Map([[
+    4312,
+    {
+      pid: 4312,
+      processGroupId: 4312,
+      startTime: "100",
+      executable: "/usr/bin/node"
+    }
+  ]]);
+  let handlers;
+  const frames = [];
+  const child = new EventEmitter();
+  child.pid = 4312;
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  const backend = createPosixProcessGroupBackend({
+    platform: "linux",
+    spawn() {
+      return child;
+    },
+    async createRegistrationChannel(nextHandlers) {
+      handlers = nextHandlers;
+      return {
+        endpoint: "unix:/tmp/cdx-cancel.sock",
+        async send(pid, frame) {
+          frames.push({ pid, frame });
+          handlers.root({
+            type: "root",
+            version: 1,
+            ...identity,
+            status: null,
+            signal: frame.signal
+          });
+        },
+        async close() {}
+      };
+    },
+    async inspectProcess(pid) {
+      return processes.get(pid) ?? null;
+    },
+    killGroup(pid, signal) {
+      assert.equal(pid, 4312);
+      processes.clear();
+    },
+    async waitForDrain() {
+      return true;
+    }
+  });
+  const launched = await backend.launch({
+    ...identity,
+    command: "/usr/bin/node",
+    args: ["-e", "setInterval(()=>{},1000)"],
+    env: {},
+    shell: false
+  });
+
+  assert.deepEqual(launched.kill("SIGINT"), {
+    backend: "posix-cooperative",
+    stopped: true
+  });
+  assert.deepEqual(await launched.root, {
+    backend: "posix-cooperative",
+    status: null,
+    signal: "SIGINT",
+    stdout: Buffer.alloc(0),
+    stderr: Buffer.alloc(0),
+    error: undefined
+  });
+  assert.equal(frames.length, 1);
+  assert.equal(frames[0].pid, 4312);
+  assert.equal(frames[0].frame.type, "stop");
+  assert.equal(frames[0].frame.signal, "SIGINT");
+  assert.equal((await launched.cleanup()).registered, 0);
+});
+
+test("POSIX async launch writes initial input and exposes writable stdin", async () => {
+  const fixture = controlledBackend();
+  fixture.child.stdin = new PassThrough();
+  let input = Buffer.alloc(0);
+  fixture.child.stdin.on("data", (chunk) => {
+    input = Buffer.concat([input, chunk]);
+  });
+  const launched = await fixture.backend.launch({
+    ...identity,
+    command: "/usr/bin/cat",
+    args: [],
+    env: {},
+    input: "initial input",
+    shell: false
+  });
+
+  assert.equal(launched.stdin, fixture.child.stdin);
+  await new Promise((resolve) => fixture.child.stdin.once("finish", resolve));
+  assert.equal(input.toString(), "initial input");
+});
+
+test("POSIX async stdout preserves early output until the caller reads it", async () => {
+  let alive = true;
+  const fixture = controlledBackend({
+    async inspectProcess(pid) {
+      return alive
+        ? { pid, startTime: "100", executable: "/usr/bin/node" }
+        : null;
+    },
+    killGroup() {
+      alive = false;
+    },
+    async waitForDrain() {
+      return true;
+    }
+  });
+  fixture.child.stdout = new PassThrough();
+  const launched = await fixture.backend.launch({
+    ...identity,
+    command: "/usr/bin/node",
+    args: [],
+    env: {},
+    maxBuffer: 32,
+    shell: false
+  });
+  fixture.child.stdout.end("early output");
+
+  const chunks = [];
+  for await (const chunk of launched.stdout) chunks.push(chunk);
+  assert.equal(Buffer.concat(chunks).toString(), "early output");
+  assert.notEqual(launched.stdout, fixture.child.stdout);
+  await launched.cleanup();
+});
+
+for (const streamName of ["stdout", "stderr"]) {
+test(`POSIX async ${streamName} overflow is bounded, requests cancellation, and rejects root`, async () => {
+  let handlers;
+  const frames = [];
+  const child = new EventEmitter();
+  child.pid = 4312;
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  const processes = new Map([[
+    4312,
+    {
+      pid: 4312,
+      processGroupId: 4312,
+      startTime: "100",
+      executable: "/usr/bin/node"
+    }
+  ]]);
+  const backend = createPosixProcessGroupBackend({
+    platform: "linux",
+    spawn() {
+      return child;
+    },
+    async createRegistrationChannel(nextHandlers) {
+      handlers = nextHandlers;
+      return {
+        endpoint: "unix:/tmp/cdx-output.sock",
+        async send(pid, frame) {
+          frames.push({ pid, frame });
+        },
+        async close() {}
+      };
+    },
+    async inspectProcess(pid) {
+      return processes.get(pid) ?? null;
+    },
+    killGroup() {
+      processes.clear();
+    },
+    async waitForDrain() {
+      return true;
+    }
+  });
+  const launched = await backend.launch({
+    ...identity,
+    command: "/usr/bin/node",
+    args: [],
+    env: {},
+    maxBuffer: 4,
+    shell: false
+  });
+  child[streamName].write("12345");
+
+  await assert.rejects(
+    launched.root,
+    (error) => error.code === "OUTPUT_LIMIT_EXCEEDED"
+  );
+  assert.equal(frames.at(-1).frame.type, "stop");
+  assert.equal(frames.at(-1).frame.signal, "SIGTERM");
+  await launched.cleanup();
+});
+}
+
+test("live POSIX cancellation settles root and completion with truthful terminal evidence", {
+  skip: process.platform === "win32"
+}, async () => {
+  const supervisor = createProcessSupervisor({
+    platform: process.platform,
+    backendFactories: [() => createPosixProcessGroupBackend()]
+  });
+  const child = await supervisor.spawnTracked({
+    command: process.execPath,
+    args: ["-e", "setInterval(()=>{},1000)"],
+    timeout: 5000,
+    maxBuffer: 1024
+  });
+  const pid = child.pid;
+  assert.equal(child.kill("SIGINT"), true);
+  const result = await child.completion;
+
+  assert.equal(result.status, null);
+  assert.equal(result.signal, "SIGINT");
+  assert.equal(result.supervisor.requestedSignal, "SIGINT");
+  assert.equal(result.supervisor.observedSignal, "SIGINT");
+  assert.equal(result.supervisor.terminationCause, "requested-signal");
+  assert.equal(result.supervisor.cleanup.level, "registered-drained");
+  assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+  await supervisor.shutdown();
+  supervisor.assertHealthy();
+});
+
+test("live POSIX overflow failure still drains the owned group with zero survivors", {
+  skip: process.platform === "win32"
+}, async () => {
+  const supervisor = createProcessSupervisor({
+    platform: process.platform,
+    backendFactories: [() => createPosixProcessGroupBackend()]
+  });
+  const child = await supervisor.spawnTracked({
+    command: process.execPath,
+    args: ["-e", "process.stdout.write('overflow');setInterval(()=>{},1000)"],
+    timeout: 5000,
+    maxBuffer: 4
+  });
+  const pid = child.pid;
+  await assert.rejects(
+    child.completion,
+    (error) => error.code === "OUTPUT_LIMIT_EXCEEDED"
+  );
+  assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+  await assert.rejects(
+    supervisor.shutdown(),
+    (error) => error.code === "OUTPUT_LIMIT_EXCEEDED"
+  );
+  assert.throws(
+    () => supervisor.assertHealthy(),
+    (error) => error.code === "OUTPUT_LIMIT_EXCEEDED"
   );
 });
 
@@ -820,6 +1222,83 @@ test("real registration socket rejects a stalled release handshake", async () =>
   }
 });
 
+test("authenticated malformed control traffic still poisons protocol health", async () => {
+  const pipe = `\\\\.\\pipe\\cdx-auth-malformed-${process.pid}-${Date.now()}`;
+  let lostError;
+  const channel = await createNetRegistrationChannel({
+    async hello() {},
+    root() {},
+    async closed() {},
+    lost(error) {
+      lostError = error;
+    }
+  }, {
+    socketPath: pipe,
+    handshakeMs: 1000
+  });
+  const socket = net.createConnection({ path: pipe });
+  socket.setEncoding("utf8");
+  await new Promise((resolve, reject) => {
+    let pending = "";
+    socket.once("error", reject);
+    socket.on("data", (chunk) => {
+      pending += chunk;
+      if (!pending.includes("\n")) return;
+      socket.write('{"type":"foreign"}\n');
+    });
+    socket.once("close", resolve);
+    socket.write(`${JSON.stringify({
+      type: "hello",
+      version: 1,
+      ...identity,
+      pid: 4312,
+      parentPid: 4000
+    })}\n`);
+  });
+  assert.equal(lostError?.code, "PROTOCOL_INVALID_MESSAGE");
+  await channel.close();
+});
+
+test("default POSIX control socket is private, resists foreign malformed clients, and leaves no residue", {
+  skip: process.platform === "win32"
+}, async () => {
+  const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cdx-control-test-"));
+  let lost = 0;
+  const channel = await createNetRegistrationChannel({
+    async hello() {
+      assert.fail("foreign malformed client must not authenticate");
+    },
+    root() {},
+    async closed() {},
+    lost() {
+      lost += 1;
+    }
+  }, {
+    temporaryRoot,
+    handshakeMs: 100
+  });
+  const socketPath = channel.endpoint.slice("unix:".length);
+  const privateDirectory = path.dirname(socketPath);
+  assert.equal(fs.statSync(privateDirectory).mode & 0o077, 0);
+  assert.equal(fs.statSync(socketPath).mode & 0o077, 0);
+  assert.equal(path.dirname(privateDirectory), temporaryRoot);
+
+  const foreign = net.createConnection({ path: socketPath });
+  await new Promise((resolve, reject) => {
+    foreign.once("error", () => {});
+    foreign.once("close", resolve);
+    foreign.once("connect", () => foreign.end('{"type":"foreign"}\n'));
+    setTimeout(() => reject(new Error("foreign client was not rejected")), 1000);
+  });
+  assert.equal(lost, 0);
+
+  await channel.close();
+  assert.equal(fs.existsSync(socketPath), false);
+  assert.equal(fs.existsSync(privateDirectory), false);
+  assert.deepEqual(fs.readdirSync(temporaryRoot), []);
+  fs.rmSync(temporaryRoot, { recursive: true, force: true });
+});
+
 test("real launch shim reports root exit while a descendant holds stdout open", async () => {
   let resolveRoot;
   const rootMessage = new Promise((resolve) => {
@@ -871,6 +1350,7 @@ test("real launch shim reports root exit while a descendant holds stdout open", 
 test("real clean socket close while registered process is live latches protocol loss", async () => {
   let endpoint;
   let registrationChannel;
+  let alive = true;
   const fixture = controlledBackend({
     async createRegistrationChannel(handlers) {
       let registeredPid;
@@ -883,6 +1363,17 @@ test("real clean socket close while registered process is live latches protocol 
       endpoint = channel.endpoint;
       registrationChannel = channel;
       return channel;
+    },
+    async inspectProcess(pid) {
+      return alive
+        ? { pid, startTime: pid === 4312 ? "100" : "200", executable: "/usr/bin/node" }
+        : null;
+    },
+    killGroup() {
+      alive = false;
+    },
+    async waitForDrain() {
+      return true;
     }
   });
   const launched = await fixture.backend.launch({
@@ -1082,7 +1573,7 @@ test("authenticated root frame already in transport wins its race with shim exit
   }
 });
 
-test("server hello deadline is absolute despite slow-drip activity", async () => {
+test("foreign slow-drip client is bounded without poisoning authenticated protocol health", async () => {
   const pipe = `\\\\.\\pipe\\cdx-slow-drip-${process.pid}-${Date.now()}`;
   let lostError;
   const channel = await createNetRegistrationChannel({
@@ -1103,7 +1594,7 @@ test("server hello deadline is absolute despite slow-drip activity", async () =>
   const drip = setInterval(() => socket.write("{"), 10);
   try {
     await closed;
-    assert.equal(lostError?.code, "PROTOCOL_HANDSHAKE_TIMEOUT");
+    assert.equal(lostError, undefined);
     assert.ok(Date.now() - started < 80);
   } finally {
     clearInterval(drip);

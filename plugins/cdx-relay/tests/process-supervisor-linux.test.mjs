@@ -155,6 +155,70 @@ const launchSpec = Object.freeze({
   backend: "linux-cgroup"
 });
 
+const HOSTILE_WRITE_ATTEMPTS = Object.freeze([
+  "delegatedParentProcs",
+  "outerProcs",
+  "payloadProcs",
+  "siblingProcs",
+  "outerThreads",
+  "payloadThreads",
+  "outerSubtreeControl",
+  "payloadSubtreeControl"
+]);
+
+function assertCompleteHostileEvidence(evidence) {
+  assert.ok(evidence && typeof evidence === "object");
+  for (const name of HOSTILE_WRITE_ATTEMPTS) {
+    assert.ok(
+      ["EACCES", "EPERM", "EROFS"].includes(evidence[name]),
+      `${name} must prove an explicit permission or read-only denial`
+    );
+  }
+  assert.equal(
+    Number.isInteger(evidence.remountStatus) && evidence.remountStatus !== 0,
+    true,
+    "cgroup remount must be denied with an observed nonzero status"
+  );
+  for (const name of ["reaperVisible", "reaperTerm", "reaperKill"]) {
+    assert.ok(
+      ["EPERM", "ESRCH"].includes(evidence[name]),
+      `${name} must prove the independent reaper is unreachable`
+    );
+  }
+  assert.equal(Number.isSafeInteger(evidence.detachedPid), true);
+  assert.equal(evidence.detachedPid > 0, true);
+}
+
+test("Linux hostile evidence gate fails closed when any required escape proof is absent", () => {
+  const complete = {
+    ...Object.fromEntries(HOSTILE_WRITE_ATTEMPTS.map((name) => [name, "EROFS"])),
+    remountStatus: 32,
+    reaperVisible: "ESRCH",
+    reaperTerm: "EPERM",
+    reaperKill: "EPERM",
+    detachedPid: 123
+  };
+  assert.doesNotThrow(() => assertCompleteHostileEvidence(complete));
+  for (const field of [
+    ...HOSTILE_WRITE_ATTEMPTS,
+    "remountStatus",
+    "reaperVisible",
+    "reaperTerm",
+    "reaperKill",
+    "detachedPid"
+  ]) {
+    const incomplete = { ...complete };
+    delete incomplete[field];
+    assert.throws(() => assertCompleteHostileEvidence(incomplete));
+  }
+  for (const errno of ["EINVAL", "EBUSY", "ENOENT", "writable"]) {
+    assert.throws(() => assertCompleteHostileEvidence({
+      ...complete,
+      payloadProcs: errno
+    }));
+  }
+});
+
 test("atomic registry authenticates the complete record before returning it", async () => {
   const registryPath = await fs.mkdtemp(path.join(os.tmpdir(), "cdx-registry-"));
   await fs.chmod(registryPath, 0o700);
@@ -1605,6 +1669,115 @@ test("Linux strict mode requires a live protected runner", {
   });
   assert.equal(Buffer.from((await migration.root).stdout).toString(), "denied");
   assert.equal((await migration.cleanup()).populated, 0);
+
+  const siblingIdentity = {
+    epoch: `sibling-${Date.now()}`,
+    runId: `sibling-${process.pid}`,
+    nonce: `sibling-nonce-${Date.now()}`,
+    backend: "linux-cgroup"
+  };
+  const sibling = await backend.launch({
+    command: process.execPath,
+    args: ["-e", "setInterval(()=>{},1000)"],
+    shell: false,
+    ...siblingIdentity
+  });
+  void sibling.root.catch(() => {});
+  await waitFor(async () => {
+    const state = (await audit(siblingIdentity.runId)).entry;
+    return state?.state === "running" && state.populated === 1
+      ? state
+      : undefined;
+  }, "sibling run never became populated");
+
+  const hostileIdentity = {
+    epoch: `hostile-${Date.now()}`,
+    runId: `hostile-${process.pid}`,
+    nonce: `hostile-nonce-${Date.now()}`,
+    backend: "linux-cgroup"
+  };
+  const hostileOuter = protectedOuter(
+    hostileIdentity.epoch,
+    hostileIdentity.runId,
+    process.env.CDX_RELAY_LINUX_PROTECTED_ROOT
+  );
+  const siblingOuter = protectedOuter(
+    siblingIdentity.epoch,
+    siblingIdentity.runId,
+    process.env.CDX_RELAY_LINUX_PROTECTED_ROOT
+  );
+  const activeReaperPid = Number(restartedProbe.reaperIdentity.split(":").at(-1));
+  const hostileSource = [
+    "const fs=require('node:fs');",
+    "const {spawn,spawnSync}=require('node:child_process');",
+    "const result={};",
+    "const attempt=(name,file,value=String(process.pid))=>{",
+    "try{fs.writeFileSync(file,value);result[name]='writable'}",
+    "catch(error){result[name]=error.code}};",
+    "for(const [name,file,value] of JSON.parse(process.env.WRITE_ATTEMPTS)){",
+    "attempt(name,file,value)}",
+    "const remount=spawnSync('mount',['-o','remount,rw','/sys/fs/cgroup']);",
+    "result.remountStatus=remount.status;",
+    "const signal=(name,value)=>{try{process.kill(Number(process.env.REAPER_PID),value);",
+    "result[name]='visible'}catch(error){result[name]=error.code}};",
+    "signal('reaperVisible',0);signal('reaperTerm','SIGTERM');",
+    "signal('reaperKill','SIGKILL');",
+    "const detached=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],",
+    "{detached:true,stdio:'ignore'});detached.unref();",
+    "result.detachedPid=detached.pid;",
+    "process.stdout.write(JSON.stringify(result));"
+  ].join("");
+  const writeAttempts = [
+    ["delegatedParentProcs", path.join(
+      process.env.CDX_RELAY_LINUX_PROTECTED_ROOT,
+      "cgroup.procs"
+    )],
+    ["outerProcs", path.join(hostileOuter, "cgroup.procs")],
+    ["payloadProcs", path.join(hostileOuter, "payload", "cgroup.procs")],
+    ["siblingProcs", path.join(siblingOuter, "cgroup.procs")],
+    ["outerThreads", path.join(hostileOuter, "cgroup.threads")],
+    ["payloadThreads", path.join(hostileOuter, "payload", "cgroup.threads")],
+    ["outerSubtreeControl", path.join(hostileOuter, "cgroup.subtree_control"), "\n"],
+    ["payloadSubtreeControl", path.join(
+      hostileOuter,
+      "payload",
+      "cgroup.subtree_control"
+    ), "\n"]
+  ];
+  const hostile = await backend.launch({
+    command: process.execPath,
+    args: ["-e", hostileSource],
+    env: {
+      WRITE_ATTEMPTS: JSON.stringify(writeAttempts),
+      REAPER_PID: String(activeReaperPid)
+    },
+    maxBuffer: 64 * 1024,
+    timeout: 10_000,
+    shell: false,
+    ...hostileIdentity
+  });
+  const hostileRoot = await hostile.root;
+  const hostileEvidence = JSON.parse(Buffer.from(hostileRoot.stdout).toString());
+  assertCompleteHostileEvidence(hostileEvidence);
+  const liveHostile = await waitFor(async () => {
+    const state = (await audit(hostileIdentity.runId)).entry;
+    return state?.state === "running" && state.populated === 1 &&
+      state.pids?.includes(hostileEvidence.detachedPid)
+      ? state
+      : undefined;
+  }, "detached hostile descendant was not visible in the outer cgroup");
+  const hostileProof = await hostile.cleanup();
+  assert.equal(hostileProof.populated, 0);
+  const hostileFinal = (await audit(hostileIdentity.runId)).entry;
+  assert.equal(hostileFinal.state, "drained");
+  assert.equal(hostileFinal.populated, 0);
+  assert.deepEqual(hostileFinal.pids, []);
+  for (const pid of liveHostile.pids) {
+    await assert.rejects(fs.access(`/proc/${pid}`), { code: "ENOENT" });
+  }
+  const reaperAfterHostile = (await audit(hostileIdentity.runId)).probe;
+  assert.equal(reaperAfterHostile.reaperIdentity, restartedProbe.reaperIdentity);
+  assert.equal((await sibling.cleanup()).populated, 0);
 
   const backendUrl = new URL(
     "./process-supervisor/backends/linux-cgroup.mjs",
