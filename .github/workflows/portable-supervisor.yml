@@ -9,6 +9,28 @@ permissions:
   contents: read
 
 jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Verify Windows strict adversarial supervision
+        if: runner.os == 'Windows'
+        run: node --test --test-concurrency=1 --test-timeout=600000 plugins/cdx-relay/tests/process-supervisor-windows.test.mjs
+      - name: Verify macOS cooperative supervision and strict refusal
+        if: runner.os == 'macOS'
+        run: node --test --test-concurrency=1 --test-timeout=600000 plugins/cdx-relay/tests/process-supervisor-posix.test.mjs
+      - run: npm --prefix plugins/cdx-relay test
+
   linux-strict:
     runs-on: ubuntu-24.04
     timeout-minutes: 20

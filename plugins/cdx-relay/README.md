@@ -25,6 +25,45 @@ repository provides the compatible Codex relay plugin and its runtime policy.
   - Usage will contribute to your Codex usage limits. [Learn more](https://developers.openai.com/codex/pricing).
 - **Node.js 18.18 or later**
 
+### Test process-supervision capabilities
+
+The integration-test supervisor selects only a cleanup guarantee that the host
+can prove:
+
+- **Windows:** `host-strict` through Job Objects when PowerShell `Add-Type` is
+  available. The Job Object must report an empty boundary before cleanup is
+  accepted.
+- **Linux:** `host-strict` only with the protected reaper/cgroup runner.
+  Without that runner, a strict request fails explicitly; cooperative mode is
+  used only when the test permits it.
+- **macOS:** native cooperative process-group supervision. Native
+  `host-strict` is unavailable and fails explicitly.
+- **External macOS strict evidence:** belongs to the disposable-runner
+  orchestrator after verified environment disposal. It is never inferred or
+  issued by the guest.
+
+Run the focused supervisor suites from the marketplace root:
+
+```bash
+# Shared contract plus native Windows strict adversarial coverage
+node --test --test-concurrency=1 --test-timeout=600000 plugins/cdx-relay/tests/process-supervisor-contract.test.mjs plugins/cdx-relay/tests/process-supervisor-windows.test.mjs
+
+# Shared contract plus POSIX/macOS cooperative and host-strict refusal coverage
+node --test --test-concurrency=1 --test-timeout=600000 plugins/cdx-relay/tests/process-supervisor-contract.test.mjs plugins/cdx-relay/tests/process-supervisor-posix.test.mjs
+
+# Portable Linux injected coverage and strict-capability refusal
+node --test --test-concurrency=1 --test-timeout=600000 plugins/cdx-relay/tests/process-supervisor-linux.test.mjs
+
+# Live Linux strict gate; use only inside the protected reaper/cgroup runner
+CDX_RELAY_TEST_LINUX_STRICT=1 node --test --test-concurrency=1 --test-timeout=600000 plugins/cdx-relay/tests/process-supervisor-linux.test.mjs
+```
+
+The complete package gate is:
+
+```bash
+npm --prefix plugins/cdx-relay test
+```
+
 ## Install
 
 Add the relay marketplace, install the plugin, and reload plugins:
