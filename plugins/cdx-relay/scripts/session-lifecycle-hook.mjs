@@ -10,7 +10,6 @@ import {
   LOG_FILE_ENV,
   loadBrokerSession,
   PID_FILE_ENV,
-  sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
 import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
@@ -91,26 +90,20 @@ async function handleSessionEnd(input) {
           logFile: process.env[LOG_FILE_ENV] ?? null
         }
       : null);
-  const brokerEndpoint = brokerSession?.endpoint ?? null;
-  const pidFile = brokerSession?.pidFile ?? null;
-  const logFile = brokerSession?.logFile ?? null;
-  const sessionDir = brokerSession?.sessionDir ?? null;
-  const pid = brokerSession?.pid ?? null;
-
-  if (brokerEndpoint) {
-    await sendBrokerShutdown(brokerEndpoint);
-  }
-
   cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
-  teardownBrokerSession({
-    endpoint: brokerEndpoint,
-    pidFile,
-    logFile,
-    sessionDir,
-    pid,
+  if (!brokerSession) return;
+
+  const cleanup = await teardownBrokerSession({
+    ...brokerSession,
     killProcess: terminateProcessTree
   });
-  clearBrokerSession(cwd);
+  if (cleanup.removed) {
+    clearBrokerSession(cwd);
+    return;
+  }
+  throw new Error(
+    `Broker cleanup failed closed (${cleanup.reason}); diagnostic metadata was retained.`
+  );
 }
 
 async function main() {

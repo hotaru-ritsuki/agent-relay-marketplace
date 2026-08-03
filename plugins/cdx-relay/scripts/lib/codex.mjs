@@ -941,7 +941,9 @@ export function getCodexAvailability(cwd) {
 }
 
 export function getSessionRuntimeStatus(env = process.env, cwd = process.cwd()) {
-  const endpoint = env?.[BROKER_ENDPOINT_ENV] ?? loadBrokerSession(cwd)?.endpoint ?? null;
+  const storedBroker = loadBrokerSession(cwd);
+  const endpoint = env?.[BROKER_ENDPOINT_ENV] ??
+    (storedBroker?.state === "ready" ? storedBroker.endpoint ?? null : null);
   if (endpoint) {
     return {
       mode: "shared",

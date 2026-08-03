@@ -8,6 +8,10 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
+import {
+  BROKER_AUTH_ERROR_CODE,
+  markBrokerSessionFailed
+} from "./lib/broker-lifecycle.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 
@@ -48,7 +52,7 @@ function writePidFile(pidFile) {
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (subcommand !== "serve") {
-    throw new Error("Usage: node scripts/app-server-broker.mjs serve --endpoint <value> [--cwd <path>] [--pid-file <path>]");
+    throw new Error("Usage: node scripts/app-server-broker.mjs serve --endpoint <value> --nonce <value> [--cwd <path>] [--pid-file <path>]");
   }
   if (process.env.CDX_RELAY_SUPERVISOR_TOKEN) {
     const { registerControlledDescendant } =
@@ -57,15 +61,19 @@ async function main() {
   }
 
   const { options } = parseArgs(argv, {
-    valueOptions: ["cwd", "pid-file", "endpoint"]
+    valueOptions: ["cwd", "pid-file", "endpoint", "nonce"]
   });
 
   if (!options.endpoint) {
     throw new Error("Missing required --endpoint.");
   }
+  if (!options.nonce) {
+    throw new Error("Missing required --nonce.");
+  }
 
   const cwd = options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
   const endpoint = String(options.endpoint);
+  const nonce = String(options.nonce);
   const listenTarget = parseBrokerEndpoint(endpoint);
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
   writePidFile(pidFile);
@@ -75,6 +83,8 @@ async function main() {
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
   const sockets = new Set();
+  let intentionalShutdown = false;
+  let terminalizing = false;
 
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
@@ -104,18 +114,25 @@ async function main() {
     }
   }
 
-  async function shutdown(server) {
-    for (const socket of sockets) {
-      socket.end();
-    }
-    await appClient.close().catch(() => {});
-    await new Promise((resolve) => server.close(resolve));
+  function removeRuntimeArtifacts() {
     if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
       fs.unlinkSync(listenTarget.path);
     }
     if (pidFile && fs.existsSync(pidFile)) {
       fs.unlinkSync(pidFile);
     }
+  }
+
+  async function shutdown(server, { destroySockets = false } = {}) {
+    for (const socket of sockets) {
+      if (destroySockets) socket.destroy();
+      else socket.end();
+    }
+    await appClient.close().catch(() => {});
+    if (server.listening) {
+      await new Promise((resolve) => server.close(resolve));
+    }
+    removeRuntimeArtifacts();
   }
 
   appClient.setNotificationHandler(routeNotification);
@@ -162,8 +179,31 @@ async function main() {
           continue;
         }
 
+        if (message.id !== undefined && message.method === "broker/status") {
+          if (message.params?.nonce !== nonce) {
+            send(socket, {
+              id: message.id,
+              error: buildJsonRpcError(BROKER_AUTH_ERROR_CODE, "Broker authentication failed.")
+            });
+            continue;
+          }
+          send(socket, {
+            id: message.id,
+            result: { state: "ready", pid: process.pid, nonce }
+          });
+          continue;
+        }
+
         if (message.id !== undefined && message.method === "broker/shutdown") {
-          send(socket, { id: message.id, result: {} });
+          if (message.params?.nonce !== nonce) {
+            send(socket, {
+              id: message.id,
+              error: buildJsonRpcError(BROKER_AUTH_ERROR_CODE, "Broker authentication failed.")
+            });
+            continue;
+          }
+          intentionalShutdown = true;
+          send(socket, { id: message.id, result: { stopped: true, nonce } });
           await shutdown(server);
           process.exit(0);
         }
@@ -239,13 +279,24 @@ async function main() {
   });
 
   process.on("SIGTERM", async () => {
+    intentionalShutdown = true;
     await shutdown(server);
     process.exit(0);
   });
 
   process.on("SIGINT", async () => {
+    intentionalShutdown = true;
     await shutdown(server);
     process.exit(0);
+  });
+
+  appClient.addTerminalListener((error) => {
+    if (intentionalShutdown || terminalizing) return;
+    terminalizing = true;
+    markBrokerSessionFailed(cwd, { endpoint, pid: process.pid, nonce }, error);
+    void shutdown(server, { destroySockets: true }).finally(() => {
+      process.exitCode = 1;
+    });
   });
 
   server.listen(listenTarget.path);
