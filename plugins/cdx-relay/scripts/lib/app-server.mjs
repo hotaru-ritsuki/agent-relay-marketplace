@@ -289,18 +289,27 @@ class AppServerClientBase {
   }
 
   appendStderr(chunk) {
+    if (this.closed) {
+      return;
+    }
     const text = String(chunk);
+    if (this.stderr.length + text.length <= MAX_STDERR_CHARS) {
+      this.stderr += text;
+      return;
+    }
     if (text.length >= MAX_STDERR_CHARS) {
       this.stderr = text.slice(-MAX_STDERR_CHARS);
-      this.stderrTruncated = true;
-      return;
-    }
-    if (this.stderr.length + text.length > MAX_STDERR_CHARS) {
+    } else {
       this.stderr = `${this.stderr.slice(-(MAX_STDERR_CHARS - text.length))}${text}`;
-      this.stderrTruncated = true;
-      return;
     }
-    this.stderr += text;
+    this.stderrTruncated = true;
+    const stderr = this.stderrForError();
+    this.handleExit(
+      createProtocolError(
+        `codex app-server stderr exceeded ${MAX_STDERR_CHARS} characters.${stderr ? `\n${stderr}` : ""}`,
+        { maxChars: MAX_STDERR_CHARS }
+      )
+    );
   }
 
   stderrForError() {

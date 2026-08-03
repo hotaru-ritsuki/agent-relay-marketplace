@@ -130,3 +130,47 @@ Result: 331 total; 326 passed, 5 skipped, 0 failed in 389.8 seconds. This includ
 ### Fix-round concerns
 
 None.
+
+## Fix Round 2
+
+### Finding addressed
+
+Direct-process stderr now terminalizes the app-server client as soon as retained stderr would exceed the 64 KiB cap. The overflow error includes the bounded diagnostic tail and uses the same idempotent terminal path as other transport failures, so pending requests reject exactly once and normal child-process cleanup runs even while the peer remains alive.
+
+### RED evidence
+
+Command:
+
+`node --test --test-concurrency=1 --test-timeout=600000 --test-name-pattern="direct stderr overflow terminally rejects initialize and cleans up" plugins/cdx-relay/tests/runtime.test.mjs`
+
+The hostile fixture emitted oversized stderr and deliberately stayed alive. Before the production change, the 1.5-second negative-control guard failed with `stderr overflow did not terminalize the client`.
+
+### GREEN evidence
+
+The same focused command passed 1/1. It asserts prompt rejection from the client itself, the 65,536-character cap and truncation diagnostic, preservation of the diagnostic marker, a bounded error message, and observed termination of the still-live fixture process.
+
+Syntax checks passed for the production module, fixture, and runtime test.
+
+Full runtime command:
+
+`node --test --test-concurrency=1 --test-timeout=600000 plugins/cdx-relay/tests/runtime.test.mjs`
+
+Result: 92 passed, 0 failed in 250.2 seconds.
+
+Package command:
+
+`npm --prefix plugins/cdx-relay test`
+
+Result: 331 total; 326 passed, 5 skipped, 0 failed in 392.5 seconds. This includes the app-server TypeScript build contract.
+
+### Fix-round self-review
+
+- Exactly the configured cap remains accepted; the first character beyond it terminalizes.
+- The retained diagnostic tail never exceeds 64 KiB, and the overflow error adds only a bounded prefix/marker.
+- `handleExit` closes before settling pending work; later stderr chunks are ignored and cannot emit a second terminal event.
+- The connect failure path performs its existing awaited child-process cleanup, independently confirmed by polling the fixture PID.
+- No broker lifecycle implementation changed.
+
+### Fix-round concerns
+
+None.

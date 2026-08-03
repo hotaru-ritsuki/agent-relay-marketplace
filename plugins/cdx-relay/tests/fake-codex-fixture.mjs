@@ -293,7 +293,8 @@ rl.on("line", (line) => {
           break;
         }
         if (BEHAVIOR === "oversized-stderr") {
-          process.stderr.write("s".repeat(256 * 1024) + "stderr-tail-marker\\n", () => process.exit(7));
+          process.stderr.write("stderr-diagnostic-marker\\n".repeat(12_000));
+          setInterval(() => {}, 1000);
           break;
         }
         if (BEHAVIOR === "silent-initialize") {

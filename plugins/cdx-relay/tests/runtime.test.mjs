@@ -524,23 +524,39 @@ test("oversized unterminated direct stdout line terminally rejects initialize", 
   );
 });
 
-test("direct stderr diagnostics stay bounded when initialize exits", async () => {
+test("direct stderr overflow terminally rejects initialize and cleans up", async (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
   installFakeCodex(binDir, "oversized-stderr");
-
-  const error = await CodexAppServerClient.connect(repo, {
+  installFakeProcessCleanup(t, statePath);
+  const connection = CodexAppServerClient.connect(repo, {
     disableBroker: true,
     env: buildEnv(binDir),
-    initializeTimeoutMs: 1000
-  }).then(
-    () => assert.fail("oversized stderr fixture unexpectedly initialized"),
-    (reason) => reason
-  );
+    initializeTimeoutMs: 5000
+  });
+  connection.catch(() => {});
 
+  const error = await Promise.race([
+    connection.then(
+      () => assert.fail("oversized stderr fixture unexpectedly initialized"),
+      (reason) => reason
+    ),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("stderr overflow did not terminalize the client")), 1500))
+  ]);
+
+  assert.match(error.message, /stderr exceeded.*65536/i);
   assert.match(error.message, /stderr truncated/i);
-  assert.match(error.message, /stderr-tail-marker/);
+  assert.match(error.message, /stderr-diagnostic-marker/);
   assert.ok(error.message.length < 70 * 1024);
+  const state = await waitFor(() => {
+    if (!fs.existsSync(statePath)) {
+      return null;
+    }
+    const value = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    return value.appServerPid ? value : null;
+  });
+  assert.equal(await waitForProcessExit(state.appServerPid), true);
 });
 
 for (const behavior of ["silent-initialize", "initialize-rpc-error"]) {
