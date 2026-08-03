@@ -29,7 +29,7 @@ jobs:
       - name: Verify macOS cooperative supervision and strict refusal
         if: runner.os == 'macOS'
         run: node --test --test-concurrency=1 --test-timeout=600000 plugins/cdx-relay/tests/process-supervisor-posix.test.mjs
-      - run: npm --prefix plugins/cdx-relay test
+      - run: npm run check
 
   linux-strict:
     runs-on: ubuntu-24.04
@@ -96,4 +96,4 @@ jobs:
           cat "$RUNNER_TEMP/cdx-relay-reaper.log"
           exit 1
       - run: node --test --test-concurrency=1 --test-timeout=600000 plugins/cdx-relay/tests/process-supervisor-linux.test.mjs
-      - run: npm --prefix plugins/cdx-relay test
+      - run: npm run check

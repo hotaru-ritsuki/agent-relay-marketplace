@@ -10,7 +10,7 @@ test("root package fixes the runtime floor and license", () => {
   assert.equal(pkg.engines.node, ">=20");
   assert.equal(
     pkg.scripts.test,
-    "node --test --test-concurrency=1 --test-timeout=600000",
+    "node tooling/run-tests.mjs",
   );
 });
 

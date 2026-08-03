@@ -13,7 +13,7 @@
     "plugins/cursor-relay"
   ],
   "scripts": {
-    "test": "node --test --test-concurrency=1 --test-timeout=600000",
+    "test": "node tooling/run-tests.mjs",
     "sync-contracts": "node tooling/sync-contracts.mjs",
     "check:isolation": "node tooling/check-plugin-isolation.mjs",
     "check:safety": "node tooling/check-forbidden-flags.mjs",
