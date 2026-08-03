@@ -292,9 +292,27 @@ rl.on("line", (line) => {
         break;
 
       case "initialized":
+        if (BEHAVIOR === "close-stdin-under-pressure") {
+          state.stdinClosed = true;
+          saveState(state);
+          rl.close();
+          process.stdin.destroy();
+          setTimeout(() => process.exit(0), 250);
+        }
         break;
 
       case "account/read":
+        if (BEHAVIOR === "silent-control") {
+          break;
+        }
+        if (BEHAVIOR === "exit-with-pending-requests") {
+          if (!state.exitScheduled) {
+            state.exitScheduled = true;
+            saveState(state);
+            setTimeout(() => process.exit(0), 25);
+          }
+          break;
+        }
         send({ id: message.id, result: buildAccountReadResult() });
         break;
 
@@ -452,7 +470,17 @@ rl.on("line", (line) => {
 	          prompt
 	        };
 	        saveState(state);
+	        if (BEHAVIOR === "silent-turn-admission") {
+	          break;
+	        }
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
+	        if (BEHAVIOR === "exit-after-turn-admission") {
+	          setTimeout(() => process.exit(0), 25);
+	          break;
+	        }
+	        if (BEHAVIOR === "silent-turn-completion") {
+	          break;
+	        }
 
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)
@@ -600,7 +628,7 @@ rl.on("line", (line) => {
 	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
 	          }, 5000);
 	          interruptibleTurns.set(turnId, { threadId: thread.id, timer });
-	        } else if (BEHAVIOR === "slow-task") {
+	        } else if (BEHAVIOR === "slow-task" || BEHAVIOR === "delayed-turn-completion") {
 	          emitTurnCompletedLater(thread.id, turnId, items, 400);
 	        } else {
 	          emitTurnCompleted(thread.id, turnId, items);

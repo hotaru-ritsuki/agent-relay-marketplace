@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import {
@@ -15,6 +15,7 @@ import {
   spawnTracked
 } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../scripts/lib/broker-lifecycle.mjs";
+import { CodexAppServerClient } from "../scripts/lib/app-server.mjs";
 import { DEFAULT_CONTINUE_PROMPT } from "../scripts/lib/codex.mjs";
 import { resolveStateDir, upsertJob, writeJobFile } from "../scripts/lib/state.mjs";
 
@@ -180,6 +181,206 @@ function seedFakeCodexThread(statePath, cwd, threadId = "thr_exact") {
     })
   );
 }
+
+async function connectDirectFixture(t, repo, binDir, behavior) {
+  installFakeCodex(binDir, behavior);
+  const client = await CodexAppServerClient.connect(repo, {
+    disableBroker: true,
+    env: buildEnv(binDir)
+  });
+  t.after(async () => {
+    await client.close().catch(() => {});
+  });
+  return client;
+}
+
+async function startFixtureThread(client, cwd) {
+  const response = await client.request("thread/start", {
+    cwd,
+    model: null,
+    approvalPolicy: "never",
+    sandbox: "read-only",
+    serviceName: "runtime-test",
+    ephemeral: true
+  }, { timeoutMs: 500 });
+  return response.thread.id;
+}
+
+function turnStartParams(threadId, prompt = "exercise app-server transport") {
+  return {
+    threadId,
+    input: [{ type: "text", text: prompt, text_elements: [] }],
+    model: null,
+    effort: null,
+    outputSchema: null
+  };
+}
+
+test("direct app-server peer exit closes the client and rejects every pending request", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const client = await connectDirectFixture(t, repo, binDir, "exit-with-pending-requests");
+
+  const results = await Promise.race([
+    Promise.allSettled([
+      client.request("account/read", { refreshToken: false }, { timeoutMs: 1000 }),
+      client.request("account/read", { refreshToken: true }, { timeoutMs: 1000 })
+    ]),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("peer exit did not settle pending requests")), 1000))
+  ]);
+
+  assert.deepEqual(results.map((result) => result.status), ["rejected", "rejected"]);
+  assert.equal(client.closed, true);
+  assert.equal(client.pending.size, 0);
+});
+
+test("a live but silent app-server control request rejects at its deadline", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const client = await connectDirectFixture(t, repo, binDir, "silent-control");
+  const startedAt = Date.now();
+
+  await assert.rejects(
+    Promise.race([
+      client.request("account/read", { refreshToken: false }, { timeoutMs: 30 }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("control request outlived its deadline")), 250))
+    ]),
+    /account\/read timed out after 30 ms/i
+  );
+  assert.ok(Date.now() - startedAt < 200);
+  assert.equal(client.pending.size, 0);
+});
+
+test("turn start admission rejects at its request deadline", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const client = await connectDirectFixture(t, repo, binDir, "silent-turn-admission");
+  const threadId = await startFixtureThread(client, repo);
+
+  await assert.rejects(
+    Promise.race([
+      client.request("turn/start", turnStartParams(threadId), { timeoutMs: 30 }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("turn admission outlived its deadline")), 250))
+    ]),
+    /turn\/start timed out after 30 ms/i
+  );
+  assert.equal(client.pending.size, 0);
+});
+
+test("turn completion can outlive the short admission deadline", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const client = await connectDirectFixture(t, repo, binDir, "delayed-turn-completion");
+  const threadId = await startFixtureThread(client, repo);
+  const { captureTurn } = await import("../scripts/lib/codex.mjs");
+  assert.equal(typeof captureTurn, "function");
+  const startedAt = Date.now();
+
+  const state = await captureTurn(
+    client,
+    threadId,
+    () => client.request("turn/start", turnStartParams(threadId), { timeoutMs: 30 })
+  );
+
+  assert.equal(state.finalTurn?.status, "completed");
+  assert.ok(Date.now() - startedAt >= 300);
+});
+
+test("a caller can explicitly bound whole-turn completion", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const client = await connectDirectFixture(t, repo, binDir, "silent-turn-completion");
+  const threadId = await startFixtureThread(client, repo);
+  const { captureTurn } = await import("../scripts/lib/codex.mjs");
+
+  await assert.rejects(
+    Promise.race([
+      captureTurn(
+        client,
+        threadId,
+        () => client.request("turn/start", turnStartParams(threadId), { timeoutMs: 200 }),
+        { timeoutMs: 30 }
+      ),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("caller turn deadline was ignored")), 250))
+    ]),
+    /turn timed out after 30 ms/i
+  );
+  assert.equal(client.terminalListeners.size, 0);
+});
+
+test("transport death after turn admission rejects and removes the long-turn listener", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const client = await connectDirectFixture(t, repo, binDir, "exit-after-turn-admission");
+  const threadId = await startFixtureThread(client, repo);
+  const { captureTurn } = await import("../scripts/lib/codex.mjs");
+  assert.equal(typeof captureTurn, "function");
+
+  await assert.rejects(
+    Promise.race([
+      captureTurn(
+        client,
+        threadId,
+        () => client.request("turn/start", turnStartParams(threadId), { timeoutMs: 200 })
+      ),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("turn completion survived transport death")), 500))
+    ]),
+    /connection closed|transport closed|exited/i
+  );
+  assert.equal(client.terminalListeners.size, 0);
+});
+
+test("direct stdin write pressure rejects without an uncaught pipe failure", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "close-stdin-under-pressure");
+  const appServerUrl = pathToFileURL(path.join(PLUGIN_ROOT, "scripts", "lib", "app-server.mjs")).href;
+  const probe = `
+    const { CodexAppServerClient } = await import(${JSON.stringify(appServerUrl)});
+    const fs = await import("node:fs");
+    const statePath = ${JSON.stringify(statePath)};
+    process.once("uncaughtException", (error) => {
+      console.log(JSON.stringify({ uncaught: { code: error?.code ?? null, message: error?.message ?? String(error) } }));
+      process.exit(91);
+    });
+    const watchdog = setTimeout(() => {
+      console.log(JSON.stringify({ uncaught: null, rejection: null, closed: false, pending: null, watchdog: true }));
+      process.exit(92);
+    }, 1500);
+    const client = await CodexAppServerClient.connect(process.cwd(), { disableBroker: true, env: process.env });
+    const waitDeadline = Date.now() + 1000;
+    while (Date.now() < waitDeadline) {
+      const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+      if (state.stdinClosed) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    let rejection = null;
+    try {
+      await client.request("thread/list", { cursor: null, limit: 1, sortKey: null, cwd: "x".repeat(64 * 1024 * 1024) }, { timeoutMs: 1000 });
+    } catch (error) {
+      rejection = { code: error?.code ?? null, message: error?.message ?? String(error) };
+    }
+    const result = { uncaught: null, rejection, closed: client.closed, pending: client.pending.size };
+    await client.close().catch(() => {});
+    clearTimeout(watchdog);
+    console.log(JSON.stringify(result));
+  `;
+
+  const result = run(process.execPath, ["--input-type=module", "-e", probe], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    timeout: 3000
+  });
+
+  assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+  const payload = JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1));
+  assert.equal(payload.uncaught, null);
+  assert.ok(payload.rejection);
+  assert.doesNotMatch(JSON.stringify(payload), /uncaughtException|EPIPE|\bEOF\b/i);
+  assert.equal(payload.closed, true);
+  assert.equal(payload.pending, 0);
+});
 
 test("setup reports ready when fake codex is installed and authenticated", () => {
   const binDir = makeTempDir();

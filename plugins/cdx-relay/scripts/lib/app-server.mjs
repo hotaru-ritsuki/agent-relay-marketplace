@@ -21,6 +21,11 @@ const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"))
 
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
+const DEFAULT_RPC_DEADLINE_MS = 30_000;
+
+export function deadlineForMethod(_method) {
+  return DEFAULT_RPC_DEADLINE_MS;
+}
 
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
@@ -54,6 +59,10 @@ function createProtocolError(message, data) {
   return error;
 }
 
+function createTransportWriteError(error) {
+  return new Error("codex app-server transport write failed.", { cause: error });
+}
+
 class AppServerClientBase {
   constructor(cwd, options = {}) {
     this.cwd = cwd;
@@ -63,6 +72,7 @@ class AppServerClientBase {
     this.stderr = "";
     this.closed = false;
     this.exitError = null;
+    this.terminalListeners = new Set();
     /** @type {AppServerNotificationHandler | null} */
     this.notificationHandler = null;
     this.lineBuffer = "";
@@ -77,13 +87,26 @@ class AppServerClientBase {
     this.notificationHandler = handler;
   }
 
+  addTerminalListener(listener) {
+    if (this.closed) {
+      listener(this.exitError ?? new Error("codex app-server connection closed."));
+      return () => {};
+    }
+
+    this.terminalListeners.add(listener);
+    return () => {
+      this.terminalListeners.delete(listener);
+    };
+  }
+
   /**
    * @template {AppServerMethod} M
    * @param {M} method
    * @param {import("./app-server-protocol").AppServerRequestParams<M>} params
+   * @param {{ timeoutMs?: number }} [requestOptions]
    * @returns {Promise<import("./app-server-protocol").AppServerResponse<M>>}
    */
-  request(method, params) {
+  request(method, params, requestOptions = {}) {
     if (this.closed) {
       throw new Error("codex app-server client is closed.");
     }
@@ -92,8 +115,23 @@ class AppServerClientBase {
     this.nextId += 1;
 
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, method });
-      this.sendMessage({ id, method, params });
+      const timeoutMs = requestOptions.timeoutMs ?? deadlineForMethod(method);
+      const pending = { resolve, reject, method, deadlineTimer: null };
+      if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+        pending.deadlineTimer = setTimeout(() => {
+          const expired = this.takePending(id);
+          if (expired) {
+            expired.reject(new Error(`codex app-server ${method} timed out after ${timeoutMs} ms.`));
+          }
+        }, timeoutMs);
+        pending.deadlineTimer.unref?.();
+      }
+      this.pending.set(id, pending);
+      try {
+        this.sendMessage({ id, method, params });
+      } catch (error) {
+        this.handleExit(error);
+      }
     });
   }
 
@@ -101,7 +139,24 @@ class AppServerClientBase {
     if (this.closed) {
       return;
     }
-    this.sendMessage({ method, params });
+    try {
+      this.sendMessage({ method, params });
+    } catch (error) {
+      this.handleExit(error);
+    }
+  }
+
+  takePending(id) {
+    const pending = this.pending.get(id);
+    if (!pending) {
+      return null;
+    }
+    this.pending.delete(id);
+    if (pending.deadlineTimer) {
+      clearTimeout(pending.deadlineTimer);
+      pending.deadlineTimer = null;
+    }
+    return pending;
   }
 
   handleChunk(chunk) {
@@ -134,11 +189,10 @@ class AppServerClientBase {
     }
 
     if (message.id !== undefined) {
-      const pending = this.pending.get(message.id);
+      const pending = this.takePending(message.id);
       if (!pending) {
         return;
       }
-      this.pending.delete(message.id);
 
       if (message.error) {
         pending.reject(createProtocolError(message.error.message ?? `codex app-server ${pending.method} failed.`, message.error));
@@ -154,10 +208,14 @@ class AppServerClientBase {
   }
 
   handleServerRequest(message) {
-    this.sendMessage({
-      id: message.id,
-      error: buildJsonRpcError(-32601, `Unsupported server request: ${message.method}`)
-    });
+    try {
+      this.sendMessage({
+        id: message.id,
+        error: buildJsonRpcError(-32601, `Unsupported server request: ${message.method}`)
+      });
+    } catch (error) {
+      this.handleExit(error);
+    }
   }
 
   handleExit(error) {
@@ -166,12 +224,21 @@ class AppServerClientBase {
     }
 
     this.exitResolved = true;
-    this.exitError = error ?? null;
+    this.closed = true;
+    this.exitError = error instanceof Error ? error : new Error("codex app-server connection closed.");
 
-    for (const pending of this.pending.values()) {
-      pending.reject(this.exitError ?? new Error("codex app-server connection closed."));
+    for (const id of [...this.pending.keys()]) {
+      const pending = this.takePending(id);
+      pending?.reject(this.exitError);
     }
-    this.pending.clear();
+    for (const listener of this.terminalListeners) {
+      try {
+        listener(this.exitError);
+      } catch {
+        // A terminal listener cannot prevent the remaining waiters from settling.
+      }
+    }
+    this.terminalListeners.clear();
     this.resolveExit(undefined);
   }
 
@@ -194,6 +261,9 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
       windowsHide: true
     });
+    this.processClosePromise = new Promise((resolve) => {
+      this.resolveProcessClose = resolve;
+    });
 
     this.proc.stdout.setEncoding("utf8");
     this.proc.stderr.setEncoding("utf8");
@@ -204,6 +274,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
 
     this.proc.on("error", (error) => {
       this.handleExit(error);
+      this.resolveProcessClose();
     });
 
     this.proc.on("exit", (code, signal) => {
@@ -215,6 +286,22 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
               `codex app-server exited unexpectedly (${signal ? `signal ${signal}` : `exit ${code}`}).${stderr ? `\n${stderr}` : ""}`
             );
       this.handleExit(detail);
+    });
+
+    this.proc.on("close", (code, signal) => {
+      const stderr = this.stderr.trim();
+      const detail =
+        code === 0
+          ? null
+          : createProtocolError(
+              `codex app-server transport closed unexpectedly (${signal ? `signal ${signal}` : `exit ${code}`}).${stderr ? `\n${stderr}` : ""}`
+            );
+      this.handleExit(detail);
+      this.resolveProcessClose();
+    });
+
+    this.proc.stdin.on("error", (error) => {
+      this.handleExit(createTransportWriteError(error));
     });
 
     this.readline = readline.createInterface({ input: this.proc.stdout });
@@ -230,21 +317,23 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   }
 
   async close() {
-    if (this.closed) {
-      await this.exitPromise;
-      return;
-    }
-
-    this.closed = true;
+    this.handleExit(new Error("codex app-server connection closed."));
 
     if (this.readline) {
       this.readline.close();
     }
 
-    if (this.proc && !this.proc.killed) {
-      this.proc.stdin.end();
-      setTimeout(() => {
-        if (this.proc && !this.proc.killed && this.proc.exitCode === null) {
+    let killTimer = null;
+    if (this.proc && this.proc.exitCode === null && this.proc.signalCode === null) {
+      if (!this.proc.stdin.destroyed) {
+        try {
+          this.proc.stdin.end();
+        } catch (error) {
+          this.handleExit(error);
+        }
+      }
+      killTimer = setTimeout(() => {
+        if (this.proc && this.proc.exitCode === null && this.proc.signalCode === null) {
           // On Windows with shell: true, the direct child is cmd.exe.
           // Use terminateProcessTree to kill the entire tree including
           // the grandchild node process.
@@ -259,10 +348,14 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
             this.proc.kill("SIGTERM");
           }
         }
-      }, 50).unref?.();
+      }, 50);
+      killTimer.unref?.();
     }
 
-    await this.exitPromise;
+    await this.processClosePromise;
+    if (killTimer) {
+      clearTimeout(killTimer);
+    }
   }
 
   sendMessage(message) {
@@ -271,7 +364,15 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     if (!stdin) {
       throw new Error("codex app-server stdin is not available.");
     }
-    stdin.write(line);
+    try {
+      stdin.write(line, (error) => {
+        if (error) {
+          this.handleExit(createTransportWriteError(error));
+        }
+      });
+    } catch (error) {
+      throw createTransportWriteError(error);
+    }
   }
 }
 
@@ -286,6 +387,9 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
     await new Promise((resolve, reject) => {
       const target = parseBrokerEndpoint(this.endpoint);
       this.socket = net.createConnection({ path: target.path });
+      this.socketClosePromise = new Promise((resolveClose) => {
+        this.resolveSocketClose = resolveClose;
+      });
       this.socket.setEncoding("utf8");
       this.socket.on("connect", resolve);
       this.socket.on("data", (chunk) => {
@@ -299,6 +403,7 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
       });
       this.socket.on("close", () => {
         this.handleExit(this.exitError);
+        this.resolveSocketClose();
       });
     });
 
@@ -310,16 +415,11 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
   }
 
   async close() {
-    if (this.closed) {
-      await this.exitPromise;
-      return;
-    }
-
-    this.closed = true;
-    if (this.socket) {
+    this.handleExit(new Error("codex app-server connection closed."));
+    if (this.socket && !this.socket.destroyed) {
       this.socket.end();
     }
-    await this.exitPromise;
+    await (this.socketClosePromise ?? this.exitPromise);
   }
 
   sendMessage(message) {
@@ -328,7 +428,15 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
     if (!socket) {
       throw new Error("codex app-server broker connection is not connected.");
     }
-    socket.write(line);
+    try {
+      socket.write(line, (error) => {
+        if (error) {
+          this.handleExit(createTransportWriteError(error));
+        }
+      });
+    } catch (error) {
+      throw createTransportWriteError(error);
+    }
   }
 }
 

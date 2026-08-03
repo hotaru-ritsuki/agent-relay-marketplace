@@ -24,6 +24,7 @@
  *   pendingCollaborations: Set<string>,
  *   activeSubagentTurns: Set<string>,
  *   completionTimer: ReturnType<typeof setTimeout> | null,
+ *   deadlineTimer: ReturnType<typeof setTimeout> | null,
  *   lastAgentMessage: string,
  *   reviewText: string,
  *   reasoningSummary: string[],
@@ -325,6 +326,7 @@ function createTurnCaptureState(threadId, options = {}) {
     pendingCollaborations: new Set(),
     activeSubagentTurns: new Set(),
     completionTimer: null,
+    deadlineTimer: null,
     lastAgentMessage: "",
     reviewText: "",
     reasoningSummary: [],
@@ -343,12 +345,31 @@ function clearCompletionTimer(state) {
   }
 }
 
+function clearTurnDeadline(state) {
+  if (state.deadlineTimer) {
+    clearTimeout(state.deadlineTimer);
+    state.deadlineTimer = null;
+  }
+}
+
+function failTurn(state, error) {
+  if (state.completed) {
+    return;
+  }
+
+  clearCompletionTimer(state);
+  clearTurnDeadline(state);
+  state.completed = true;
+  state.rejectCompletion(error);
+}
+
 function completeTurn(state, turn = null, options = {}) {
   if (state.completed) {
     return;
   }
 
   clearCompletionTimer(state);
+  clearTurnDeadline(state);
   state.completed = true;
 
   if (turn) {
@@ -556,9 +577,17 @@ function applyTurnNotification(state, message) {
   }
 }
 
-async function captureTurn(client, threadId, startRequest, options = {}) {
+export async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
+  let removeTerminalListener = () => {};
+
+  if (Number.isFinite(options.timeoutMs) && options.timeoutMs > 0) {
+    state.deadlineTimer = setTimeout(() => {
+      failTurn(state, new Error(`codex app-server turn timed out after ${options.timeoutMs} ms.`));
+    }, options.timeoutMs);
+    state.deadlineTimer.unref?.();
+  }
 
   client.setNotificationHandler((message) => {
     if (!state.turnId) {
@@ -582,7 +611,9 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   });
 
   try {
-    const response = await startRequest();
+    const response = state.deadlineTimer
+      ? await Promise.race([startRequest(), state.completion])
+      : await startRequest();
     options.onResponse?.(response, state);
     state.turnId = response.turn?.id ?? null;
     if (state.turnId) {
@@ -603,9 +634,15 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       completeTurn(state, response.turn);
     }
 
+    removeTerminalListener = client.addTerminalListener((error) => {
+      failTurn(state, error);
+    });
+
     return await state.completion;
   } finally {
     clearCompletionTimer(state);
+    clearTurnDeadline(state);
+    removeTerminalListener();
     client.setNotificationHandler(previousHandler ?? null);
   }
 }
