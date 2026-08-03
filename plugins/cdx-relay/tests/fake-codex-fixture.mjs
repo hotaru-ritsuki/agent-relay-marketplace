@@ -274,6 +274,9 @@ const bootState = loadState();
 bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
 bootState.appServerPid = process.pid;
 saveState(bootState);
+if (BEHAVIOR === "silent-initialize-sticky") {
+  setInterval(() => {}, 1000);
+}
 
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
@@ -297,7 +300,7 @@ rl.on("line", (line) => {
           setInterval(() => {}, 1000);
           break;
         }
-        if (BEHAVIOR === "silent-initialize") {
+        if (BEHAVIOR === "silent-initialize" || BEHAVIOR === "silent-initialize-sticky") {
           break;
         }
         if (BEHAVIOR === "initialize-rpc-error") {
@@ -321,6 +324,11 @@ rl.on("line", (line) => {
 
       case "account/read":
         if (BEHAVIOR === "silent-control") {
+          break;
+        }
+        if (BEHAVIOR === "oversized-stdout-on-account-read") {
+          process.stdout.write("x".repeat(9 * 1024 * 1024));
+          setTimeout(() => process.exit(0), 500);
           break;
         }
         if (BEHAVIOR === "exit-with-pending-requests") {

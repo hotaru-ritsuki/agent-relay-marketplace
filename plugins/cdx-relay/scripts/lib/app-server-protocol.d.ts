@@ -55,6 +55,8 @@ export interface CodexAppServerClientOptions {
   brokerEndpoint?: string;
   disableBroker?: boolean;
   reuseExistingBroker?: boolean;
+  onClientCreated?: (client: { close(): Promise<void> }) => void;
+  onProcessSpawned?: (process: { pid?: number }) => void;
 }
 
 export interface AppServerMethodMap {

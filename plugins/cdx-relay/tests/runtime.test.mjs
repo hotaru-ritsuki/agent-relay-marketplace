@@ -22,11 +22,13 @@ import {
   saveBrokerSession,
   sendBrokerShutdown,
   sendBrokerStatus,
+  spawnBrokerProcess,
   teardownBrokerSession,
   waitForBrokerEndpoint
 } from "../scripts/lib/broker-lifecycle.mjs";
 import { CodexAppServerClient } from "../scripts/lib/app-server.mjs";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "../scripts/lib/broker-endpoint.mjs";
+import { captureProcessIdentity } from "../scripts/lib/process-identity.mjs";
 import { DEFAULT_CONTINUE_PROMPT, getSessionRuntimeStatus } from "../scripts/lib/codex.mjs";
 import { resolveStateDir, upsertJob, writeJobFile } from "../scripts/lib/state.mjs";
 
@@ -50,6 +52,8 @@ const BROKER_FIXTURE_SOURCE = `
   const target = endpoint.startsWith("unix:") ? endpoint.slice(5) : endpoint.slice(5);
   const marker = process.env.BROKER_FIXTURE_MARKER;
   const delayMs = Number(process.env.BROKER_FIXTURE_DELAY_MS || 0);
+  const shutdownDelayMs = Number(process.env.BROKER_FIXTURE_SHUTDOWN_DELAY_MS || 0);
+  const keepAlive = setInterval(() => {}, 1000);
   fs.writeFileSync(marker, JSON.stringify({ pid: process.pid, endpoint, delayMs, startedAt: Date.now() }), "utf8");
 
   const server = net.createServer((socket) => {
@@ -75,9 +79,24 @@ const BROKER_FIXTURE_SOURCE = `
         });
         return;
       }
+      if (message.method === "fixture/crash") {
+        socket.end(JSON.stringify({ id: message.id, result: {} }) + "\\n", () => {
+          process.exit(17);
+        });
+        return;
+      }
+      if (message.method === "fixture/drop-endpoint") {
+        socket.end(JSON.stringify({ id: message.id, result: {} }) + "\\n", () => {
+          server.close(() => {});
+        });
+        return;
+      }
       if (message.method === "broker/shutdown") {
         socket.end(JSON.stringify({ id: message.id, result: { stopped: true, nonce } }) + "\\n", () => {
-          server.close(() => process.exit(0));
+          server.close(() => {
+            clearInterval(keepAlive);
+            setTimeout(() => process.exit(0), shutdownDelayMs);
+          });
         });
         return;
       }
@@ -316,7 +335,7 @@ async function sendFixtureRequest(endpoint, method, nonce, timeoutMs = 1000) {
   });
 }
 
-function installBrokerFixture(t, { delayMs = 0 } = {}) {
+function installBrokerFixture(t, { delayMs = 0, shutdownDelayMs = 0 } = {}) {
   const fixtureDir = makeTempDir("cdx-broker-lifecycle-");
   const scriptPath = path.join(fixtureDir, "broker-fixture.mjs");
   const markerPath = path.join(fixtureDir, "broker-marker.json");
@@ -343,9 +362,41 @@ function installBrokerFixture(t, { delayMs = 0 } = {}) {
     env: {
       ...process.env,
       BROKER_FIXTURE_MARKER: markerPath,
-      BROKER_FIXTURE_DELAY_MS: String(delayMs)
+      BROKER_FIXTURE_DELAY_MS: String(delayMs),
+      BROKER_FIXTURE_SHUTDOWN_DELAY_MS: String(shutdownDelayMs)
     }
   };
+}
+
+async function startUnobservedBroker(repo, fixture) {
+  const sessionDir = makeTempDir("cdx-unobserved-broker-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const pidFile = path.join(sessionDir, "broker.pid");
+  const logFile = path.join(sessionDir, "broker.log");
+  const nonce = "unobserved-broker-nonce-0123456789abcdef0123456789abcdef";
+  const child = spawnBrokerProcess({
+    scriptPath: fixture.scriptPath,
+    cwd: repo,
+    endpoint,
+    pidFile,
+    logFile,
+    nonce,
+    env: fixture.env
+  });
+  const processIdentity = await waitFor(() => captureProcessIdentity(child.pid));
+  assert.equal(await waitForBrokerEndpoint(endpoint, 1000), true);
+  const session = {
+    state: "ready",
+    endpoint,
+    pid: child.pid,
+    nonce,
+    processIdentity,
+    pidFile,
+    logFile,
+    sessionDir
+  };
+  saveBrokerSession(repo, session);
+  return session;
 }
 
 function installFakeProcessCleanup(t, statePath) {
@@ -716,6 +767,34 @@ for (const behavior of ["silent-initialize", "initialize-rpc-error"]) {
     assert.equal(await waitForProcessExit(state.appServerPid), true);
   });
 }
+
+test("direct spawn ownership callback failure still terminates the spawned app-server", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "silent-initialize-sticky");
+  installFakeProcessCleanup(t, statePath);
+  let spawnedPid = null;
+  const connection = CodexAppServerClient.connect(repo, {
+    disableBroker: true,
+    env: buildEnv(binDir),
+    onProcessSpawned(child) {
+      spawnedPid = child.pid;
+      throw new Error("ownership publication failed");
+    }
+  });
+  connection.catch(() => {});
+
+  await assert.rejects(
+    Promise.race([
+      connection,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("ownership callback cleanup deadline was ignored")), 1000))
+    ]),
+    /ownership publication failed/i
+  );
+  assert.ok(Number.isSafeInteger(spawnedPid) && spawnedPid > 0);
+  assert.equal(await waitForProcessExit(spawnedPid), true);
+});
 
 for (const behavior of ["silent-initialize", "initialize-rpc-error"]) {
   test(`broker ${behavior} cleanup closes the socket`, async (t) => {
@@ -3430,9 +3509,52 @@ test("delayed broker startup rejects after terminating the exact child and canno
   assert.match(outcome.error.message, /broker startup|did not become ready/i);
 });
 
+test("cold broker startup failure proves its real app-server descendant exited before removing metadata", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "silent-initialize-sticky");
+  installFakeProcessCleanup(t, fakeStatePath);
+
+  const startup = ensureBrokerSession(repo, {
+    env: buildEnv(binDir),
+    timeoutMs: 75,
+    cleanupTimeoutMs: 1000
+  });
+  const outcomePromise = startup.then(
+    (value) => ({ value, error: null }),
+    (error) => ({ value: null, error })
+  );
+  const starting = await waitFor(() => {
+    const session = loadBrokerSession(repo);
+    return session?.state === "starting" && Number.isSafeInteger(session.pid) ? session : null;
+  });
+  const appServerPid = await waitFor(() => {
+    if (!fs.existsSync(fakeStatePath)) return null;
+    return JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerPid ?? null;
+  });
+
+  const outcome = await outcomePromise;
+  const brokerExited = await waitForProcessExit(starting.pid);
+  const descendantExited = await waitForProcessExit(appServerPid);
+
+  assert.deepEqual({
+    rejected: Boolean(outcome.error),
+    brokerExited,
+    descendantExited,
+    metadataRemovedAfterBothTerminal: loadBrokerSession(repo) === null
+  }, {
+    rejected: true,
+    brokerExited: true,
+    descendantExited: true,
+    metadataRemovedAfterBothTerminal: true
+  });
+  assert.match(outcome.error.message, /broker startup|did not become ready/i);
+});
+
 test("only nonce-authenticated broker status and shutdown calls are accepted", async (t) => {
   const repo = makeTempDir();
-  const fixture = installBrokerFixture(t);
+  const fixture = installBrokerFixture(t, { shutdownDelayMs: 1500 });
   const session = await ensureBrokerSession(repo, {
     scriptPath: fixture.scriptPath,
     env: fixture.env,
@@ -3459,16 +3581,65 @@ test("only nonce-authenticated broker status and shutdown calls are accepted", a
     nonce: session.nonce
   });
 
+  let terminatorCalls = 0;
   const cleanup = await teardownBrokerSession({
     ...session,
     shutdownTimeoutMs: 250,
     killProcess(pid) {
+      terminatorCalls += 1;
       process.kill(pid, "SIGTERM");
     }
   });
   assert.equal(cleanup.removed, true);
+  assert.equal(terminatorCalls, 0);
+  assert.equal(await waitForProcessExit(session.pid), true);
   clearBrokerSession(repo);
 });
+
+for (const failure of [
+  { method: "fixture/crash", name: "later nonzero broker exit" },
+  { method: "fixture/drop-endpoint", name: "later broker endpoint loss" }
+]) {
+  test(`${failure.name} durably revokes ready metadata before cleanup or reuse`, async (t) => {
+    const repo = makeTempDir();
+    const fixture = installBrokerFixture(t);
+    const session = await startUnobservedBroker(repo, fixture);
+    await sendFixtureRequest(session.endpoint, failure.method, session.nonce);
+    if (failure.method === "fixture/crash") {
+      assert.equal(await waitForProcessExit(session.pid), true);
+    } else {
+      await waitFor(async () =>
+        (await waitForBrokerEndpoint(session.endpoint, 50)) ? null : true
+      );
+    }
+
+    let observedFailedBeforeCleanup = false;
+    const replacement = await ensureBrokerSession(repo, {
+      scriptPath: fixture.scriptPath,
+      env: fixture.env,
+      timeoutMs: 1000,
+      statusTimeoutMs: 50,
+      shutdownTimeoutMs: 50,
+      cleanupProofTimeoutMs: 500,
+      captureProcessIdentityImpl(pid) {
+        if (pid === session.pid) {
+          observedFailedBeforeCleanup ||= loadBrokerSession(repo)?.state === "failed";
+        }
+        return captureProcessIdentity(pid);
+      },
+      killProcess(pid) {
+        process.kill(pid, "SIGTERM");
+      }
+    });
+
+    assert.equal(observedFailedBeforeCleanup, true);
+    assert.equal(replacement.state, "ready");
+    assert.notEqual(replacement.nonce, session.nonce);
+    const cleanup = await teardownBrokerSession(replacement);
+    assert.equal(cleanup.removed, true);
+    clearBrokerSession(repo);
+  });
+}
 
 test("ready broker revokes readiness and exits when its app-server child dies", async (t) => {
   const repo = makeTempDir();
@@ -3515,6 +3686,160 @@ test("ready broker revokes readiness and exits when its app-server child dies", 
   });
   assert.equal(replacement.transport, "direct");
   await replacement.close();
+});
+
+test("broker shutdown remains structural when failed-state publication throws", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "exit-with-pending-requests");
+  installFakeProcessCleanup(t, fakeStatePath);
+  const client = await CodexAppServerClient.connect(repo, { env: buildEnv(binDir) });
+  const ready = loadBrokerSession(repo);
+  const brokerStatePath = path.join(resolveStateDir(repo), "broker.json");
+  fs.chmodSync(brokerStatePath, 0o444);
+  t.after(async () => {
+    try {
+      fs.chmodSync(brokerStatePath, 0o666);
+    } catch {
+      // The broker state may already have been removed by a successful cleanup.
+    }
+    await client.close().catch(() => {});
+    if (processIsAlive(ready.pid)) {
+      try {
+        process.kill(ready.pid, "SIGTERM");
+      } catch (error) {
+        if (error?.code !== "ESRCH") throw error;
+      }
+      await waitForProcessExit(ready.pid);
+    }
+    clearBrokerSession(repo);
+  });
+
+  await assert.rejects(
+    client.request("account/read", {}, { timeoutMs: 500 }),
+    /exited unexpectedly|connection closed|transport closed|timed out/i
+  );
+
+  assert.equal(await waitForProcessExit(ready.pid), true);
+  assert.equal(await waitForBrokerEndpoint(ready.endpoint, 100), false);
+});
+
+test("broker terminal shutdown destroys sockets accepted while shutdown is beginning", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "oversized-stdout-on-account-read");
+  installFakeProcessCleanup(t, fakeStatePath);
+  const client = await CodexAppServerClient.connect(repo, { env: buildEnv(binDir) });
+  const ready = loadBrokerSession(repo);
+  const target = parseBrokerEndpoint(ready.endpoint);
+  const lateSockets = new Set();
+  const connectedLateSockets = new Set();
+  let lateConnectionAttempts = 0;
+  let pump = null;
+  t.after(async () => {
+    if (pump) clearInterval(pump);
+    for (const socket of lateSockets) socket.destroy();
+    await client.close().catch(() => {});
+    if (processIsAlive(ready.pid)) {
+      try {
+        process.kill(ready.pid, "SIGTERM");
+      } catch (error) {
+        if (error?.code !== "ESRCH") throw error;
+      }
+      await waitForProcessExit(ready.pid);
+    }
+    clearBrokerSession(repo);
+  });
+
+  const requestRejection = assert.rejects(
+    client.request("account/read", {}, { timeoutMs: 500 }),
+    /exited unexpectedly|connection closed|transport closed|timed out/i
+  );
+  await waitFor(() => loadBrokerSession(repo)?.state === "failed" ? true : null, {
+    timeoutMs: 500,
+    intervalMs: 1
+  });
+  const openLateSocket = () => {
+    lateConnectionAttempts += 1;
+    const socket = net.createConnection({ path: target.path });
+    lateSockets.add(socket);
+    socket.once("connect", () => {
+      connectedLateSockets.add(socket);
+      socket.write("{\"id\":1");
+    });
+    socket.on("error", () => {});
+    socket.once("close", () => {
+      lateSockets.delete(socket);
+      connectedLateSockets.delete(socket);
+    });
+  };
+  openLateSocket();
+  pump = setInterval(openLateSocket, 1);
+  await requestRejection;
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  clearInterval(pump);
+  pump = null;
+
+  assert.ok(lateConnectionAttempts > 0);
+  assert.equal(await waitForProcessExit(ready.pid), true);
+  assert.equal(connectedLateSockets.size, 0);
+});
+
+test("broker rejects an oversized request without a newline and remains healthy", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const client = await CodexAppServerClient.connect(repo, { env: buildEnv(binDir) });
+  const ready = loadBrokerSession(repo);
+  t.after(async () => {
+    await client.close().catch(() => {});
+    const stored = loadBrokerSession(repo);
+    if (stored) {
+      await teardownBrokerSession(stored).catch(() => {});
+      clearBrokerSession(repo);
+    }
+  });
+
+  const target = parseBrokerEndpoint(ready.endpoint);
+  const oversized = await new Promise((resolve, reject) => {
+    const socket = net.createConnection({ path: target.path });
+    let response = "";
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(result);
+    };
+    const timer = setTimeout(() => finish({ closed: false, response }), 1000);
+    socket.setEncoding("utf8");
+    socket.once("connect", () => {
+      socket.write("x".repeat(9 * 1024 * 1024));
+    });
+    socket.on("data", (chunk) => {
+      if (response.length < 4096) response += chunk;
+    });
+    socket.once("close", () => finish({ closed: true, response }));
+    socket.once("error", (error) => {
+      if (error?.code === "ECONNRESET" || error?.code === "EPIPE" || error?.code === "EOF") {
+        finish({ closed: true, response });
+      } else {
+        reject(error);
+      }
+    });
+  });
+
+  assert.equal(oversized.closed, true);
+  assert.match(oversized.response, /request.*too large|maximum.*request/i);
+  assert.ok(oversized.response.length < 1024);
+  assert.deepEqual(await sendBrokerStatus(ready.endpoint, ready.nonce, 250), {
+    state: "ready",
+    pid: ready.pid,
+    nonce: ready.nonce
+  });
 });
 
 test("blocked authenticated shutdown terminates only after stored process identity matches", async (t) => {

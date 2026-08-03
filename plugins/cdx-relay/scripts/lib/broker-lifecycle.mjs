@@ -274,7 +274,11 @@ function publishBrokerReady(cwd, session) {
 
 function observeBrokerChild(cwd, session, child) {
   const fail = (detail) => {
-    markBrokerSessionFailed(cwd, session, detail);
+    try {
+      markBrokerSessionFailed(cwd, session, detail);
+    } catch {
+      // A failed diagnostic write cannot turn child observation into an uncaught exception.
+    }
   };
   child.once("error", fail);
   child.once("exit", (code, signal) => {
@@ -336,23 +340,57 @@ function waitForChildTerminal(child, timeoutMs) {
 async function terminateSpawnedBroker(child, timeoutMs) {
   if (childIsTerminal(child)) return true;
   try {
-    child.kill("SIGTERM");
+    if (process.platform === "win32" && Number.isSafeInteger(child.pid)) {
+      terminateProcessTree(child.pid);
+    } else {
+      child.kill("SIGTERM");
+    }
   } catch {
     // Terminal proof below decides whether metadata can be removed.
   }
   const gracefulMs = Math.max(1, Math.floor(timeoutMs * 0.8));
   if (await waitForChildTerminal(child, gracefulMs)) return true;
   try {
-    child.kill("SIGKILL");
+    if (process.platform === "win32" && Number.isSafeInteger(child.pid)) {
+      terminateProcessTree(child.pid);
+    } else {
+      child.kill("SIGKILL");
+    }
   } catch {
     // Terminal proof below decides whether metadata can be removed.
   }
   return waitForChildTerminal(child, Math.max(1, timeoutMs - gracefulMs));
 }
 
+function readOwnedAppServerPid(session) {
+  const appServerPidFile = session.sessionDir
+    ? path.join(session.sessionDir, "app-server.pid")
+    : null;
+  if (!appServerPidFile || !fs.existsSync(appServerPidFile)) {
+    return { recorded: false, pid: null };
+  }
+  const pid = Number(fs.readFileSync(appServerPidFile, "utf8").trim());
+  return Number.isSafeInteger(pid) && pid > 0
+    ? { recorded: true, pid }
+    : { recorded: true, pid: null };
+}
+
+async function waitForOwnedProcessExit(pid, expectedIdentity, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const current = captureProcessIdentity(pid);
+    if (current === null || !matchesProcessIdentity(expectedIdentity, current)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  const current = captureProcessIdentity(pid);
+  return current === null || !matchesProcessIdentity(expectedIdentity, current);
+}
+
 function removeBrokerArtifacts({ endpoint = null, pidFile = null, logFile = null, sessionDir = null }) {
   if (pidFile && fs.existsSync(pidFile)) fs.unlinkSync(pidFile);
   if (logFile && fs.existsSync(logFile)) fs.unlinkSync(logFile);
+  const appServerPidFile = sessionDir ? path.join(sessionDir, "app-server.pid") : null;
+  if (appServerPidFile && fs.existsSync(appServerPidFile)) fs.unlinkSync(appServerPidFile);
   if (endpoint) {
     try {
       const target = parseBrokerEndpoint(endpoint);
@@ -373,25 +411,73 @@ function removeBrokerArtifacts({ endpoint = null, pidFile = null, logFile = null
 
 async function failSpawnedBroker(cwd, session, child, error, cleanupTimeoutMs) {
   markBrokerSessionFailed(cwd, session, error);
+  let descendant = readOwnedAppServerPid(session);
+  let descendantIdentity = null;
+  let descendantIdentityAvailable = true;
+  if (descendant.recorded && descendant.pid) {
+    try {
+      descendantIdentity = captureProcessIdentity(descendant.pid);
+    } catch {
+      descendantIdentityAvailable = false;
+    }
+  } else if (descendant.recorded) {
+    descendantIdentityAvailable = false;
+  }
   const terminal = await terminateSpawnedBroker(child, cleanupTimeoutMs);
-  if (terminal) {
+  if (!descendant.recorded) descendant = readOwnedAppServerPid(session);
+  let descendantTerminal = !descendant.recorded;
+  if (descendant.recorded && descendant.pid && descendantIdentityAvailable) {
+    try {
+      const currentIdentity = captureProcessIdentity(descendant.pid);
+      if (
+        terminal &&
+        descendantIdentity !== null &&
+        currentIdentity !== null &&
+        matchesProcessIdentity(descendantIdentity, currentIdentity)
+      ) {
+        if (process.platform === "win32") terminateProcessTree(descendant.pid);
+        else process.kill(descendant.pid, "SIGTERM");
+      }
+      descendantTerminal = descendantIdentity === null || await waitForOwnedProcessExit(
+        descendant.pid,
+        descendantIdentity,
+        cleanupTimeoutMs
+      );
+    } catch {
+      descendantTerminal = false;
+    }
+  }
+  if (terminal && descendantTerminal) {
     removeBrokerArtifacts(session);
     clearBrokerSessionIfNonce(cwd, session.nonce);
   }
-  const suffix = terminal
-    ? "The exact spawned child reached a terminal event."
-    : "Exact-child termination could not be proved; diagnostic metadata was retained.";
+  const suffix = terminal && descendantTerminal
+    ? "The exact spawned broker and its recorded app-server descendant reached terminal state."
+    : "Broker and app-server descendant terminality could not both be proved; diagnostic metadata was retained.";
   throw new Error(`${error.message} ${suffix}`, { cause: error });
 }
 
 export async function ensureBrokerSession(cwd, options = {}) {
   const existing = loadBrokerSession(cwd);
   if (existing?.state === "ready") {
+    let readinessFailure = null;
     try {
       const status = await sendBrokerStatus(existing.endpoint, existing.nonce, options.statusTimeoutMs ?? 150);
       if (status.pid === existing.pid) return existing;
+      readinessFailure = new Error(
+        `Broker status pid ${status.pid} did not match recorded pid ${existing.pid}.`
+      );
+    } catch (error) {
+      readinessFailure = error;
+    }
+    try {
+      markBrokerSessionFailed(
+        cwd,
+        existing,
+        readinessFailure ?? new Error("Broker readiness could not be confirmed.")
+      );
     } catch {
-      // Teardown below classifies authentication, transport, and identity failures.
+      // Teardown below still classifies authentication, transport, and identity failures.
     }
   }
 
@@ -401,6 +487,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
       killProcess: options.killProcess ?? terminateProcessTree,
       captureProcessIdentityImpl: options.captureProcessIdentityImpl ?? captureProcessIdentity,
       shutdownTimeoutMs: options.shutdownTimeoutMs ?? BROKER_SHUTDOWN_TIMEOUT_MS,
+      cooperativeExitTimeoutMs: options.cooperativeExitTimeoutMs,
       cleanupProofTimeoutMs: options.cleanupProofTimeoutMs
     });
     if (!cleanup.removed) {
@@ -508,6 +595,7 @@ export async function teardownBrokerSession({
   killProcess = terminateProcessTree,
   captureProcessIdentityImpl = captureProcessIdentity,
   shutdownTimeoutMs = BROKER_SHUTDOWN_TIMEOUT_MS,
+  cooperativeExitTimeoutMs = 2000,
   cleanupProofTimeoutMs = 1000
 }) {
   let shutdown = null;
@@ -526,7 +614,7 @@ export async function teardownBrokerSession({
     }
   }
 
-  if (!Number.isSafeInteger(pid) || pid <= 0 || !processIdentity) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
     return {
       removed: false,
       reason: "process-identity-unavailable",
@@ -535,15 +623,48 @@ export async function teardownBrokerSession({
   }
 
   let currentIdentity;
-  try {
-    currentIdentity = captureProcessIdentityImpl(pid);
-  } catch (error) {
+  if (shutdown?.stopped === true) {
+    let cooperativeProof;
+    try {
+      cooperativeProof = await waitForRecordedProcessExit(
+        pid,
+        captureProcessIdentityImpl,
+        cooperativeExitTimeoutMs
+      );
+    } catch (error) {
+      return {
+        removed: false,
+        reason: "process-identity-unavailable",
+        shutdown,
+        error
+      };
+    }
+    if (cooperativeProof.exited) {
+      removeBrokerArtifacts({ endpoint, pidFile, logFile, sessionDir });
+      return { removed: true, reason: "cooperative-shutdown", shutdown };
+    }
+    currentIdentity = cooperativeProof.current;
+  }
+
+  if (!processIdentity) {
     return {
       removed: false,
       reason: "process-identity-unavailable",
-      shutdown,
-      error
+      shutdown
     };
+  }
+
+  if (currentIdentity === undefined) {
+    try {
+      currentIdentity = captureProcessIdentityImpl(pid);
+    } catch (error) {
+      return {
+        removed: false,
+        reason: "process-identity-unavailable",
+        shutdown,
+        error
+      };
+    }
   }
 
   if (currentIdentity === null) {

@@ -14,6 +14,9 @@ import {
 } from "./lib/broker-lifecycle.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
+const MAX_BROKER_REQUEST_CHARS = 8 * 1024 * 1024;
+const BROKER_SERVER_CLOSE_TIMEOUT_MS = 500;
+let emergencyFailureHandler = null;
 
 function buildStreamThreadIds(method, params, result) {
   const threadIds = new Set();
@@ -41,12 +44,12 @@ function isInterruptRequest(message) {
   return message?.method === "turn/interrupt";
 }
 
-function writePidFile(pidFile) {
+function writePidFile(pidFile, pid = process.pid) {
   if (!pidFile) {
     return;
   }
   fs.mkdirSync(path.dirname(pidFile), { recursive: true });
-  fs.writeFileSync(pidFile, `${process.pid}\n`, "utf8");
+  fs.writeFileSync(pidFile, `${pid}\n`, "utf8");
 }
 
 async function main() {
@@ -76,15 +79,18 @@ async function main() {
   const nonce = String(options.nonce);
   const listenTarget = parseBrokerEndpoint(endpoint);
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
+  const appServerPidFile = pidFile ? path.join(path.dirname(pidFile), "app-server.pid") : null;
   writePidFile(pidFile);
 
-  const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
+  let appClient = null;
+  let server = null;
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
   const sockets = new Set();
   let intentionalShutdown = false;
   let terminalizing = false;
+  let shutdownPromise = null;
 
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
@@ -121,28 +127,133 @@ async function main() {
     if (pidFile && fs.existsSync(pidFile)) {
       fs.unlinkSync(pidFile);
     }
+    if (appServerPidFile && fs.existsSync(appServerPidFile)) {
+      fs.unlinkSync(appServerPidFile);
+    }
   }
 
-  async function shutdown(server, { destroySockets = false } = {}) {
+  function beginServerClose() {
+    if (!server?.listening) return null;
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      try {
+        server.close(finish);
+      } catch {
+        finish();
+      }
+    });
+  }
+
+  function publishFailureBestEffort(error) {
+    try {
+      markBrokerSessionFailed(cwd, { endpoint, pid: process.pid, nonce }, error);
+    } catch (publicationError) {
+      process.stderr.write(
+        `Failed to publish broker failure: ${publicationError instanceof Error ? publicationError.message : String(publicationError)}\n`
+      );
+    }
+  }
+
+  function beginShutdown({ intentional = false, error = null, destroySockets = true } = {}) {
+    if (intentional) intentionalShutdown = true;
+    terminalizing = true;
+    if (shutdownPromise) return shutdownPromise;
+
+    const serverClose = beginServerClose();
     for (const socket of sockets) {
       if (destroySockets) socket.destroy();
       else socket.end();
     }
-    await appClient.close().catch(() => {});
-    if (server.listening) {
-      await new Promise((resolve) => server.close(resolve));
+    if (error) publishFailureBestEffort(error);
+
+    shutdownPromise = (async () => {
+      await appClient?.close().catch(() => {});
+      for (const socket of sockets) socket.destroy();
+      if (serverClose) {
+        await Promise.race([
+          serverClose,
+          new Promise((resolve) => {
+            const timer = setTimeout(resolve, BROKER_SERVER_CLOSE_TIMEOUT_MS);
+            timer.unref?.();
+          })
+        ]);
+      }
+      removeRuntimeArtifacts();
+    })();
+    return shutdownPromise;
+  }
+
+  async function exitAfterShutdown({ intentional = false, error = null, exitCode = 1, destroySockets = true } = {}) {
+    try {
+      await beginShutdown({ intentional, error, destroySockets });
+    } finally {
+      process.exit(exitCode);
     }
-    removeRuntimeArtifacts();
+  }
+
+  emergencyFailureHandler = (error) => exitAfterShutdown({ error, exitCode: 1 });
+  process.on("SIGTERM", () => {
+    void exitAfterShutdown({ intentional: true, exitCode: 0, destroySockets: false });
+  });
+  process.on("SIGINT", () => {
+    void exitAfterShutdown({ intentional: true, exitCode: 0, destroySockets: false });
+  });
+
+  try {
+    appClient = await CodexAppServerClient.connect(cwd, {
+      disableBroker: true,
+      onClientCreated(client) {
+        appClient = client;
+      },
+      onProcessSpawned(child) {
+        if (Number.isSafeInteger(child.pid) && child.pid > 0) {
+          writePidFile(appServerPidFile, child.pid);
+        }
+      }
+    });
+  } catch (error) {
+    if (terminalizing) {
+      await shutdownPromise;
+      return;
+    }
+    await exitAfterShutdown({ error, exitCode: 1 });
+    return;
   }
 
   appClient.setNotificationHandler(routeNotification);
 
-  const server = net.createServer((socket) => {
+  server = net.createServer((socket) => {
+    if (terminalizing) {
+      socket.destroy();
+      return;
+    }
     sockets.add(socket);
     socket.setEncoding("utf8");
     let buffer = "";
+    let inputRejected = false;
 
     socket.on("data", async (chunk) => {
+      if (inputRejected || terminalizing) {
+        socket.destroy();
+        return;
+      }
+      if (buffer.length + chunk.length > MAX_BROKER_REQUEST_CHARS) {
+        inputRejected = true;
+        buffer = "";
+        const diagnostic = `${JSON.stringify({
+          id: null,
+          error: buildJsonRpcError(-32600, "Broker request exceeded the maximum request size.")
+        })}\n`;
+        socket.end(diagnostic);
+        const destroyTimer = setTimeout(() => socket.destroy(), 250);
+        destroyTimer.unref?.();
+        return;
+      }
       buffer += chunk;
       let newlineIndex = buffer.indexOf("\n");
       while (newlineIndex !== -1) {
@@ -202,10 +313,9 @@ async function main() {
             });
             continue;
           }
-          intentionalShutdown = true;
           send(socket, { id: message.id, result: { stopped: true, nonce } });
-          await shutdown(server);
-          process.exit(0);
+          await exitAfterShutdown({ intentional: true, exitCode: 0, destroySockets: false });
+          return;
         }
 
         if (message.id === undefined) {
@@ -278,31 +388,29 @@ async function main() {
     });
   });
 
-  process.on("SIGTERM", async () => {
-    intentionalShutdown = true;
-    await shutdown(server);
-    process.exit(0);
-  });
-
-  process.on("SIGINT", async () => {
-    intentionalShutdown = true;
-    await shutdown(server);
-    process.exit(0);
-  });
-
   appClient.addTerminalListener((error) => {
     if (intentionalShutdown || terminalizing) return;
-    terminalizing = true;
-    markBrokerSessionFailed(cwd, { endpoint, pid: process.pid, nonce }, error);
-    void shutdown(server, { destroySockets: true }).finally(() => {
-      process.exitCode = 1;
-    });
+    void exitAfterShutdown({ error, exitCode: 1, destroySockets: true });
   });
 
-  server.listen(listenTarget.path);
+  server.on("error", (error) => {
+    if (terminalizing) return;
+    void exitAfterShutdown({ error, exitCode: 1, destroySockets: true });
+  });
+  if (!terminalizing) {
+    try {
+      server.listen(listenTarget.path);
+    } catch (error) {
+      await exitAfterShutdown({ error, exitCode: 1, destroySockets: true });
+    }
+  }
 }
 
 main().catch((error) => {
   process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+  if (emergencyFailureHandler) {
+    void emergencyFailureHandler(error);
+    return;
+  }
   process.exit(1);
 });

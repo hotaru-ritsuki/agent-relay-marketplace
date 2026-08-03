@@ -390,6 +390,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     this.proc.stdout.on("end", () => {
       this.handleInputEnd();
     });
+    this.options.onProcessSpawned?.(this.proc);
 
     await this.request("initialize", {
       clientInfo: this.options.clientInfo ?? DEFAULT_CLIENT_INFO,
@@ -540,6 +541,7 @@ export class CodexAppServerClient {
       ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
       : new SpawnedCodexAppServerClient(cwd, options);
     try {
+      options.onClientCreated?.(client);
       await client.initialize();
       return client;
     } catch (error) {
