@@ -57,6 +57,8 @@ export function runAuthoritativeTests({ repoRoot, nodeArgs = [] }) {
     throw new Error(`No authoritative tests found beneath ${root}`);
   }
 
+  const environment = { ...process.env };
+  delete environment.NODE_TEST_CONTEXT;
   const result = spawnSync(process.execPath, [
     "--test",
     "--test-concurrency=1",
@@ -65,6 +67,7 @@ export function runAuthoritativeTests({ repoRoot, nodeArgs = [] }) {
     ...testFiles,
   ], {
     cwd: root,
+    env: environment,
     shell: false,
     stdio: "inherit",
   });

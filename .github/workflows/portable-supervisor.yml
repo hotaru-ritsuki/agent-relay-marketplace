@@ -95,5 +95,6 @@ jobs:
           done
           cat "$RUNNER_TEMP/cdx-relay-reaper.log"
           exit 1
-      - run: node --test --test-concurrency=1 --test-timeout=600000 plugins/cdx-relay/tests/process-supervisor-linux.test.mjs
+      - name: Verify Linux protected-cgroup strict supervision
+        run: node --test --test-concurrency=1 --test-timeout=600000 plugins/cdx-relay/tests/process-supervisor-linux.test.mjs
       - run: npm run check
