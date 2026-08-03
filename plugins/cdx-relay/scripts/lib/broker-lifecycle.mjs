@@ -15,6 +15,7 @@ export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
 export const BROKER_AUTH_ERROR_CODE = -32002;
 export const BROKER_SHUTDOWN_TIMEOUT_MS = 5000;
+export const APP_SERVER_OWNERSHIP_FILE = "app-server-ownership.json";
 const BROKER_STATE_FILE = "broker.json";
 const MAX_CONTROL_RESPONSE_CHARS = 64 * 1024;
 
@@ -258,6 +259,105 @@ export function markBrokerSessionFailed(cwd, identity, failure) {
   return true;
 }
 
+function resolveAppServerOwnershipFile(sessionDir) {
+  return typeof sessionDir === "string" && sessionDir.length > 0
+    ? path.join(sessionDir, APP_SERVER_OWNERSHIP_FILE)
+    : null;
+}
+
+export function recordAppServerOwnership({
+  sessionDir,
+  endpoint,
+  nonce,
+  brokerPid = process.pid,
+  childPid,
+  processIdentity
+}) {
+  if (
+    typeof sessionDir !== "string" ||
+    typeof endpoint !== "string" ||
+    typeof nonce !== "string" ||
+    !Number.isSafeInteger(brokerPid) ||
+    brokerPid <= 0 ||
+    !Number.isSafeInteger(childPid) ||
+    childPid <= 0 ||
+    !matchesProcessIdentity({ ...processIdentity, pid: childPid }, processIdentity)
+  ) {
+    throw new Error("App-server ownership requires a complete broker binding and spawn-time process identity.");
+  }
+  const resolvedSessionDir = path.resolve(sessionDir);
+  const ownershipFile = resolveAppServerOwnershipFile(resolvedSessionDir);
+  const record = {
+    version: 1,
+    state: "spawned",
+    broker: {
+      nonce,
+      pid: brokerPid,
+      endpoint,
+      sessionDir: resolvedSessionDir
+    },
+    child: {
+      pid: childPid,
+      processIdentity
+    }
+  };
+  fs.writeFileSync(ownershipFile, `${JSON.stringify(record, null, 2)}\n`, {
+    encoding: "utf8",
+    flag: "wx"
+  });
+  return record;
+}
+
+function readBoundAppServerOwnership(session) {
+  const ownershipFile = resolveAppServerOwnershipFile(session.sessionDir);
+  if (!ownershipFile || !fs.existsSync(ownershipFile)) {
+    return { valid: false, reason: "ownership-record-missing", ownershipFile };
+  }
+
+  let record;
+  try {
+    record = JSON.parse(fs.readFileSync(ownershipFile, "utf8"));
+  } catch (error) {
+    return { valid: false, reason: "ownership-record-malformed", ownershipFile, error };
+  }
+
+  const childPid = record?.child?.pid;
+  const childIdentity = record?.child?.processIdentity;
+  const structurallyValid =
+    record?.version === 1 &&
+    record?.state === "spawned" &&
+    typeof record?.broker?.nonce === "string" &&
+    Number.isSafeInteger(record?.broker?.pid) &&
+    typeof record?.broker?.endpoint === "string" &&
+    typeof record?.broker?.sessionDir === "string" &&
+    Number.isSafeInteger(childPid) &&
+    childPid > 0 &&
+    childIdentity?.pid === childPid &&
+    typeof childIdentity?.startIdentity === "string" &&
+    childIdentity.startIdentity.length > 0 &&
+    typeof childIdentity?.executableIdentity === "string" &&
+    childIdentity.executableIdentity.length > 0;
+  if (!structurallyValid) {
+    return { valid: false, reason: "ownership-record-malformed", ownershipFile };
+  }
+
+  let sessionDirMatches = false;
+  try {
+    sessionDirMatches = path.resolve(record.broker.sessionDir) === path.resolve(session.sessionDir);
+  } catch {
+    // The structural checks above are intentionally followed by binding checks.
+  }
+  if (
+    record.broker.nonce !== session.nonce ||
+    record.broker.pid !== session.pid ||
+    record.broker.endpoint !== session.endpoint ||
+    !sessionDirMatches
+  ) {
+    return { valid: false, reason: "ownership-record-unbound", ownershipFile, record };
+  }
+  return { valid: true, ownershipFile, record };
+}
+
 function publishBrokerReady(cwd, session) {
   const existing = loadBrokerSession(cwd);
   if (
@@ -362,28 +462,86 @@ async function terminateSpawnedBroker(child, timeoutMs) {
   return waitForChildTerminal(child, Math.max(1, timeoutMs - gracefulMs));
 }
 
-function readOwnedAppServerPid(session) {
-  const appServerPidFile = session.sessionDir
-    ? path.join(session.sessionDir, "app-server.pid")
-    : null;
-  if (!appServerPidFile || !fs.existsSync(appServerPidFile)) {
-    return { recorded: false, pid: null };
-  }
-  const pid = Number(fs.readFileSync(appServerPidFile, "utf8").trim());
-  return Number.isSafeInteger(pid) && pid > 0
-    ? { recorded: true, pid }
-    : { recorded: true, pid: null };
-}
-
-async function waitForOwnedProcessExit(pid, expectedIdentity, timeoutMs) {
+async function waitForOwnedProcessExit(pid, expectedIdentity, timeoutMs, captureIdentity) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const current = captureProcessIdentity(pid);
+    const current = captureIdentity(pid);
     if (current === null || !matchesProcessIdentity(expectedIdentity, current)) return true;
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
-  const current = captureProcessIdentity(pid);
+  const current = captureIdentity(pid);
   return current === null || !matchesProcessIdentity(expectedIdentity, current);
+}
+
+function terminateOwnedAppServer(pid) {
+  if (process.platform === "win32") terminateProcessTree(pid);
+  else process.kill(pid, "SIGTERM");
+}
+
+async function proveOwnedAppServerTerminal(session, {
+  timeoutMs,
+  captureIdentity = captureProcessIdentity,
+  terminateOwnedProcess = terminateOwnedAppServer,
+  ownership = readBoundAppServerOwnership(session)
+}) {
+  if (!ownership.valid) {
+    return { terminal: false, reason: ownership.reason, ownership };
+  }
+
+  const expectedIdentity = ownership.record.child.processIdentity;
+  const pid = ownership.record.child.pid;
+  let currentIdentity;
+  try {
+    currentIdentity = captureIdentity(pid);
+  } catch (error) {
+    return { terminal: false, reason: "owned-process-identity-unavailable", ownership, error };
+  }
+  if (currentIdentity === null || !matchesProcessIdentity(expectedIdentity, currentIdentity)) {
+    return { terminal: true, reason: "owned-process-gone", ownership };
+  }
+
+  try {
+    await terminateOwnedProcess(pid);
+  } catch (error) {
+    return { terminal: false, reason: "owned-process-termination-failed", ownership, error };
+  }
+  try {
+    const terminal = await waitForOwnedProcessExit(
+      pid,
+      expectedIdentity,
+      timeoutMs,
+      captureIdentity
+    );
+    return {
+      terminal,
+      reason: terminal ? "owned-process-terminated" : "owned-process-termination-unproved",
+      ownership
+    };
+  } catch (error) {
+    return { terminal: false, reason: "owned-process-identity-unavailable", ownership, error };
+  }
+}
+
+async function removeBrokerArtifactsAfterTerminalProof(session, options = {}) {
+  const ownershipFile = resolveAppServerOwnershipFile(session.sessionDir);
+  const ownershipRequired = session.appServerOwnershipRequired === true ||
+    Boolean(ownershipFile && fs.existsSync(ownershipFile));
+  if (ownershipRequired) {
+    const proof = await proveOwnedAppServerTerminal(session, {
+      timeoutMs: options.timeoutMs ?? 1000,
+      captureIdentity: options.captureIdentity ?? captureProcessIdentity,
+      terminateOwnedProcess: options.terminateOwnedProcess ?? terminateOwnedAppServer
+    });
+    if (!proof.terminal) {
+      return {
+        removed: false,
+        reason: proof.reason,
+        descendantProof: proof
+      };
+    }
+  }
+  removeBrokerArtifacts(session);
+  return { removed: true };
 }
 
 function removeBrokerArtifacts({ endpoint = null, pidFile = null, logFile = null, sessionDir = null }) {
@@ -391,6 +549,10 @@ function removeBrokerArtifacts({ endpoint = null, pidFile = null, logFile = null
   if (logFile && fs.existsSync(logFile)) fs.unlinkSync(logFile);
   const appServerPidFile = sessionDir ? path.join(sessionDir, "app-server.pid") : null;
   if (appServerPidFile && fs.existsSync(appServerPidFile)) fs.unlinkSync(appServerPidFile);
+  const appServerOwnershipFile = resolveAppServerOwnershipFile(sessionDir);
+  if (appServerOwnershipFile && fs.existsSync(appServerOwnershipFile)) {
+    fs.unlinkSync(appServerOwnershipFile);
+  }
   if (endpoint) {
     try {
       const target = parseBrokerEndpoint(endpoint);
@@ -409,51 +571,26 @@ function removeBrokerArtifacts({ endpoint = null, pidFile = null, logFile = null
   }
 }
 
-async function failSpawnedBroker(cwd, session, child, error, cleanupTimeoutMs) {
+async function failSpawnedBroker(cwd, session, child, error, cleanupTimeoutMs, options = {}) {
+  const ownership = readBoundAppServerOwnership(session);
   markBrokerSessionFailed(cwd, session, error);
-  let descendant = readOwnedAppServerPid(session);
-  let descendantIdentity = null;
-  let descendantIdentityAvailable = true;
-  if (descendant.recorded && descendant.pid) {
-    try {
-      descendantIdentity = captureProcessIdentity(descendant.pid);
-    } catch {
-      descendantIdentityAvailable = false;
-    }
-  } else if (descendant.recorded) {
-    descendantIdentityAvailable = false;
-  }
   const terminal = await terminateSpawnedBroker(child, cleanupTimeoutMs);
-  if (!descendant.recorded) descendant = readOwnedAppServerPid(session);
-  let descendantTerminal = !descendant.recorded;
-  if (descendant.recorded && descendant.pid && descendantIdentityAvailable) {
-    try {
-      const currentIdentity = captureProcessIdentity(descendant.pid);
-      if (
-        terminal &&
-        descendantIdentity !== null &&
-        currentIdentity !== null &&
-        matchesProcessIdentity(descendantIdentity, currentIdentity)
-      ) {
-        if (process.platform === "win32") terminateProcessTree(descendant.pid);
-        else process.kill(descendant.pid, "SIGTERM");
-      }
-      descendantTerminal = descendantIdentity === null || await waitForOwnedProcessExit(
-        descendant.pid,
-        descendantIdentity,
-        cleanupTimeoutMs
-      );
-    } catch {
-      descendantTerminal = false;
-    }
-  }
+  const descendantProof = terminal
+    ? await proveOwnedAppServerTerminal(session, {
+        timeoutMs: cleanupTimeoutMs,
+        captureIdentity: options.captureOwnedProcessIdentityImpl ?? captureProcessIdentity,
+        terminateOwnedProcess: options.killOwnedProcess ?? terminateOwnedAppServer,
+        ownership
+      })
+    : { terminal: false, reason: "broker-termination-unproved" };
+  const descendantTerminal = descendantProof.terminal;
   if (terminal && descendantTerminal) {
     removeBrokerArtifacts(session);
     clearBrokerSessionIfNonce(cwd, session.nonce);
   }
   const suffix = terminal && descendantTerminal
     ? "The exact spawned broker and its recorded app-server descendant reached terminal state."
-    : "Broker and app-server descendant terminality could not both be proved; diagnostic metadata was retained.";
+    : `Broker and app-server descendant terminality could not both be proved (${descendantProof.reason}); diagnostic metadata was retained.`;
   throw new Error(`${error.message} ${suffix}`, { cause: error });
 }
 
@@ -470,14 +607,21 @@ export async function ensureBrokerSession(cwd, options = {}) {
     } catch (error) {
       readinessFailure = error;
     }
+    const publishFailed = options.markBrokerSessionFailedImpl ?? markBrokerSessionFailed;
     try {
-      markBrokerSessionFailed(
+      const published = publishFailed(
         cwd,
         existing,
         readinessFailure ?? new Error("Broker readiness could not be confirmed.")
       );
-    } catch {
-      // Teardown below still classifies authentication, transport, and identity failures.
+      if (!published) {
+        throw new Error("The stored broker identity no longer matched the ready session.");
+      }
+    } catch (error) {
+      throw new Error(
+        "Broker failed state could not be durably published; teardown and replacement were refused.",
+        { cause: error }
+      );
     }
   }
 
@@ -485,6 +629,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
     const cleanup = await teardownBrokerSession({
       ...existing,
       killProcess: options.killProcess ?? terminateProcessTree,
+      killOwnedProcess: options.killOwnedProcess ?? terminateOwnedAppServer,
       captureProcessIdentityImpl: options.captureProcessIdentityImpl ?? captureProcessIdentity,
       shutdownTimeoutMs: options.shutdownTimeoutMs ?? BROKER_SHUTDOWN_TIMEOUT_MS,
       cooperativeExitTimeoutMs: options.cooperativeExitTimeoutMs,
@@ -505,7 +650,8 @@ export async function ensureBrokerSession(cwd, options = {}) {
   const endpoint = endpointFactory(sessionDir, options.platform);
   const pidFile = path.join(sessionDir, "broker.pid");
   const logFile = path.join(sessionDir, "broker.log");
-  const scriptPath = options.scriptPath ?? fileURLToPath(new URL("../app-server-broker.mjs", import.meta.url));
+  const defaultScriptPath = fileURLToPath(new URL("../app-server-broker.mjs", import.meta.url));
+  const scriptPath = options.scriptPath ?? defaultScriptPath;
   const nonce = randomBytes(32).toString("hex");
   let session = {
     state: "starting",
@@ -513,6 +659,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
     pid: null,
     nonce,
     processIdentity: null,
+    appServerOwnershipRequired: options.appServerOwnershipRequired ?? (scriptPath === defaultScriptPath),
     pidFile,
     logFile,
     sessionDir
@@ -548,7 +695,11 @@ export async function ensureBrokerSession(cwd, options = {}) {
       session,
       child,
       new Error("Broker startup did not return a valid child pid."),
-      cleanupTimeoutMs
+      cleanupTimeoutMs,
+      {
+        captureOwnedProcessIdentityImpl: options.captureOwnedProcessIdentityImpl,
+        killOwnedProcess: options.killOwnedProcess
+      }
     );
   }
 
@@ -565,12 +716,18 @@ export async function ensureBrokerSession(cwd, options = {}) {
       throw new Error(`Broker startup did not become ready within ${startupTimeoutMs} ms.`);
     }
     await waitForBrokerReady(endpoint, nonce, session.pid, remainingStartupMs);
+    if (session.appServerOwnershipRequired && !readBoundAppServerOwnership(session).valid) {
+      throw new Error("Broker readiness could not be published without a bound app-server ownership record.");
+    }
     if (!publishBrokerReady(cwd, session)) {
       throw new Error("Broker readiness was revoked before it could be published.");
     }
     return { ...session, state: "ready" };
   } catch (error) {
-    return failSpawnedBroker(cwd, session, child, error, cleanupTimeoutMs);
+    return failSpawnedBroker(cwd, session, child, error, cleanupTimeoutMs, {
+      captureOwnedProcessIdentityImpl: options.captureOwnedProcessIdentityImpl,
+      killOwnedProcess: options.killOwnedProcess
+    });
   }
 }
 
@@ -592,12 +749,28 @@ export async function teardownBrokerSession({
   pid = null,
   nonce = null,
   processIdentity = null,
+  appServerOwnershipRequired = false,
   killProcess = terminateProcessTree,
+  killOwnedProcess = terminateOwnedAppServer,
   captureProcessIdentityImpl = captureProcessIdentity,
   shutdownTimeoutMs = BROKER_SHUTDOWN_TIMEOUT_MS,
   cooperativeExitTimeoutMs = 2000,
   cleanupProofTimeoutMs = 1000
 }) {
+  const artifactSession = {
+    endpoint,
+    pidFile,
+    logFile,
+    sessionDir,
+    pid,
+    nonce,
+    appServerOwnershipRequired
+  };
+  const finalizeArtifacts = () => removeBrokerArtifactsAfterTerminalProof(artifactSession, {
+    timeoutMs: cleanupProofTimeoutMs,
+    captureIdentity: captureProcessIdentityImpl,
+    terminateOwnedProcess: killOwnedProcess
+  });
   let shutdown = null;
   if (endpoint) {
     try {
@@ -640,8 +813,10 @@ export async function teardownBrokerSession({
       };
     }
     if (cooperativeProof.exited) {
-      removeBrokerArtifacts({ endpoint, pidFile, logFile, sessionDir });
-      return { removed: true, reason: "cooperative-shutdown", shutdown };
+      const artifacts = await finalizeArtifacts();
+      return artifacts.removed
+        ? { removed: true, reason: "cooperative-shutdown", shutdown }
+        : { ...artifacts, shutdown };
     }
     currentIdentity = cooperativeProof.current;
   }
@@ -668,8 +843,10 @@ export async function teardownBrokerSession({
   }
 
   if (currentIdentity === null) {
-    removeBrokerArtifacts({ endpoint, pidFile, logFile, sessionDir });
-    return { removed: true, reason: "process-exited", shutdown };
+    const artifacts = await finalizeArtifacts();
+    return artifacts.removed
+      ? { removed: true, reason: "process-exited", shutdown }
+      : { ...artifacts, shutdown };
   }
   if (!matchesProcessIdentity(processIdentity, currentIdentity)) {
     return {
@@ -720,6 +897,8 @@ export async function teardownBrokerSession({
     };
   }
 
-  removeBrokerArtifacts({ endpoint, pidFile, logFile, sessionDir });
-  return { removed: true, reason: "process-terminated", shutdown };
+  const artifacts = await finalizeArtifacts();
+  return artifacts.removed
+    ? { removed: true, reason: "process-terminated", shutdown }
+    : { ...artifacts, shutdown };
 }

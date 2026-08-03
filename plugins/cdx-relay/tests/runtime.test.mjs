@@ -399,6 +399,10 @@ async function startUnobservedBroker(repo, fixture) {
   return session;
 }
 
+function appServerOwnershipPath(sessionDir) {
+  return path.join(sessionDir, "app-server-ownership.json");
+}
+
 function installFakeProcessCleanup(t, statePath) {
   t.after(async () => {
     if (!fs.existsSync(statePath)) {
@@ -3465,7 +3469,7 @@ test("stop hook runs the actual task when auth status looks stale", () => {
   assert.match(payload.reason, /Missing empty-state guard/i);
 });
 
-test("delayed broker startup rejects after terminating the exact child and cannot become reachable later", async (t) => {
+test("delayed broker startup without an ownership record retains failed metadata after exact broker termination", async (t) => {
   const repo = makeTempDir();
   const fixture = installBrokerFixture(t, { delayMs: 300 });
   const startup = ensureBrokerSession(repo, {
@@ -3491,22 +3495,26 @@ test("delayed broker startup rejects after terminating the exact child and canno
   const terminal = await waitForProcessExit(marker.pid);
   await new Promise((resolve) => setTimeout(resolve, 350));
   const reachableLater = await waitForBrokerEndpoint(marker.endpoint, 100);
+  const retained = loadBrokerSession(repo);
 
   assert.deepEqual({
     publishedStarting: Boolean(starting),
     rejected: Boolean(outcome.error),
     exactPidTerminated: terminal,
     reachableLater,
-    metadataRemovedAfterTerminal: loadBrokerSession(repo) === null
+    failedMetadataRetained: retained?.state === "failed",
+    ownershipRecordMissing: !fs.existsSync(appServerOwnershipPath(starting.sessionDir))
   }, {
     publishedStarting: true,
     rejected: true,
     exactPidTerminated: true,
     reachableLater: false,
-    metadataRemovedAfterTerminal: true
+    failedMetadataRetained: true,
+    ownershipRecordMissing: true
   });
   assert.equal(starting.endpoint, marker.endpoint);
-  assert.match(outcome.error.message, /broker startup|did not become ready/i);
+  assert.match(outcome.error.message, /ownership|terminality could not.*proved/i);
+  clearBrokerSession(repo);
 });
 
 test("cold broker startup failure proves its real app-server descendant exited before removing metadata", async (t) => {
@@ -3533,23 +3541,303 @@ test("cold broker startup failure proves its real app-server descendant exited b
     if (!fs.existsSync(fakeStatePath)) return null;
     return JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerPid ?? null;
   });
+  const ownershipPath = appServerOwnershipPath(starting.sessionDir);
+  const ownership = await waitFor(() =>
+    fs.existsSync(ownershipPath)
+      ? JSON.parse(fs.readFileSync(ownershipPath, "utf8"))
+      : null
+  );
 
   const outcome = await outcomePromise;
   const brokerExited = await waitForProcessExit(starting.pid);
+  const recordedChildExited = await waitForProcessExit(ownership.child.pid);
   const descendantExited = await waitForProcessExit(appServerPid);
 
   assert.deepEqual({
     rejected: Boolean(outcome.error),
     brokerExited,
+    recordedChildExited,
     descendantExited,
-    metadataRemovedAfterBothTerminal: loadBrokerSession(repo) === null
+    metadataRemovedAfterBothTerminal: loadBrokerSession(repo) === null,
+    ownershipRecordedBeforeInitialize: Boolean(ownership),
+    ownershipBinding: ownership ? {
+      state: ownership.state,
+      brokerNonce: ownership.broker?.nonce,
+      brokerPid: ownership.broker?.pid,
+      endpoint: ownership.broker?.endpoint,
+      sessionDir: ownership.broker?.sessionDir,
+      childPidIsPositive: Number.isSafeInteger(ownership.child?.pid) && ownership.child.pid > 0,
+      identityPidMatchesChild: ownership.child?.processIdentity?.pid === ownership.child?.pid,
+      hasStartIdentity: Boolean(ownership.child?.processIdentity?.startIdentity),
+      hasExecutableIdentity: Boolean(ownership.child?.processIdentity?.executableIdentity)
+    } : null,
+    ownershipRemovedAfterProof: !fs.existsSync(ownershipPath)
   }, {
     rejected: true,
     brokerExited: true,
+    recordedChildExited: true,
     descendantExited: true,
-    metadataRemovedAfterBothTerminal: true
+    metadataRemovedAfterBothTerminal: true,
+    ownershipRecordedBeforeInitialize: true,
+    ownershipBinding: {
+      state: "spawned",
+      brokerNonce: starting.nonce,
+      brokerPid: starting.pid,
+      endpoint: starting.endpoint,
+      sessionDir: starting.sessionDir,
+      childPidIsPositive: true,
+      identityPidMatchesChild: true,
+      hasStartIdentity: true,
+      hasExecutableIdentity: true
+    },
+    ownershipRemovedAfterProof: true
   });
   assert.match(outcome.error.message, /broker startup|did not become ready/i);
+});
+
+test("startup cleanup never kills a reused PID whose identity differs from the spawn-bound record", async (t) => {
+  const repo = makeTempDir();
+  const fixture = installBrokerFixture(t, { delayMs: 500 });
+  const unrelated = await spawnTracked(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    cwd: repo,
+    stdio: "ignore"
+  });
+  unrelated.unref();
+  t.after(async () => {
+    if (processIsAlive(unrelated.pid)) {
+      try {
+        process.kill(unrelated.pid, "SIGTERM");
+      } catch (error) {
+        if (error?.code !== "ESRCH") throw error;
+      }
+      await waitForProcessExit(unrelated.pid);
+    }
+    clearBrokerSession(repo);
+  });
+
+  const startup = ensureBrokerSession(repo, {
+    scriptPath: fixture.scriptPath,
+    env: fixture.env,
+    timeoutMs: 200
+  });
+  const outcomePromise = startup.then(
+    (value) => ({ value, error: null }),
+    (error) => ({ value: null, error })
+  );
+  const starting = await waitFor(() => {
+    const session = loadBrokerSession(repo);
+    return session?.state === "starting" && Number.isSafeInteger(session.pid) ? session : null;
+  });
+  fs.writeFileSync(path.join(starting.sessionDir, "app-server.pid"), `${unrelated.pid}\n`, "utf8");
+  fs.writeFileSync(appServerOwnershipPath(starting.sessionDir), `${JSON.stringify({
+    version: 1,
+    state: "spawned",
+    broker: {
+      nonce: starting.nonce,
+      pid: starting.pid,
+      endpoint: starting.endpoint,
+      sessionDir: starting.sessionDir
+    },
+    child: {
+      pid: unrelated.pid,
+      processIdentity: {
+        pid: unrelated.pid,
+        startIdentity: "stale-process-start",
+        executableIdentity: process.execPath
+      }
+    }
+  }, null, 2)}\n`, "utf8");
+
+  const outcome = await outcomePromise;
+
+  assert.equal(Boolean(outcome.error), true);
+  assert.equal(await waitForProcessExit(starting.pid), true);
+  assert.equal(processIsAlive(unrelated.pid), true);
+  assert.equal(loadBrokerSession(repo), null);
+  assert.equal(fs.existsSync(appServerOwnershipPath(starting.sessionDir)), false);
+});
+
+test("startup cleanup rejects an ownership record first published after the failure transition", async (t) => {
+  const repo = makeTempDir();
+  const fixture = installBrokerFixture(t, { delayMs: 500 });
+  const unrelated = await spawnTracked(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    cwd: repo,
+    stdio: "ignore"
+  });
+  unrelated.unref();
+  const unrelatedIdentity = await waitFor(() => captureProcessIdentity(unrelated.pid));
+  t.after(async () => {
+    if (processIsAlive(unrelated.pid)) {
+      try {
+        process.kill(unrelated.pid, "SIGTERM");
+      } catch (error) {
+        if (error?.code !== "ESRCH") throw error;
+      }
+      await waitForProcessExit(unrelated.pid);
+    }
+    clearBrokerSession(repo);
+  });
+
+  const startup = ensureBrokerSession(repo, {
+    scriptPath: fixture.scriptPath,
+    env: fixture.env,
+    timeoutMs: 50
+  });
+  const outcomePromise = startup.then(
+    (value) => ({ value, error: null }),
+    (error) => ({ value: null, error })
+  );
+  const starting = await waitFor(() => {
+    const session = loadBrokerSession(repo);
+    return session?.state === "starting" && Number.isSafeInteger(session.pid) ? session : null;
+  });
+  await waitFor(() => loadBrokerSession(repo)?.state === "failed" || null);
+  const ownershipPath = appServerOwnershipPath(starting.sessionDir);
+  const lateRecord = `${JSON.stringify({
+    version: 1,
+    state: "spawned",
+    broker: {
+      nonce: starting.nonce,
+      pid: starting.pid,
+      endpoint: starting.endpoint,
+      sessionDir: starting.sessionDir
+    },
+    child: {
+      pid: unrelated.pid,
+      processIdentity: unrelatedIdentity
+    }
+  }, null, 2)}\n`;
+  fs.writeFileSync(ownershipPath, lateRecord, "utf8");
+
+  const outcome = await outcomePromise;
+
+  assert.equal(Boolean(outcome.error), true);
+  assert.equal(await waitForProcessExit(starting.pid), true);
+  assert.equal(processIsAlive(unrelated.pid), true);
+  assert.equal(loadBrokerSession(repo)?.state, "failed");
+  assert.equal(fs.readFileSync(ownershipPath, "utf8"), lateRecord);
+  assert.match(outcome.error.message, /ownership|terminality could not.*proved/i);
+});
+
+for (const ownership of [
+  { name: "malformed", contents: "not json\n" },
+  {
+    name: "unbound",
+    contents(sessionDir, endpoint) {
+      return `${JSON.stringify({
+        version: 1,
+        state: "spawned",
+        broker: {
+          nonce: "another-broker-nonce",
+          pid: 4321,
+          endpoint,
+          sessionDir
+        },
+        child: {
+          pid: 5432,
+          processIdentity: {
+            pid: 5432,
+            startIdentity: "another-process-start",
+            executableIdentity: process.execPath
+          }
+        }
+      }, null, 2)}\n`;
+    }
+  }
+]) {
+  test(`startup cleanup fails closed for a ${ownership.name} ownership record`, async (t) => {
+    const repo = makeTempDir();
+    const fixture = installBrokerFixture(t, { delayMs: 300 });
+    let ownershipPath = null;
+    const startup = ensureBrokerSession(repo, {
+      scriptPath: fixture.scriptPath,
+      env: fixture.env,
+      timeoutMs: 50,
+      createBrokerEndpoint(sessionDir, platform) {
+        const endpoint = createBrokerEndpoint(sessionDir, platform);
+        ownershipPath = appServerOwnershipPath(sessionDir);
+        fs.writeFileSync(path.join(sessionDir, "broker.pid"), "diagnostic pid metadata\n", "utf8");
+        const contents = typeof ownership.contents === "function"
+          ? ownership.contents(sessionDir, endpoint)
+          : ownership.contents;
+        fs.writeFileSync(ownershipPath, contents, "utf8");
+        return endpoint;
+      }
+    });
+    const outcome = await startup.then(
+      (value) => ({ value, error: null }),
+      (error) => ({ value: null, error })
+    );
+    const retained = loadBrokerSession(repo);
+
+    assert.equal(Boolean(outcome.error), true);
+    assert.equal(retained?.state, "failed");
+    assert.equal(await waitForProcessExit(retained.pid), true);
+    assert.equal(fs.existsSync(ownershipPath), true);
+    assert.equal(fs.existsSync(retained.pidFile), true);
+    assert.equal(fs.existsSync(retained.logFile), true);
+    assert.match(outcome.error.message, /ownership|terminality could not.*proved/i);
+    clearBrokerSession(repo);
+  });
+}
+
+test("a pre-existing unbound ownership record cannot be overwritten by a new broker", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  installFakeProcessCleanup(t, fakeStatePath);
+  let ownershipPath = null;
+  let originalContents = null;
+  const startup = ensureBrokerSession(repo, {
+    env: buildEnv(binDir),
+    timeoutMs: 1000,
+    createBrokerEndpoint(sessionDir, platform) {
+      const endpoint = createBrokerEndpoint(sessionDir, platform);
+      ownershipPath = appServerOwnershipPath(sessionDir);
+      originalContents = `${JSON.stringify({
+        version: 1,
+        state: "spawned",
+        broker: {
+          nonce: "another-broker-nonce",
+          pid: 4321,
+          endpoint,
+          sessionDir
+        },
+        child: {
+          pid: 5432,
+          processIdentity: {
+            pid: 5432,
+            startIdentity: "another-process-start",
+            executableIdentity: process.execPath
+          }
+        }
+      }, null, 2)}\n`;
+      fs.writeFileSync(ownershipPath, originalContents, "utf8");
+      return endpoint;
+    }
+  });
+  const outcome = await startup.then(
+    (value) => ({ value, error: null }),
+    (error) => ({ value: null, error })
+  );
+  const retained = loadBrokerSession(repo);
+  t.after(async () => {
+    if (retained && processIsAlive(retained.pid)) {
+      try {
+        process.kill(retained.pid, "SIGTERM");
+      } catch (error) {
+        if (error?.code !== "ESRCH") throw error;
+      }
+      await waitForProcessExit(retained.pid);
+    }
+    clearBrokerSession(repo);
+  });
+
+  assert.equal(Boolean(outcome.error), true);
+  assert.equal(retained?.state, "failed");
+  assert.equal(fs.readFileSync(ownershipPath, "utf8"), originalContents);
+  assert.match(outcome.error.message, /ownership|terminality could not.*proved/i);
 });
 
 test("only nonce-authenticated broker status and shutdown calls are accepted", async (t) => {
@@ -3640,6 +3928,54 @@ for (const failure of [
     clearBrokerSession(repo);
   });
 }
+
+test("external endpoint failure refuses teardown and replacement when failed-state publication throws", async (t) => {
+  const repo = makeTempDir();
+  const fixture = installBrokerFixture(t);
+  const session = await startUnobservedBroker(repo, fixture);
+  const originalMarker = JSON.parse(fs.readFileSync(fixture.markerPath, "utf8"));
+  await sendFixtureRequest(session.endpoint, "fixture/drop-endpoint", session.nonce);
+  await waitFor(async () =>
+    (await waitForBrokerEndpoint(session.endpoint, 50)) ? null : true
+  );
+  let publicationCalls = 0;
+  let identityCalls = 0;
+  let terminatorCalls = 0;
+
+  const outcome = await ensureBrokerSession(repo, {
+    scriptPath: fixture.scriptPath,
+    env: fixture.env,
+    timeoutMs: 1000,
+    statusTimeoutMs: 50,
+    shutdownTimeoutMs: 50,
+    markBrokerSessionFailedImpl() {
+      publicationCalls += 1;
+      throw new Error("failed-state persistence unavailable");
+    },
+    captureProcessIdentityImpl(pid) {
+      identityCalls += 1;
+      return captureProcessIdentity(pid);
+    },
+    killProcess(pid) {
+      terminatorCalls += 1;
+      process.kill(pid, "SIGTERM");
+    }
+  }).then(
+    (value) => ({ value, error: null }),
+    (error) => ({ value: null, error })
+  );
+  const markerAfter = JSON.parse(fs.readFileSync(fixture.markerPath, "utf8"));
+
+  assert.equal(Boolean(outcome.error), true);
+  assert.match(outcome.error.message, /failed state|persistence|durable/i);
+  assert.equal(publicationCalls, 1);
+  assert.equal(identityCalls, 0);
+  assert.equal(terminatorCalls, 0);
+  assert.equal(processIsAlive(session.pid), true);
+  assert.deepEqual(loadBrokerSession(repo), session);
+  assert.deepEqual(markerAfter, originalMarker);
+  clearBrokerSession(repo);
+});
 
 test("ready broker revokes readiness and exits when its app-server child dies", async (t) => {
   const repo = makeTempDir();

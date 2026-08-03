@@ -10,8 +10,10 @@ import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 import {
   BROKER_AUTH_ERROR_CODE,
-  markBrokerSessionFailed
+  markBrokerSessionFailed,
+  recordAppServerOwnership
 } from "./lib/broker-lifecycle.mjs";
+import { captureProcessIdentity } from "./lib/process-identity.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 const MAX_BROKER_REQUEST_CHARS = 8 * 1024 * 1024;
@@ -79,7 +81,7 @@ async function main() {
   const nonce = String(options.nonce);
   const listenTarget = parseBrokerEndpoint(endpoint);
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
-  const appServerPidFile = pidFile ? path.join(path.dirname(pidFile), "app-server.pid") : null;
+  const sessionDir = pidFile ? path.dirname(pidFile) : null;
   writePidFile(pidFile);
 
   let appClient = null;
@@ -126,9 +128,6 @@ async function main() {
     }
     if (pidFile && fs.existsSync(pidFile)) {
       fs.unlinkSync(pidFile);
-    }
-    if (appServerPidFile && fs.existsSync(appServerPidFile)) {
-      fs.unlinkSync(appServerPidFile);
     }
   }
 
@@ -211,9 +210,21 @@ async function main() {
         appClient = client;
       },
       onProcessSpawned(child) {
-        if (Number.isSafeInteger(child.pid) && child.pid > 0) {
-          writePidFile(appServerPidFile, child.pid);
+        if (!sessionDir || !Number.isSafeInteger(child.pid) || child.pid <= 0) {
+          throw new Error("The broker could not bind ownership to the spawned app-server process.");
         }
+        const processIdentity = captureProcessIdentity(child.pid);
+        if (!processIdentity) {
+          throw new Error("The spawned app-server exited before its ownership identity could be captured.");
+        }
+        recordAppServerOwnership({
+          sessionDir,
+          endpoint,
+          nonce,
+          brokerPid: process.pid,
+          childPid: child.pid,
+          processIdentity
+        });
       }
     });
   } catch (error) {
