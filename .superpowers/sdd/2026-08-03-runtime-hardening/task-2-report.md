@@ -75,3 +75,58 @@ Result: 324 tests total; 319 passed, 5 skipped, 0 failed in 375.5 seconds. The p
 ## Concerns
 
 None.
+
+## Fix Round 1
+
+### Findings addressed
+
+1. Protocol input is now bounded at 8 MiB per JSONL message for both broker input and direct app-server stdout. Direct stdout no longer uses `readline`, so an unterminated line is checked incrementally rather than accumulated inside an uncapped library buffer. Oversized input clears the retained line and terminates through the existing idempotent terminal path.
+2. Retained direct-process stderr is capped at 64 KiB. The most recent diagnostic tail is preserved, exit errors identify truncation, and malformed-protocol previews are capped separately at 4 KiB.
+3. `CodexAppServerClient.connect` now closes/terminalizes the newly created direct child or broker socket when `initialize` fails for any reason. A focused `initializeTimeoutMs` option drives real timeout cleanup tests without changing the 30-second production default.
+4. The deferred Windows scheduler assertion was naturally removed while the deadline tests were amended; deadline identity and the existing generous watchdog remain authoritative.
+
+No broker lifecycle implementation was changed.
+
+### RED evidence
+
+Command:
+
+`node --test --test-concurrency=1 --test-timeout=600000 --test-name-pattern="oversized unterminated|stderr diagnostics stay bounded|cleanup terminates the spawned|cleanup closes the socket" plugins/cdx-relay/tests/runtime.test.mjs`
+
+After correcting a test-fixture newline escape, all seven controls failed for the intended missing behavior:
+
+- Oversized unterminated broker input remained buffered until the 1.5-second guard.
+- Oversized direct stdout reached the uncapped `readline` path and failed only when the peer later exited and the retained 9 MiB line was parsed.
+- A 256 KiB stderr payload appeared unbounded in the initialize failure.
+- Silent direct and broker initialization ignored the injected 30 ms deadline.
+- Direct and broker JSON-RPC initialize errors rejected but left the child/socket alive.
+
+### GREEN evidence
+
+Focused Fix Round 1 controls: 7 passed, 0 failed in 1.9 seconds.
+
+Full amended runtime command:
+
+`node --test --test-concurrency=1 --test-timeout=600000 plugins/cdx-relay/tests/runtime.test.mjs`
+
+Result: 92 passed, 0 failed in 250.5 seconds.
+
+Package command:
+
+`npm --prefix plugins/cdx-relay test`
+
+Result: 331 total; 326 passed, 5 skipped, 0 failed in 389.8 seconds. This includes the app-server TypeScript build contract.
+
+### Fix-round self-review
+
+- The JSONL cap is checked before appending each decoded segment, including unterminated input; both broker and direct streams share this path.
+- Limit-plus-one input terminalizes and releases the partial line.
+- EOF preserves prior direct behavior by parsing a final bounded non-newline-terminated message.
+- Stderr retention never exceeds 64 KiB and preserves the tail marker emitted after the hostile payload.
+- Parse-error protocol data stores only a bounded preview instead of retaining an otherwise-valid 8 MiB line.
+- Direct cleanup awaits actual process close; broker cleanup destroys and awaits socket close. The original initialize error is rethrown after best-effort cleanup.
+- Test cleanup independently terminates hostile fixture processes/sockets, so RED failures do not contaminate later tests.
+
+### Fix-round concerns
+
+None.

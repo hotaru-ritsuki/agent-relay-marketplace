@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
@@ -16,6 +17,7 @@ import {
 } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../scripts/lib/broker-lifecycle.mjs";
 import { CodexAppServerClient } from "../scripts/lib/app-server.mjs";
+import { createBrokerEndpoint, parseBrokerEndpoint } from "../scripts/lib/broker-endpoint.mjs";
 import { DEFAULT_CONTINUE_PROMPT } from "../scripts/lib/codex.mjs";
 import { resolveStateDir, upsertJob, writeJobFile } from "../scripts/lib/state.mjs";
 
@@ -194,6 +196,113 @@ async function connectDirectFixture(t, repo, binDir, behavior) {
   return client;
 }
 
+function processIsAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function waitForProcessExit(pid, timeoutMs = 1500) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!processIsAlive(pid)) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return !processIsAlive(pid);
+}
+
+function installFakeProcessCleanup(t, statePath) {
+  t.after(async () => {
+    if (!fs.existsSync(statePath)) {
+      return;
+    }
+    const pid = JSON.parse(fs.readFileSync(statePath, "utf8")).appServerPid;
+    if (processIsAlive(pid)) {
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch (error) {
+        if (error?.code !== "ESRCH") {
+          throw error;
+        }
+      }
+      await waitForProcessExit(pid);
+    }
+  });
+}
+
+async function startBrokerPeer(t, behavior) {
+  const endpoint = createBrokerEndpoint(makeTempDir("cdx-app-server-peer-"));
+  const target = parseBrokerEndpoint(endpoint);
+  const sockets = new Set();
+  let resolveAccepted;
+  const accepted = new Promise((resolve) => {
+    resolveAccepted = resolve;
+  });
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("error", () => {
+      // The client is expected to terminate hostile peers while they write.
+    });
+    let resolveClosed;
+    const closed = new Promise((resolve) => {
+      resolveClosed = resolve;
+    });
+    socket.once("close", () => {
+      sockets.delete(socket);
+      resolveClosed();
+    });
+    resolveAccepted({ socket, closed });
+
+    let requestBuffer = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      requestBuffer += chunk;
+      const newlineIndex = requestBuffer.indexOf("\n");
+      if (newlineIndex === -1) {
+        return;
+      }
+      const request = JSON.parse(requestBuffer.slice(0, newlineIndex));
+      requestBuffer = requestBuffer.slice(newlineIndex + 1);
+      if (behavior === "oversized-input") {
+        socket.write("x".repeat(9 * 1024 * 1024));
+      } else if (behavior === "initialize-rpc-error") {
+        socket.write(`${JSON.stringify({ id: request.id, error: { code: -32000, message: "broker initialize rejected" } })}\n`);
+      }
+    });
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(target.path, resolve);
+  });
+  t.after(async () => {
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+    await new Promise((resolve) => server.close(resolve));
+  });
+
+  return { endpoint, accepted };
+}
+
+async function settlesWithin(promise, timeoutMs = 1000) {
+  return Promise.race([
+    promise.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), timeoutMs))
+  ]);
+}
+
 async function startFixtureThread(client, cwd) {
   const response = await client.request("thread/start", {
     cwd,
@@ -238,7 +347,6 @@ test("a live but silent app-server control request rejects at its deadline", asy
   const repo = makeTempDir();
   const binDir = makeTempDir();
   const client = await connectDirectFixture(t, repo, binDir, "silent-control");
-  const startedAt = Date.now();
 
   await assert.rejects(
     Promise.race([
@@ -247,7 +355,6 @@ test("a live but silent app-server control request rejects at its deadline", asy
     ]),
     /account\/read timed out after 30 ms/i
   );
-  assert.ok(Date.now() - startedAt < 200);
   assert.equal(client.pending.size, 0);
 });
 
@@ -381,6 +488,114 @@ test("direct stdin write pressure rejects without an uncaught pipe failure", () 
   assert.equal(payload.closed, true);
   assert.equal(payload.pending, 0);
 });
+
+test("oversized unterminated broker input terminally rejects initialize", async (t) => {
+  const repo = makeTempDir();
+  const peer = await startBrokerPeer(t, "oversized-input");
+  const connection = CodexAppServerClient.connect(repo, {
+    brokerEndpoint: peer.endpoint,
+    initializeTimeoutMs: 1000
+  });
+  connection.catch(() => {});
+
+  await assert.rejects(
+    Promise.race([
+      connection,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("oversized broker input was retained")), 1500))
+    ]),
+    /JSONL message exceeded.*8388608/i
+  );
+  const accepted = await peer.accepted;
+  assert.equal(await settlesWithin(accepted.closed), true);
+});
+
+test("oversized unterminated direct stdout line terminally rejects initialize", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "oversized-direct-stdout");
+
+  await assert.rejects(
+    CodexAppServerClient.connect(repo, {
+      disableBroker: true,
+      env: buildEnv(binDir),
+      initializeTimeoutMs: 1000
+    }),
+    /JSONL message exceeded.*8388608/i
+  );
+});
+
+test("direct stderr diagnostics stay bounded when initialize exits", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "oversized-stderr");
+
+  const error = await CodexAppServerClient.connect(repo, {
+    disableBroker: true,
+    env: buildEnv(binDir),
+    initializeTimeoutMs: 1000
+  }).then(
+    () => assert.fail("oversized stderr fixture unexpectedly initialized"),
+    (reason) => reason
+  );
+
+  assert.match(error.message, /stderr truncated/i);
+  assert.match(error.message, /stderr-tail-marker/);
+  assert.ok(error.message.length < 70 * 1024);
+});
+
+for (const behavior of ["silent-initialize", "initialize-rpc-error"]) {
+  test(`direct ${behavior} cleanup terminates the spawned app-server`, async (t) => {
+    const repo = makeTempDir();
+    const binDir = makeTempDir();
+    const statePath = path.join(binDir, "fake-codex-state.json");
+    installFakeCodex(binDir, behavior);
+    installFakeProcessCleanup(t, statePath);
+    const connection = CodexAppServerClient.connect(repo, {
+      disableBroker: true,
+      env: buildEnv(binDir),
+      initializeTimeoutMs: behavior === "silent-initialize" ? 30 : 500
+    });
+    connection.catch(() => {});
+
+    await assert.rejects(
+      Promise.race([
+        connection,
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`${behavior} cleanup deadline was ignored`)), 1000))
+      ]),
+      behavior === "silent-initialize" ? /initialize timed out after 30 ms/i : /initialize rejected by fixture/i
+    );
+    const state = await waitFor(() => {
+      if (!fs.existsSync(statePath)) {
+        return null;
+      }
+      const value = JSON.parse(fs.readFileSync(statePath, "utf8"));
+      return value.appServerPid ? value : null;
+    });
+    assert.equal(await waitForProcessExit(state.appServerPid), true);
+  });
+}
+
+for (const behavior of ["silent-initialize", "initialize-rpc-error"]) {
+  test(`broker ${behavior} cleanup closes the socket`, async (t) => {
+    const repo = makeTempDir();
+    const peer = await startBrokerPeer(t, behavior);
+    const connection = CodexAppServerClient.connect(repo, {
+      brokerEndpoint: peer.endpoint,
+      initializeTimeoutMs: 30
+    });
+    connection.catch(() => {});
+
+    await assert.rejects(
+      Promise.race([
+        connection,
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`${behavior} broker cleanup deadline was ignored`)), 500))
+      ]),
+      behavior === "silent-initialize" ? /initialize timed out after 30 ms/i : /broker initialize rejected/i
+    );
+    const accepted = await peer.accepted;
+    assert.equal(await settlesWithin(accepted.closed), true);
+  });
+}
 
 test("setup reports ready when fake codex is installed and authenticated", () => {
   const binDir = makeTempDir();

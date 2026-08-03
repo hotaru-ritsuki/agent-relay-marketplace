@@ -11,7 +11,6 @@ import fs from "node:fs";
 import net from "node:net";
 import process from "node:process";
 import { spawn } from "node:child_process";
-import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
 import { terminateProcessTree } from "./process.mjs";
@@ -22,6 +21,9 @@ const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"))
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
 const DEFAULT_RPC_DEADLINE_MS = 30_000;
+const MAX_JSONL_MESSAGE_CHARS = 8 * 1024 * 1024;
+const MAX_STDERR_CHARS = 64 * 1024;
+const MAX_PROTOCOL_PREVIEW_CHARS = 4096;
 
 export function deadlineForMethod(_method) {
   return DEFAULT_RPC_DEADLINE_MS;
@@ -63,6 +65,15 @@ function createTransportWriteError(error) {
   return new Error("codex app-server transport write failed.", { cause: error });
 }
 
+function boundedProtocolPreview(value) {
+  const text = String(value ?? "");
+  if (text.length <= MAX_PROTOCOL_PREVIEW_CHARS) {
+    return text;
+  }
+  const half = Math.floor(MAX_PROTOCOL_PREVIEW_CHARS / 2);
+  return `${text.slice(0, half)}...[truncated]...${text.slice(-half)}`;
+}
+
 class AppServerClientBase {
   constructor(cwd, options = {}) {
     this.cwd = cwd;
@@ -70,6 +81,7 @@ class AppServerClientBase {
     this.pending = new Map();
     this.nextId = 1;
     this.stderr = "";
+    this.stderrTruncated = false;
     this.closed = false;
     this.exitError = null;
     this.terminalListeners = new Set();
@@ -160,14 +172,43 @@ class AppServerClientBase {
   }
 
   handleChunk(chunk) {
-    this.lineBuffer += chunk;
-    let newlineIndex = this.lineBuffer.indexOf("\n");
-    while (newlineIndex !== -1) {
-      const line = this.lineBuffer.slice(0, newlineIndex);
-      this.lineBuffer = this.lineBuffer.slice(newlineIndex + 1);
-      this.handleLine(line);
-      newlineIndex = this.lineBuffer.indexOf("\n");
+    if (this.closed) {
+      return;
     }
+
+    let offset = 0;
+    while (offset < chunk.length && !this.closed) {
+      const newlineIndex = chunk.indexOf("\n", offset);
+      const segmentEnd = newlineIndex === -1 ? chunk.length : newlineIndex;
+      const segment = chunk.slice(offset, segmentEnd);
+      if (this.lineBuffer.length + segment.length > MAX_JSONL_MESSAGE_CHARS) {
+        this.lineBuffer = "";
+        this.handleExit(
+          createProtocolError(
+            `codex app-server JSONL message exceeded ${MAX_JSONL_MESSAGE_CHARS} characters.`,
+            { maxChars: MAX_JSONL_MESSAGE_CHARS }
+          )
+        );
+        return;
+      }
+      this.lineBuffer += segment;
+      if (newlineIndex === -1) {
+        return;
+      }
+      const line = this.lineBuffer;
+      this.lineBuffer = "";
+      this.handleLine(line);
+      offset = newlineIndex + 1;
+    }
+  }
+
+  handleInputEnd() {
+    if (this.closed || !this.lineBuffer) {
+      return;
+    }
+    const line = this.lineBuffer;
+    this.lineBuffer = "";
+    this.handleLine(line);
   }
 
   handleLine(line) {
@@ -179,7 +220,12 @@ class AppServerClientBase {
     try {
       message = JSON.parse(line);
     } catch (error) {
-      this.handleExit(createProtocolError(`Failed to parse codex app-server JSONL: ${error.message}`, { line }));
+      this.handleExit(
+        createProtocolError(
+          `Failed to parse codex app-server JSONL: ${error.message}`,
+          { line: boundedProtocolPreview(line) }
+        )
+      );
       return;
     }
 
@@ -242,6 +288,31 @@ class AppServerClientBase {
     this.resolveExit(undefined);
   }
 
+  appendStderr(chunk) {
+    const text = String(chunk);
+    if (text.length >= MAX_STDERR_CHARS) {
+      this.stderr = text.slice(-MAX_STDERR_CHARS);
+      this.stderrTruncated = true;
+      return;
+    }
+    if (this.stderr.length + text.length > MAX_STDERR_CHARS) {
+      this.stderr = `${this.stderr.slice(-(MAX_STDERR_CHARS - text.length))}${text}`;
+      this.stderrTruncated = true;
+      return;
+    }
+    this.stderr += text;
+  }
+
+  stderrForError() {
+    const stderr = this.stderr.trim();
+    if (!stderr) {
+      return "";
+    }
+    return this.stderrTruncated
+      ? `[stderr truncated to last ${MAX_STDERR_CHARS} characters]\n${stderr}`
+      : stderr;
+  }
+
   sendMessage(_message) {
     throw new Error("sendMessage must be implemented by subclasses.");
   }
@@ -269,7 +340,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     this.proc.stderr.setEncoding("utf8");
 
     this.proc.stderr.on("data", (chunk) => {
-      this.stderr += chunk;
+      this.appendStderr(chunk);
     });
 
     this.proc.on("error", (error) => {
@@ -278,7 +349,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     });
 
     this.proc.on("exit", (code, signal) => {
-      const stderr = this.stderr.trim();
+      const stderr = this.stderrForError();
       const detail =
         code === 0
           ? null
@@ -289,7 +360,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     });
 
     this.proc.on("close", (code, signal) => {
-      const stderr = this.stderr.trim();
+      const stderr = this.stderrForError();
       const detail =
         code === 0
           ? null
@@ -304,23 +375,25 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       this.handleExit(createTransportWriteError(error));
     });
 
-    this.readline = readline.createInterface({ input: this.proc.stdout });
-    this.readline.on("line", (line) => {
-      this.handleLine(line);
+    this.proc.stdout.on("data", (chunk) => {
+      this.handleChunk(chunk);
+    });
+    this.proc.stdout.on("end", () => {
+      this.handleInputEnd();
     });
 
     await this.request("initialize", {
       clientInfo: this.options.clientInfo ?? DEFAULT_CLIENT_INFO,
       capabilities: this.options.capabilities ?? DEFAULT_CAPABILITIES
-    });
+    }, { timeoutMs: this.options.initializeTimeoutMs });
     this.notify("initialized", {});
   }
 
   async close() {
     this.handleExit(new Error("codex app-server connection closed."));
 
-    if (this.readline) {
-      this.readline.close();
+    if (this.proc?.stdout && !this.proc.stdout.destroyed) {
+      this.proc.stdout.destroy();
     }
 
     let killTimer = null;
@@ -410,14 +483,14 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
     await this.request("initialize", {
       clientInfo: this.options.clientInfo ?? DEFAULT_CLIENT_INFO,
       capabilities: this.options.capabilities ?? DEFAULT_CAPABILITIES
-    });
+    }, { timeoutMs: this.options.initializeTimeoutMs });
     this.notify("initialized", {});
   }
 
   async close() {
     this.handleExit(new Error("codex app-server connection closed."));
     if (this.socket && !this.socket.destroyed) {
-      this.socket.end();
+      this.socket.destroy();
     }
     await (this.socketClosePromise ?? this.exitPromise);
   }
@@ -456,7 +529,12 @@ export class CodexAppServerClient {
     const client = brokerEndpoint
       ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
       : new SpawnedCodexAppServerClient(cwd, options);
-    await client.initialize();
-    return client;
+    try {
+      await client.initialize();
+      return client;
+    } catch (error) {
+      await client.close().catch(() => {});
+      throw error;
+    }
   }
 }

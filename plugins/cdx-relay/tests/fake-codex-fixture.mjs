@@ -272,6 +272,7 @@ if (args[0] !== "app-server") {
 }
 const bootState = loadState();
 bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
+bootState.appServerPid = process.pid;
 saveState(bootState);
 
 const rl = readline.createInterface({ input: process.stdin });
@@ -286,6 +287,22 @@ rl.on("line", (line) => {
   try {
     switch (message.method) {
       case "initialize":
+        if (BEHAVIOR === "oversized-direct-stdout") {
+          process.stdout.write("x".repeat(9 * 1024 * 1024));
+          setTimeout(() => process.exit(0), 250);
+          break;
+        }
+        if (BEHAVIOR === "oversized-stderr") {
+          process.stderr.write("s".repeat(256 * 1024) + "stderr-tail-marker\\n", () => process.exit(7));
+          break;
+        }
+        if (BEHAVIOR === "silent-initialize") {
+          break;
+        }
+        if (BEHAVIOR === "initialize-rpc-error") {
+          send({ id: message.id, error: { code: -32000, message: "initialize rejected by fixture" } });
+          break;
+        }
         state.capabilities = message.params.capabilities || null;
         saveState(state);
         send({ id: message.id, result: { userAgent: "fake-codex-app-server" } });
