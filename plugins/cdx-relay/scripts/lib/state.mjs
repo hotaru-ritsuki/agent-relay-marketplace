@@ -3,6 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import properLockfile from "proper-lockfile";
+
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
@@ -11,6 +13,38 @@ const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
+/**
+ * @typedef {{
+ *   stale: number,
+ *   update: number,
+ *   retryTimeoutMs: number,
+ *   retryDelayMs: number
+ * }} StateLockPolicy
+ */
+/** @type {Readonly<StateLockPolicy>} */
+const DEFAULT_STATE_LOCK_POLICY = Object.freeze({
+  stale: 30_000,
+  update: 10_000,
+  retryTimeoutMs: 35_000,
+  retryDelayMs: 25
+});
+const STATE_LOCK_WAIT = new Int32Array(new SharedArrayBuffer(4));
+
+/** @type {StateLockPolicy} */
+let stateLockPolicy = { ...DEFAULT_STATE_LOCK_POLICY };
+
+export class StateConflictError extends Error {
+  constructor(expectedRevision, actualRevision) {
+    super(
+      `ERR_STATE_CONFLICT: Expected state revision ${expectedRevision}, ` +
+      `but the current revision is ${actualRevision}.`
+    );
+    this.name = "StateConflictError";
+    this.code = "ERR_STATE_CONFLICT";
+    this.expectedRevision = expectedRevision;
+    this.actualRevision = actualRevision;
+  }
+}
 
 class StateIndexCorruptionError extends Error {
   constructor(message, stateFile, options) {
@@ -27,6 +61,7 @@ function nowIso() {
 function defaultState() {
   return {
     version: STATE_VERSION,
+    revision: 0,
     config: {
       stopReviewGate: false
     },
@@ -63,6 +98,104 @@ export function ensureStateDir(cwd) {
   fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
 }
 
+/**
+ * @param {Partial<StateLockPolicy>} [overrides]
+ * @returns {() => void}
+ */
+export function setStateLockPolicyForTests(overrides = {}) {
+  const allowedKeys = new Set([
+    "stale",
+    "update",
+    "retryTimeoutMs",
+    "retryDelayMs"
+  ]);
+  for (const key of Object.keys(overrides)) {
+    if (!allowedKeys.has(key)) {
+      throw new TypeError(`Unknown state lock policy option: ${key}`);
+    }
+  }
+  const nextPolicy = { ...stateLockPolicy, ...overrides };
+  for (const [key, value] of Object.entries(nextPolicy)) {
+    if (!Number.isFinite(value) || value < 0 || (key === "retryDelayMs" && value === 0)) {
+      throw new TypeError(`State lock policy ${key} must be a valid duration.`);
+    }
+  }
+  if (nextPolicy.stale < 2_000) {
+    throw new TypeError("State lock policy stale must be at least 2000 ms.");
+  }
+  if (nextPolicy.update < 1_000 || nextPolicy.update > nextPolicy.stale / 2) {
+    throw new TypeError("State lock policy update must be between 1000 ms and stale / 2.");
+  }
+
+  const previousPolicy = stateLockPolicy;
+  stateLockPolicy = nextPolicy;
+  let restored = false;
+  return () => {
+    if (!restored) {
+      stateLockPolicy = previousPolicy;
+      restored = true;
+    }
+  };
+}
+
+function acquireStateLock(cwd) {
+  ensureStateDir(cwd);
+  const stateDir = resolveStateDir(cwd);
+  const policy = { ...stateLockPolicy };
+  const deadline = Date.now() + policy.retryTimeoutMs;
+
+  for (;;) {
+    try {
+      return properLockfile.lockSync(stateDir, {
+        realpath: false,
+        retries: 0,
+        stale: policy.stale,
+        update: policy.update,
+        onCompromised(error) {
+          throw error;
+        }
+      });
+    } catch (error) {
+      if (error?.code !== "ELOCKED" || Date.now() >= deadline) {
+        throw error;
+      }
+      const remaining = deadline - Date.now();
+      Atomics.wait(
+        STATE_LOCK_WAIT,
+        0,
+        0,
+        Math.min(policy.retryDelayMs, Math.max(remaining, 0))
+      );
+    }
+  }
+}
+
+function withStateLock(cwd, operation) {
+  const release = acquireStateLock(cwd);
+  try {
+    return operation();
+  } finally {
+    release();
+  }
+}
+
+function normalizeLegacyRevision(revision) {
+  return Number.isInteger(revision) && revision >= 0 ? revision : 0;
+}
+
+function snapshotRevision(snapshot) {
+  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
+    throw new TypeError("State snapshot must be an object.");
+  }
+  if (snapshot.revision === undefined) {
+    return 0;
+  }
+  if (!Number.isInteger(snapshot.revision) || snapshot.revision < 0) {
+    throw new TypeError("State snapshot revision must be a non-negative integer.");
+  }
+  return snapshot.revision;
+}
+
 export function loadState(cwd) {
   const stateFile = resolveStateFile(cwd);
   if (!fs.existsSync(stateFile)) {
@@ -74,6 +207,7 @@ export function loadState(cwd) {
     return {
       ...defaultState(),
       ...parsed,
+      revision: normalizeLegacyRevision(parsed.revision),
       config: {
         ...defaultState().config,
         ...(parsed.config ?? {})
@@ -131,6 +265,10 @@ export function readStateIndexStrict(cwd) {
     !parsed ||
     typeof parsed !== "object" ||
     Array.isArray(parsed) ||
+    (
+      parsed.revision !== undefined &&
+      (!Number.isInteger(parsed.revision) || parsed.revision < 0)
+    ) ||
     !Array.isArray(parsed.jobs) ||
     !parsed.jobs.every(validJob)
   ) {
@@ -139,7 +277,10 @@ export function readStateIndexStrict(cwd) {
       stateFile
     );
   }
-  return parsed;
+  return {
+    ...parsed,
+    revision: normalizeLegacyRevision(parsed.revision)
+  };
 }
 
 export function validateStateIndexPublicationCandidate(cwd, job) {
@@ -168,8 +309,15 @@ function pruneJobs(jobs) {
 }
 
 function removeFileIfExists(filePath) {
-  if (filePath && fs.existsSync(filePath)) {
+  if (!filePath) {
+    return;
+  }
+  try {
     fs.unlinkSync(filePath);
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
   }
 }
 
@@ -216,12 +364,12 @@ function atomicWriteJson(filePath, payload) {
   }
 }
 
-export function saveState(cwd, state) {
-  const previousJobs = loadState(cwd).jobs;
+function publishState(cwd, state, revision) {
   ensureStateDir(cwd);
   const nextJobs = pruneJobs(state.jobs ?? []);
   const nextState = {
     version: STATE_VERSION,
+    revision,
     config: {
       ...defaultState().config,
       ...(state.config ?? {})
@@ -229,23 +377,69 @@ export function saveState(cwd, state) {
     jobs: nextJobs
   };
 
-  const retainedIds = new Set(nextJobs.map((job) => job.id));
-  for (const job of previousJobs) {
-    if (retainedIds.has(job.id)) {
-      continue;
-    }
-    removeJobFile(resolveJobFile(cwd, job.id));
-    removeFileIfExists(job.logFile);
-  }
-
   atomicWriteJson(resolveStateFile(cwd), nextState);
   return nextState;
 }
 
+export function saveState(cwd, snapshot) {
+  const expectedRevision = snapshotRevision(snapshot);
+  return withStateLock(cwd, () => {
+    const current = loadState(cwd);
+    if (current.revision !== expectedRevision) {
+      throw new StateConflictError(expectedRevision, current.revision);
+    }
+    return publishState(cwd, snapshot, current.revision + 1);
+  });
+}
+
 export function updateState(cwd, mutate) {
-  const state = loadState(cwd);
-  mutate(state);
-  return saveState(cwd, state);
+  return withStateLock(cwd, () => {
+    const state = loadState(cwd);
+    const currentRevision = state.revision;
+    mutate(state);
+    return publishState(cwd, state, currentRevision + 1);
+  });
+}
+
+export function removeJobs(cwd, ids) {
+  const values = typeof ids === "string" ? [ids] : ids;
+  if (!values || typeof values[Symbol.iterator] !== "function") {
+    throw new TypeError("Job ids must be an iterable of strings.");
+  }
+  const explicitIds = new Set();
+  for (const id of values) {
+    if (typeof id !== "string" || id.length === 0) {
+      throw new TypeError("Job ids must be non-empty strings.");
+    }
+    explicitIds.add(id);
+  }
+
+  return withStateLock(cwd, () => {
+    const state = loadState(cwd);
+    const removedJobs = state.jobs.filter((job) => explicitIds.has(job.id));
+    if (removedJobs.length === 0) {
+      return [];
+    }
+    const retainedJobs = state.jobs.filter((job) => !explicitIds.has(job.id));
+    publishState(
+      cwd,
+      { ...state, jobs: retainedJobs },
+      state.revision + 1
+    );
+    return removedJobs;
+  });
+}
+
+export function pruneJobArtifacts(cwd, removedJobs) {
+  for (const job of removedJobs ?? []) {
+    if (!job || typeof job !== "object" || typeof job.id !== "string") {
+      continue;
+    }
+    removeFileIfExists(resolveJobFile(cwd, job.id));
+    if (typeof job.logFile === "string") {
+      removeFileIfExists(job.logFile);
+    }
+  }
 }
 
 export function generateJobId(prefix = "job") {
@@ -299,12 +493,6 @@ export function writeJobFile(cwd, jobId, payload) {
 
 export function readJobFile(jobFile) {
   return JSON.parse(fs.readFileSync(jobFile, "utf8"));
-}
-
-function removeJobFile(jobFile) {
-  if (fs.existsSync(jobFile)) {
-    fs.unlinkSync(jobFile);
-  }
 }
 
 export function resolveJobLogFile(cwd, jobId) {

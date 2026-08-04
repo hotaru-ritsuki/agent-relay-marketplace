@@ -3271,6 +3271,7 @@ test("session end fully cleans up jobs for the ending session", async () => {
   assertSupervisorHealthy();
 
   const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(state.revision, 1);
   assert.deepEqual(state.jobs.map((job) => job.id), ["review-other"]);
   const otherJob = state.jobs[0];
   assert.equal(otherJob.logFile, otherSessionLog);

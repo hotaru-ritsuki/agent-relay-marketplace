@@ -12,7 +12,12 @@ import {
   PID_FILE_ENV,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
+import {
+  loadState,
+  pruneJobArtifacts,
+  removeJobs,
+  resolveStateFile
+} from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -67,10 +72,11 @@ function cleanupSessionJobs(cwd, sessionId) {
     }
   }
 
-  saveState(workspaceRoot, {
-    ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
-  });
+  const removedCurrentJobs = removeJobs(
+    workspaceRoot,
+    removedJobs.map((job) => job.id)
+  );
+  pruneJobArtifacts(workspaceRoot, removedCurrentJobs);
 }
 
 function handleSessionStart(input) {
