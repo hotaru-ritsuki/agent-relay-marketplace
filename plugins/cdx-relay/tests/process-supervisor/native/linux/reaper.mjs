@@ -344,7 +344,8 @@ export function createProtectedLinuxReaper({
         record.harnessPid <= 0 ||
         typeof record.harnessStartTime !== "string" ||
         record.harnessStartTime.length === 0 ||
-        !["created", "running", "draining", "drained"].includes(record.state)) {
+        !["created", "running", "active", "draining", "empty", "drained"]
+          .includes(record.state)) {
       throw fail(
         "REGISTRY_AUTHENTICATION_FAILED",
         "Protected registry record identity is invalid."
@@ -387,24 +388,29 @@ export function createProtectedLinuxReaper({
     if (drains.has(key)) return drains.get(key);
     const operation = (async () => {
       if (entry.state === "drained") return entry;
-      await save(entry, "draining");
-      await cgroups.killOuter(entry);
-      const maximumPolls = 500;
-      let populated = 1;
-      for (let attempt = 0; attempt < maximumPolls; attempt += 1) {
-        const events = await cgroups.readOuterEvents(entry);
-        populated = Number(events?.populated);
-        if (populated === 0) break;
-        await new Promise((resolve) => setTimeout(resolve, 10));
+      if (entry.state !== "empty") {
+        await save(entry, "draining");
+        await cgroups.killOuter(entry);
+        const maximumPolls = 500;
+        let populated = 1;
+        for (let attempt = 0; attempt < maximumPolls; attempt += 1) {
+          const events = await cgroups.readOuterEvents(entry);
+          populated = Number(events?.populated);
+          if (populated === 0) break;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        if (populated !== 0) {
+          throw fail("CLEANUP_UNPROVEN", "Protected outer cgroup remains populated.");
+        }
+        entry.lastPopulated = 0;
+        await save(entry, "empty");
       }
-      if (populated !== 0) {
-        throw fail("CLEANUP_UNPROVEN", "Protected outer cgroup remains populated.");
-      }
-      entry.lastPopulated = 0;
       const watch = watches.get(entry.runId);
       watches.delete(entry.runId);
       await watch?.close?.();
-      await cgroups.removeRun(entry);
+      await cgroups.removeRun(entry).catch((error) => {
+        if (error?.code !== "ENOENT") throw error;
+      });
       entry.drainedAt = now().toISOString();
       await save(entry, "drained");
       return entry;
@@ -488,7 +494,7 @@ export function createProtectedLinuxReaper({
           "Blocked payload did not enter the authenticated restricted boundary."
         );
       }
-      await save(entry, "running");
+      await save(entry, "active");
       const watch = await watchHarness(entry, () => {
         void drain(entry).catch((error) => {
           poisoned ??= error instanceof SupervisorInfrastructureError
@@ -767,31 +773,42 @@ export async function runBoundedPayload({
   let captured = 0;
   let settled = false;
   let timer;
+  let rootExit;
+  let childError;
+  let boundaryResult;
 
   return new Promise((resolve) => {
-    const finish = (root) => {
+    const finish = (code, signal) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve(root);
+      const terminal = boundaryResult ?? (childError
+        ? { status: null, signal: null, error: childError }
+        : {
+            status: rootExit?.status ?? code,
+            signal: rootExit?.signal ?? signal
+          });
+      resolve({
+        ...terminal,
+        stdout: Buffer.concat(stdout),
+        stderr: Buffer.concat(stderr)
+      });
     };
     const breach = (reason, code, message) => {
-      if (settled) return;
+      if (settled || boundaryResult) return;
+      boundaryResult = {
+        status: null,
+        signal: "SIGKILL",
+        error: { code, message },
+        boundaryBreach: reason
+      };
       onBoundaryBreach(reason);
       child.stdout?.destroy();
       child.stderr?.destroy();
       child.kill("SIGKILL");
-      finish({
-        status: null,
-        signal: "SIGKILL",
-        stdout: Buffer.concat(stdout),
-        stderr: Buffer.concat(stderr),
-        error: { code, message },
-        boundaryBreach: reason
-      });
     };
     const capture = (chunks, chunk) => {
-      if (settled) return;
+      if (settled || boundaryResult) return;
       const bytes = Buffer.from(chunk);
       const remaining = Math.max(0, maxBuffer - captured);
       if (remaining > 0) {
@@ -808,22 +825,22 @@ export async function runBoundedPayload({
     };
     child.stdout?.on("data", (chunk) => capture(stdout, chunk));
     child.stderr?.on("data", (chunk) => capture(stderr, chunk));
-    child.once("error", (error) => finish({
-      status: null,
-      signal: null,
-      stdout: Buffer.concat(stdout),
-      stderr: Buffer.concat(stderr),
-      error: {
+    child.once("error", (error) => {
+      childError = {
         code: error?.code ?? "PAYLOAD_ERROR",
         message: String(error?.message ?? error).slice(0, 240)
-      }
-    }));
-    child.once("exit", (code, signal) => finish({
-      status: code,
-      signal,
-      stdout: Buffer.concat(stdout),
-      stderr: Buffer.concat(stderr)
-    }));
+      };
+    });
+    child.once("exit", (code, signal) => {
+      rootExit = { status: code, signal };
+    });
+    child.once("close", finish);
+    timer = setTimeout(() => breach(
+      "runtime-limit",
+      "ETIMEDOUT",
+      `Protected payload exceeded ${timeout} milliseconds.`
+    ), timeout);
+    timer.unref?.();
     if (payload.input !== undefined) {
       const input = payload.input?.type === "Buffer"
         ? Buffer.from(payload.input.data)
@@ -832,12 +849,6 @@ export async function runBoundedPayload({
     } else {
       child.stdin?.end();
     }
-    timer = setTimeout(() => breach(
-      "runtime-limit",
-      "ETIMEDOUT",
-      `Protected payload exceeded ${timeout} milliseconds.`
-    ), timeout);
-    timer.unref?.();
   });
 }
 

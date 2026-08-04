@@ -553,6 +553,153 @@ test("protected shim enforces a hard runtime cap for a never-exit payload", asyn
   assert.ok(Date.now() - startedAt < 1000);
 });
 
+test("protected shim retains descendant output emitted after root exit until close", async () => {
+  const child = new EventEmitter();
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = () => true;
+
+  const rootPromise = runBoundedPayload({
+    payload: {
+      command: process.execPath,
+      args: [],
+      maxBuffer: 1024,
+      timeout: 1000
+    },
+    spawnProcess() {
+      setImmediate(() => {
+        child.stdout.write("root-output:");
+        child.emit("exit", 0, null);
+        child.stdout.write("late-descendant-marker");
+        child.stderr.write("late-descendant-stderr");
+        child.stdout.end();
+        child.stderr.end();
+        child.emit("close", 0, null);
+      });
+      return child;
+    }
+  });
+
+  const root = await rootPromise;
+  assert.equal(root.status, 0);
+  assert.equal(root.signal, null);
+  assert.equal(root.stdout.toString(), "root-output:late-descendant-marker");
+  assert.equal(root.stderr.toString(), "late-descendant-stderr");
+  assert.equal(root.stdout.toString().match(/late-descendant-marker/g)?.length, 1);
+});
+
+test("protected shim retains output from a real descendant after root exit", async () => {
+  const descendantSource = [
+    "setTimeout(() => {",
+    "  process.stdout.write('late-real-descendant-marker');",
+    "}, 100);"
+  ].join("\n");
+  const rootSource = [
+    "const { spawn } = require('node:child_process');",
+    `const child = spawn(process.execPath, ["-e", ${JSON.stringify(descendantSource)}], {`,
+    "  detached: true,",
+    "  windowsHide: true,",
+    "  stdio: ['ignore', 1, 2]",
+    "});",
+    "child.unref();",
+    "process.stdout.write('root-real-output:');"
+  ].join("\n");
+
+  const root = await runBoundedPayload({
+    payload: {
+      command: process.execPath,
+      args: ["-e", rootSource],
+      maxBuffer: 1024,
+      timeout: 3000
+    }
+  });
+
+  assert.equal(root.status, 0);
+  assert.equal(root.signal, null);
+  assert.equal(
+    root.stdout.toString(),
+    "root-real-output:late-real-descendant-marker"
+  );
+  assert.equal(root.stderr.length, 0);
+});
+
+test("protected shim enforces the output cap while draining after root exit", async () => {
+  const child = new EventEmitter();
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  let killCalls = 0;
+  child.kill = () => {
+    killCalls += 1;
+    return true;
+  };
+  const breaches = [];
+
+  const rootPromise = runBoundedPayload({
+    payload: {
+      command: process.execPath,
+      args: [],
+      maxBuffer: 5,
+      timeout: 1000
+    },
+    spawnProcess() {
+      setImmediate(() => {
+        child.emit("exit", 0, null);
+        child.stdout.write("1234");
+        child.stdout.write("56789");
+        child.emit("close", 0, null);
+      });
+      return child;
+    },
+    onBoundaryBreach(reason) {
+      breaches.push(reason);
+    }
+  });
+
+  const root = await rootPromise;
+  assert.equal(root.error?.code, "ENOBUFS");
+  assert.equal(root.boundaryBreach, "output-limit");
+  assert.equal(root.stdout.length, 5);
+  assert.deepEqual(breaches, ["output-limit"]);
+  assert.equal(killCalls, 1);
+});
+
+test("protected shim spawn errors drain diagnostics without inventing exit status", async () => {
+  const child = new EventEmitter();
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = () => true;
+
+  const rootPromise = runBoundedPayload({
+    payload: {
+      command: "missing-payload-command",
+      args: [],
+      maxBuffer: 1024,
+      timeout: 1000
+    },
+    spawnProcess() {
+      setImmediate(() => {
+        const error = new Error("spawn missing-payload-command ENOENT");
+        error.code = "ENOENT";
+        child.emit("error", error);
+        child.stderr.write("late spawn diagnostics");
+        child.stderr.end();
+        child.stdout.end();
+        child.emit("close", -4058, null);
+      });
+      return child;
+    }
+  });
+
+  const root = await rootPromise;
+  assert.equal(root.status, null);
+  assert.equal(root.signal, null);
+  assert.equal(root.error?.code, "ENOENT");
+  assert.equal(root.stderr.toString(), "late spawn diagnostics");
+});
+
 test("pidfd watcher accepts only a complete bounded READY line", async () => {
   const child = new EventEmitter();
   child.stdout = new PassThrough();
@@ -999,6 +1146,7 @@ function createReaperHarness({
   checks = REQUIRED_CHECKS,
   cgroupOverrides = {},
   watchFactory,
+  registryWrite,
   reaperBootId = "boot-test"
 } = {}) {
   const events = [];
@@ -1045,6 +1193,7 @@ function createReaperHarness({
       return [...entries.values()].map((entry) => structuredClone(entry));
     },
     async write(entry) {
+      await registryWrite?.(entry, { entries, events });
       entries.set(entry.runId, structuredClone(entry));
       events.push(`registry:${entry.runId}:${entry.state}`);
     }
@@ -1087,6 +1236,22 @@ function request(operation, {
       : payload
   };
 }
+
+test("protected launch publishes the durable active state", async () => {
+  const { reaper, entries } = createReaperHarness();
+  await reaper.handleRequest(request("probe"));
+  await reaper.handleRequest(request("recover"));
+  await reaper.handleRequest(request("launch", {
+    payload: {
+      command: process.execPath,
+      args: [],
+      harnessPid: 111,
+      harnessStartTime: "222"
+    }
+  }));
+
+  assert.equal(entries.get("run-a").state, "active");
+});
 
 test("coordinator death causes independent reaper cleanup", async () => {
   const { reaper, events, entries, watchers } = createReaperHarness();
@@ -1346,6 +1511,102 @@ test("stale registry recovery completes before a new launch", async () => {
   assert.ok(events.indexOf("kill:old-run") < events.indexOf("create:run-a"));
 });
 
+test("recovery resumes from durable empty after removal-before-drained crash", async () => {
+  let removed = false;
+  let crashArmed = true;
+  const cgroupCalls = [];
+  const durableTimeline = [];
+  const first = createReaperHarness({
+    registryWrite(entry) {
+      if (entry.state === "drained" && crashArmed) {
+        crashArmed = false;
+        durableTimeline.push("crash-before:persist:drained");
+        throw new Error("injected crash before drained persistence");
+      }
+      durableTimeline.push(`persist:${entry.state}`);
+    },
+    cgroupOverrides: {
+      async killOuter() {
+        cgroupCalls.push("first-kill");
+      },
+      async readOuterEvents() {
+        cgroupCalls.push("first-events");
+        if (removed) throw new Error("read missing cgroup.events");
+        return { populated: 0 };
+      },
+      async removeRun() {
+        cgroupCalls.push("first-remove");
+        durableTimeline.push("remove");
+        removed = true;
+      }
+    }
+  });
+  await first.reaper.handleRequest(request("probe"));
+  await first.reaper.handleRequest(request("recover"));
+  const launched = await first.reaper.handleRequest(request("launch", {
+    payload: {
+      command: process.execPath,
+      args: [],
+      harnessPid: 111,
+      harnessStartTime: "222"
+    }
+  }));
+
+  await assert.rejects(
+    first.reaper.handleRequest(request("cleanup", {
+      payload: { outerCgroup: launched.outerCgroup }
+    })),
+    /injected crash before drained persistence/
+  );
+
+  const durableSnapshot = [...first.entries.values()]
+    .map((entry) => structuredClone(entry));
+  const restarted = createReaperHarness({
+    registryEntries: durableSnapshot,
+    cgroupOverrides: {
+      async killOuter() {
+        cgroupCalls.push("restart-kill");
+      },
+      async readOuterEvents() {
+        cgroupCalls.push("restart-events");
+        throw new Error("read missing cgroup.events");
+      },
+      async removeRun() {
+        cgroupCalls.push("restart-remove");
+        const error = new Error("cgroup already removed");
+        error.code = "ENOENT";
+        throw error;
+      }
+    }
+  });
+  await restarted.reaper.handleRequest(request("probe"));
+  const recovery = await restarted.reaper.handleRequest(request("recover"));
+
+  assert.deepEqual(recovery.drained, ["run-a"]);
+  assert.equal(durableSnapshot[0].state, "empty");
+  assert.equal(restarted.entries.get("run-a").state, "drained");
+  assert.deepEqual(
+    durableTimeline.filter((event) => [
+      "persist:draining",
+      "persist:empty",
+      "remove",
+      "crash-before:persist:drained"
+    ].includes(event)),
+    [
+      "persist:draining",
+      "persist:empty",
+      "remove",
+      "crash-before:persist:drained"
+    ]
+  );
+  assert.deepEqual(cgroupCalls, [
+    "first-kill",
+    "first-events",
+    "first-remove",
+    "restart-remove"
+  ]);
+});
+
 test("recovery rejects cross-boundary registry records before privileged cleanup", async () => {
   const base = {
     backend: "linux-cgroup",
@@ -1535,7 +1796,7 @@ test("Linux strict mode requires a live protected runner", {
   void staleLaunch.root.catch(() => {});
   const liveStale = await waitFor(async () => {
     const state = (await audit(staleIdentity.runId)).entry;
-    return state?.state === "running" && state.populated === 1 &&
+    return state?.state === "active" && state.populated === 1 &&
       state.pids?.length > 0 ? state : undefined;
   }, "stale run never became observably populated");
   const oldReaperPid = Number(
@@ -1685,7 +1946,7 @@ test("Linux strict mode requires a live protected runner", {
   void sibling.root.catch(() => {});
   await waitFor(async () => {
     const state = (await audit(siblingIdentity.runId)).entry;
-    return state?.state === "running" && state.populated === 1
+    return state?.state === "active" && state.populated === 1
       ? state
       : undefined;
   }, "sibling run never became populated");
@@ -1761,7 +2022,7 @@ test("Linux strict mode requires a live protected runner", {
   assertCompleteHostileEvidence(hostileEvidence);
   const liveHostile = await waitFor(async () => {
     const state = (await audit(hostileIdentity.runId)).entry;
-    return state?.state === "running" && state.populated === 1 &&
+    return state?.state === "active" && state.populated === 1 &&
       state.pids?.includes(hostileEvidence.detachedPid)
       ? state
       : undefined;
@@ -1821,7 +2082,7 @@ test("Linux strict mode requires a live protected runner", {
   });
   const liveDeath = await waitFor(async () => {
     const state = (await audit(deathIdentity.runId)).entry;
-    return state?.state === "running" && state.populated === 1 &&
+    return state?.state === "active" && state.populated === 1 &&
       state.pids?.length >= 2 ? state : undefined;
   }, "forking workload never became observably populated");
   coordinator.kill("SIGKILL");
