@@ -27,7 +27,8 @@ import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "
 import {
   binaryAvailable,
   spawnBackgroundProcess,
-  terminateProcessTree
+  terminateProcessTree,
+  waitForProcessTreeExit
 } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
@@ -50,6 +51,7 @@ import {
 } from "./lib/job-control.mjs";
 import {
   appendLogLine,
+  cancelTrackedJob,
   createJobLogFile,
   createJobProgressUpdater,
   createJobRecord,
@@ -1048,56 +1050,45 @@ async function handleCancel(argv) {
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
   const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
-  const existing = readStoredJob(workspaceRoot, job.id) ?? {};
-  const threadId = existing.threadId ?? job.threadId ?? null;
-  const turnId = existing.turnId ?? job.turnId ?? null;
+  const cancellation = await cancelTrackedJob(workspaceRoot, job.id, async (cancellingJob) => {
+    const storedJob = readStoredJob(workspaceRoot, job.id) ?? {};
+    const threadId = storedJob.threadId ?? cancellingJob.threadId ?? null;
+    const turnId = storedJob.turnId ?? cancellingJob.turnId ?? null;
+    const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
+    if (interrupt.attempted) {
+      appendLogLine(
+        cancellingJob.logFile,
+        interrupt.interrupted
+          ? `Requested Codex turn interrupt for ${turnId} on ${threadId}.`
+          : `Codex turn interrupt failed${interrupt.detail ? `: ${interrupt.detail}` : "."}`
+      );
+    }
 
-  const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
-  if (interrupt.attempted) {
-    appendLogLine(
-      job.logFile,
-      interrupt.interrupted
-        ? `Requested Codex turn interrupt for ${turnId} on ${threadId}.`
-        : `Codex turn interrupt failed${interrupt.detail ? `: ${interrupt.detail}` : "."}`
-    );
-  }
-
-  terminateProcessTree(job.pid ?? Number.NaN);
-  appendLogLine(job.logFile, "Cancelled by user.");
-
-  const completedAt = nowIso();
-  const nextJob = {
-    ...job,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    completedAt,
-    errorMessage: "Cancelled by user."
-  };
-
-  writeJobFile(workspaceRoot, job.id, {
-    ...existing,
-    ...nextJob,
-    cancelledAt: completedAt
+    const pid = cancellingJob.pid ?? Number.NaN;
+    const request = terminateProcessTree(pid);
+    const proof = await waitForProcessTreeExit(pid);
+    return {
+      terminal: proof.terminal,
+      detail: proof.terminal
+        ? null
+        : `Termination of job ${job.id} could not be confirmed (${proof.reason}).`,
+      request,
+      proof,
+      turnInterruptAttempted: interrupt.attempted,
+      turnInterrupted: interrupt.interrupted
+    };
   });
-  upsertJob(workspaceRoot, {
-    id: job.id,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    errorMessage: "Cancelled by user.",
-    completedAt
-  });
+  appendLogLine(cancellation.job.logFile, "Cancelled by user.");
 
   const payload = {
     jobId: job.id,
     status: "cancelled",
-    title: job.title,
-    turnInterruptAttempted: interrupt.attempted,
-    turnInterrupted: interrupt.interrupted
+    title: cancellation.job.title,
+    turnInterruptAttempted: cancellation.termination?.turnInterruptAttempted ?? false,
+    turnInterrupted: cancellation.termination?.turnInterrupted ?? false
   };
 
-  outputCommandResult(payload, renderCancelReport(nextJob), options.json);
+  outputCommandResult(payload, renderCancelReport(cancellation.job), options.json);
 }
 
 async function main() {

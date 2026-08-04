@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 
 import {
   spawnBackgroundProcess,
-  terminateProcessTree
+  terminateProcessTree,
+  waitForProcessTreeExit
 } from "../scripts/lib/process.mjs";
 
 test("supervised cooperative background spawn stays in its owned process group", () => {
@@ -98,4 +99,76 @@ test("terminateProcessTree treats missing Windows processes as already stopped",
   assert.equal(outcome.method, "taskkill");
   assert.equal(outcome.result.status, 128);
   assert.match(outcome.result.stdout, /not found/i);
+});
+
+test("terminateProcessTree falls back to the direct POSIX pid when the process group is missing", () => {
+  const calls = [];
+  const outcome = terminateProcessTree(1234, {
+    platform: "linux",
+    killImpl(pid, signal) {
+      calls.push([pid, signal]);
+      if (pid === -1234) {
+        throw Object.assign(new Error("missing process group"), { code: "ESRCH" });
+      }
+    }
+  });
+
+  assert.deepEqual(calls, [
+    [-1234, "SIGTERM"],
+    [1234, "SIGTERM"]
+  ]);
+  assert.equal(outcome.attempted, true);
+  assert.equal(outcome.delivered, true);
+  assert.equal(outcome.method, "process");
+});
+
+test("terminateProcessTree preserves non-ESRCH POSIX process-group errors", () => {
+  const calls = [];
+  const denied = Object.assign(new Error("permission denied"), { code: "EPERM" });
+
+  assert.throws(
+    () => terminateProcessTree(1234, {
+      platform: "linux",
+      killImpl(pid, signal) {
+        calls.push([pid, signal]);
+        throw denied;
+      }
+    }),
+    (error) => error === denied
+  );
+  assert.deepEqual(calls, [[-1234, "SIGTERM"]]);
+});
+
+test("waitForProcessTreeExit reports POSIX terminality only after group and pid are absent", async () => {
+  const calls = [];
+  const outcome = await waitForProcessTreeExit(1234, {
+    platform: "linux",
+    timeoutMs: 0,
+    killImpl(pid, signal) {
+      calls.push([pid, signal]);
+      throw Object.assign(new Error("missing"), { code: "ESRCH" });
+    }
+  });
+
+  assert.deepEqual(calls, [
+    [-1234, 0],
+    [1234, 0]
+  ]);
+  assert.deepEqual(outcome, {
+    terminal: true,
+    reason: "process-tree-exited"
+  });
+});
+
+test("waitForProcessTreeExit does not turn a live process into terminal proof", async () => {
+  const outcome = await waitForProcessTreeExit(1234, {
+    platform: "win32",
+    timeoutMs: 0,
+    killImpl() {}
+  });
+
+  assert.deepEqual(outcome, {
+    terminal: false,
+    reason: "termination-unconfirmed"
+  });
 });

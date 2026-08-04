@@ -110,6 +110,8 @@ function inferLegacyJobPhase(job, progressPreview = []) {
   switch (job.status) {
     case "queued":
       return "queued";
+    case "cancelling":
+      return "cancelling";
     case "cancelled":
       return "cancelled";
     case "failed":
@@ -164,7 +166,7 @@ export function enrichJob(job, options = {}) {
     ...job,
     kindLabel: getJobTypeLabel(job),
     progressPreview:
-      job.status === "queued" || job.status === "running" || job.status === "failed"
+      job.status === "queued" || job.status === "running" || job.status === "cancelling" || job.status === "failed"
         ? readJobProgressPreview(job.logFile, maxProgressLines)
         : [],
     elapsed: formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? null),
@@ -218,14 +220,22 @@ export function buildStatusSnapshot(cwd, options = {}) {
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
 
   const running = jobs
-    .filter((job) => job.status === "queued" || job.status === "running")
+    .filter((job) => job.status === "queued" || job.status === "running" || job.status === "cancelling")
     .map((job) => enrichJob(job, { maxProgressLines }));
 
-  const latestFinishedRaw = jobs.find((job) => job.status !== "queued" && job.status !== "running") ?? null;
+  const latestFinishedRaw = jobs.find(
+    (job) => job.status !== "queued" && job.status !== "running" && job.status !== "cancelling"
+  ) ?? null;
   const latestFinished = latestFinishedRaw ? enrichJob(latestFinishedRaw, { maxProgressLines }) : null;
 
   const recent = (options.all ? jobs : jobs.slice(0, maxJobs))
-    .filter((job) => job.status !== "queued" && job.status !== "running" && job.id !== latestFinished?.id)
+    .filter(
+      (job) =>
+        job.status !== "queued" &&
+        job.status !== "running" &&
+        job.status !== "cancelling" &&
+        job.id !== latestFinished?.id
+    )
     .map((job) => enrichJob(job, { maxProgressLines }));
 
   return {
@@ -266,7 +276,11 @@ export function resolveResultJob(cwd, reference) {
     return { workspaceRoot, job: selected };
   }
 
-  const active = matchJobReference(jobs, reference, (job) => job.status === "queued" || job.status === "running");
+  const active = matchJobReference(
+    jobs,
+    reference,
+    (job) => job.status === "queued" || job.status === "running" || job.status === "cancelling"
+  );
   if (active) {
     throw new Error(`Job ${active.id} is still ${active.status}. Check /cdx-relay:status and try again once it finishes.`);
   }
@@ -281,10 +295,16 @@ export function resolveResultJob(cwd, reference) {
 export function resolveCancelableJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
-  const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
+  const activeJobs = jobs.filter(
+    (job) => job.status === "queued" || job.status === "running" || job.status === "cancelling"
+  );
 
   if (reference) {
-    const selected = matchJobReference(activeJobs, reference);
+    const selected = matchJobReference(
+      jobs,
+      reference,
+      (job) => activeJobs.includes(job) || job.status === "cancelled"
+    );
     if (!selected) {
       throw new Error(`No active job found for "${reference}".`);
     }

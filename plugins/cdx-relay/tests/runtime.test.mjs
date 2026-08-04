@@ -31,6 +31,7 @@ import { createBrokerEndpoint, parseBrokerEndpoint } from "../scripts/lib/broker
 import { captureProcessIdentity } from "../scripts/lib/process-identity.mjs";
 import { DEFAULT_CONTINUE_PROMPT, getSessionRuntimeStatus } from "../scripts/lib/codex.mjs";
 import { resolveStateDir, upsertJob, writeJobFile } from "../scripts/lib/state.mjs";
+import { cancelTrackedJob, runTrackedJob } from "../scripts/lib/tracked-jobs.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = ROOT;
@@ -238,6 +239,42 @@ function installTaskkillFixture(binDir) {
     `@"${process.execPath}" "${fixture}" %*\r\n`,
     "utf8"
   );
+}
+
+function seedIndexedCancelableJob(workspace, jobId = "task-live") {
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const logFile = path.join(jobsDir, `${jobId}.log`);
+  const jobFile = path.join(jobsDir, `${jobId}.json`);
+  const indexedJob = {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    title: "Codex Task",
+    jobClass: "task",
+    summary: "Investigate flaky test",
+    pid: 4321,
+    logFile,
+    createdAt: "2026-03-18T15:30:00.000Z",
+    startedAt: "2026-03-18T15:30:01.000Z",
+    updatedAt: "2026-03-18T15:30:02.000Z"
+  };
+  fs.writeFileSync(logFile, "[2026-03-18T15:30:00.000Z] Starting Codex Task.\n", "utf8");
+  fs.writeFileSync(jobFile, JSON.stringify(indexedJob, null, 2), "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify({
+      version: 1,
+      revision: 0,
+      config: { stopReviewGate: false },
+      jobs: [indexedJob]
+    }, null, 2)}\n`,
+    "utf8"
+  );
+
+  return { stateDir, jobFile, logFile };
 }
 
 function seedFakeCodexThread(statePath, cwd, threadId = "thr_exact") {
@@ -2900,6 +2937,129 @@ test("result for a finished write-capable task returns the raw Codex final respo
   assert.match(result.stdout, /Resume in Codex: codex resume thr_[a-z0-9]+/i);
 });
 
+test("a tracked job terminal result completes an already-requested cancellation", async () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  let releaseRunner;
+  const runnerGate = new Promise((resolve) => {
+    releaseRunner = resolve;
+  });
+  const executionPromise = runTrackedJob(
+    {
+      id: "task-cancelling",
+      workspaceRoot: workspace,
+      title: "Codex Task"
+    },
+    async () => {
+      await runnerGate;
+      return {
+        exitStatus: 0,
+        threadId: "thr_cancel",
+        turnId: "turn_cancel",
+        summary: "Finished after cancellation intent",
+        payload: { ok: true },
+        rendered: "Finished after cancellation intent.\n"
+      };
+    }
+  );
+
+  await waitFor(() => {
+    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+    return state.jobs[0]?.status === "running";
+  });
+  const cancelRequestedAt = "2026-08-04T10:00:00.000Z";
+  upsertJob(workspace, {
+    id: "task-cancelling",
+    status: "cancelling",
+    phase: "cancelling",
+    cancelRequestedAt
+  });
+  releaseRunner();
+  await executionPromise;
+
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(state.jobs[0].status, "cancelled");
+  assert.equal(state.jobs[0].phase, "cancelled");
+  assert.equal(state.jobs[0].pid, null);
+  assert.equal(state.jobs[0].cancelRequestedAt, cancelRequestedAt);
+});
+
+test("cancel durably publishes cancelling before requesting termination", async () => {
+  const workspace = makeTempDir();
+  const { stateDir, jobFile } = seedIndexedCancelableJob(workspace);
+  let observed = null;
+
+  const cancellation = await cancelTrackedJob(workspace, "task-live", async () => {
+    observed = {
+      state: JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")),
+      storedJob: JSON.parse(fs.readFileSync(jobFile, "utf8"))
+    };
+    return { terminal: true, proof: "injected-terminal-result" };
+  });
+
+  const indexedJob = observed.state.jobs.find((job) => job.id === "task-live");
+  assert.equal(indexedJob.status, "cancelling");
+  assert.equal(indexedJob.phase, "cancelling");
+  assert.match(indexedJob.cancelRequestedAt, /^\d{4}-\d{2}-\d{2}T/);
+  assert.equal(observed.storedJob.status, "cancelling");
+  assert.equal(observed.storedJob.cancelRequestedAt, indexedJob.cancelRequestedAt);
+  assert.equal(cancellation.job.status, "cancelled");
+});
+
+test("failed cancellation remains recoverable and a repeated request is idempotent", async () => {
+  const workspace = makeTempDir();
+  const { stateDir } = seedIndexedCancelableJob(workspace);
+  let attempts = 0;
+
+  await assert.rejects(
+    cancelTrackedJob(workspace, "task-live", async () => {
+      attempts += 1;
+      throw new Error("fixture termination failure");
+    }),
+    /fixture termination failure/i
+  );
+
+  const afterFailure = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const cancelling = afterFailure.jobs[0];
+  assert.equal(cancelling.status, "cancelling");
+  assert.equal(cancelling.pid, 4321);
+  assert.match(cancelling.cancelRequestedAt, /^\d{4}-\d{2}-\d{2}T/);
+  assert.match(cancelling.cancellationError, /fixture termination failure/i);
+
+  const repeated = await cancelTrackedJob(workspace, "task-live", async () => {
+    attempts += 1;
+    return { terminal: true, proof: "injected-terminal-result" };
+  });
+  assert.equal(repeated.job.status, "cancelled");
+  assert.equal(repeated.job.cancelRequestedAt, cancelling.cancelRequestedAt);
+
+  const alreadyCancelled = await cancelTrackedJob(workspace, "task-live", async () => {
+    attempts += 1;
+    throw new Error("termination must not repeat after terminal cancellation");
+  });
+  assert.equal(alreadyCancelled.job.status, "cancelled");
+  assert.equal(alreadyCancelled.repeated, true);
+  assert.equal(attempts, 2);
+});
+
+test("successful signal delivery without terminal proof does not publish cancelled", async () => {
+  const workspace = makeTempDir();
+  const { stateDir } = seedIndexedCancelableJob(workspace);
+
+  await assert.rejects(
+    cancelTrackedJob(workspace, "task-live", async () => ({
+      terminal: false,
+      detail: "Termination of job task-live could not be confirmed."
+    })),
+    /termination.*confirm/i
+  );
+
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(state.jobs[0].status, "cancelling");
+  assert.equal(state.jobs[0].pid, 4321);
+  assert.match(state.jobs[0].cancellationError, /termination.*confirm/i);
+});
+
 test("cancel stops an active background job and marks it cancelled", async () => {
   const workspace = makeTempDir();
   const binDir = makeTempDir();
@@ -3046,11 +3206,24 @@ test("cancel without a job id ignores active jobs from other Claude sessions", (
   assert.equal(state.jobs[0].status, "running");
 });
 
-test("cancel with a job id can still target an active job from another Claude session", () => {
+test("cancel with a job id can still target an active job from another Claude session", async (t) => {
   const workspace = makeTempDir();
+  const binDir = makeTempDir();
+  installTaskkillFixture(binDir);
   const stateDir = resolveStateDir(workspace);
   const jobsDir = path.join(stateDir, "jobs");
   fs.mkdirSync(jobsDir, { recursive: true });
+  const sleeper = await spawnTracked(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    cwd: workspace,
+    detached: true,
+    stdio: "ignore"
+  });
+  sleeper.unref();
+  t.after(async () => {
+    if (processIsAlive(sleeper.pid)) sleeper.kill("SIGTERM");
+    await sleeper.completion.catch(() => {});
+    assertSupervisorHealthy();
+  });
 
   const logFile = path.join(jobsDir, "task-other.log");
   fs.writeFileSync(logFile, "", "utf8");
@@ -3068,6 +3241,7 @@ test("cancel with a job id can still target an active job from another Claude se
             jobClass: "task",
             sessionId: "sess-other",
             summary: "Other session run",
+            pid: sleeper.pid,
             updatedAt: "2026-03-24T20:05:00.000Z",
             logFile
           }
@@ -3081,7 +3255,8 @@ test("cancel with a job id can still target an active job from another Claude se
 
   const env = {
     ...process.env,
-    CODEX_COMPANION_SESSION_ID: "sess-current"
+    CODEX_COMPANION_SESSION_ID: "sess-current",
+    PATH: `${binDir}${path.delimiter}${process.env.PATH}`
   };
   const cancel = run("node", [SCRIPT, "cancel", "task-other", "--json"], {
     cwd: workspace,
@@ -3089,6 +3264,7 @@ test("cancel with a job id can still target an active job from another Claude se
   });
   assert.equal(cancel.status, 0, cancel.stderr);
   assert.equal(JSON.parse(cancel.stdout).jobId, "task-other");
+  await sleeper.completion;
 
   const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
   assert.equal(state.jobs[0].status, "cancelled");

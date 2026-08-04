@@ -1,7 +1,13 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import {
+  readJobFile,
+  resolveJobFile,
+  resolveJobLogFile,
+  updateState,
+  writeJobFile
+} from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
@@ -99,18 +105,14 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       return;
     }
 
-    upsertJob(workspaceRoot, patch);
-
-    const jobFile = resolveJobFile(workspaceRoot, jobId);
-    if (!fs.existsSync(jobFile)) {
-      return;
-    }
-
-    const storedJob = readJobFile(jobFile);
-    writeJobFile(workspaceRoot, jobId, {
-      ...storedJob,
-      ...patch
+    const indexedJob = updateIndexedJob(workspaceRoot, jobId, (current) => {
+      if (current.status === "cancelling" || current.status === "cancelled") {
+        const { phase: _ignoredPhase, ...terminalSafePatch } = patch;
+        return terminalSafePatch;
+      }
+      return patch;
     });
+    publishStoredJob(workspaceRoot, jobId, indexedJob);
   };
 }
 
@@ -139,66 +141,197 @@ function readStoredJobOrNull(workspaceRoot, jobId) {
   return readJobFile(jobFile);
 }
 
-export async function runTrackedJob(job, runner, options = {}) {
-  const runningRecord = {
-    ...job,
-    status: "running",
-    startedAt: nowIso(),
-    phase: "starting",
-    pid: process.pid,
-    logFile: options.logFile ?? job.logFile ?? null
+function updateIndexedJob(workspaceRoot, jobId, mutate) {
+  let publishedJob = null;
+  updateState(workspaceRoot, (state) => {
+    const timestamp = nowIso();
+    const index = state.jobs.findIndex((job) => job.id === jobId);
+    const current = index === -1
+      ? { id: jobId, createdAt: timestamp }
+      : state.jobs[index];
+    publishedJob = {
+      ...current,
+      ...mutate(current, timestamp),
+      id: jobId,
+      updatedAt: timestamp
+    };
+    if (index === -1) {
+      state.jobs.unshift(publishedJob);
+    } else {
+      state.jobs[index] = publishedJob;
+    }
+  });
+  return publishedJob;
+}
+
+function publishStoredJob(workspaceRoot, jobId, indexedJob) {
+  const existing = readStoredJobOrNull(workspaceRoot, jobId) ?? {};
+  writeJobFile(workspaceRoot, jobId, {
+    ...existing,
+    ...indexedJob
+  });
+}
+
+function cancellationTerminalPatch(current, timestamp) {
+  return {
+    status: "cancelled",
+    phase: "cancelled",
+    pid: null,
+    completedAt: current.completedAt ?? timestamp,
+    cancelledAt: current.cancelledAt ?? timestamp,
+    errorMessage: "Cancelled by user.",
+    cancellationError: null
   };
-  writeJobFile(job.workspaceRoot, job.id, runningRecord);
-  upsertJob(job.workspaceRoot, runningRecord);
+}
+
+export async function cancelTrackedJob(workspaceRoot, jobId, requestTermination) {
+  if (typeof requestTermination !== "function") {
+    throw new TypeError("Cancellation requires a termination request function.");
+  }
+
+  let alreadyCancelled = false;
+  const cancellingJob = updateIndexedJob(workspaceRoot, jobId, (current, timestamp) => {
+    if (current.status === "cancelled") {
+      alreadyCancelled = true;
+      return {};
+    }
+    if (!["queued", "running", "cancelling"].includes(current.status)) {
+      throw new Error(`Job ${jobId} cannot be cancelled from status ${current.status ?? "unknown"}.`);
+    }
+    return {
+      status: "cancelling",
+      phase: "cancelling",
+      cancelRequestedAt: current.cancelRequestedAt ?? timestamp
+    };
+  });
+  publishStoredJob(workspaceRoot, jobId, cancellingJob);
+
+  if (alreadyCancelled) {
+    return {
+      job: cancellingJob,
+      termination: null,
+      repeated: true
+    };
+  }
+
+  let termination;
+  try {
+    termination = await requestTermination(cancellingJob);
+    if (termination?.terminal !== true) {
+      throw Object.assign(
+        new Error(termination?.detail ?? `Termination of job ${jobId} could not be confirmed.`),
+        { code: "ERR_CANCELLATION_UNCONFIRMED" }
+      );
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    const failedJob = updateIndexedJob(workspaceRoot, jobId, (current, timestamp) => {
+      if (current.status === "cancelled") {
+        return {};
+      }
+      if (current.status !== "cancelling") {
+        throw error;
+      }
+      return {
+        status: "cancelling",
+        phase: "cancelling",
+        cancellationError: detail,
+        lastCancelAttemptAt: timestamp
+      };
+    });
+    publishStoredJob(workspaceRoot, jobId, failedJob);
+    throw error;
+  }
+
+  const cancelledJob = updateIndexedJob(workspaceRoot, jobId, (current, timestamp) => {
+    if (current.status === "cancelled") {
+      return {};
+    }
+    if (current.status !== "cancelling") {
+      throw new Error(
+        `Job ${jobId} reached ${current.status ?? "unknown"} before cancellation terminality was published.`
+      );
+    }
+    return {
+      ...cancellationTerminalPatch(current, timestamp),
+      lastCancelAttemptAt: timestamp
+    };
+  });
+  publishStoredJob(workspaceRoot, jobId, cancelledJob);
+  return {
+    job: cancelledJob,
+    termination,
+    repeated: false
+  };
+}
+
+export async function runTrackedJob(job, runner, options = {}) {
+  const runningRecord = updateIndexedJob(job.workspaceRoot, job.id, (current, timestamp) => {
+    if (current.status === "cancelling" || current.status === "cancelled") {
+      return {};
+    }
+    return {
+      ...job,
+      status: "running",
+      startedAt: timestamp,
+      phase: "starting",
+      pid: process.pid,
+      logFile: options.logFile ?? job.logFile ?? null
+    };
+  });
+  publishStoredJob(job.workspaceRoot, job.id, runningRecord);
+  if (runningRecord.status === "cancelling" || runningRecord.status === "cancelled") {
+    throw Object.assign(new Error(`Cancellation was requested for job ${job.id}.`), {
+      code: "ERR_JOB_CANCELLING"
+    });
+  }
 
   try {
     const execution = await runner();
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
-    writeJobFile(job.workspaceRoot, job.id, {
-      ...runningRecord,
-      status: completionStatus,
-      threadId: execution.threadId ?? null,
-      turnId: execution.turnId ?? null,
-      pid: null,
-      phase: completionStatus === "completed" ? "done" : "failed",
-      completedAt,
-      result: execution.payload,
-      rendered: execution.rendered
+    const completedJob = updateIndexedJob(job.workspaceRoot, job.id, (current) => {
+      if (current.status === "cancelling" || current.status === "cancelled") {
+        return {
+          ...cancellationTerminalPatch(current, completedAt),
+          threadId: execution.threadId ?? current.threadId ?? null,
+          turnId: execution.turnId ?? current.turnId ?? null
+        };
+      }
+      return {
+        status: completionStatus,
+        threadId: execution.threadId ?? null,
+        turnId: execution.turnId ?? null,
+        summary: execution.summary,
+        phase: completionStatus === "completed" ? "done" : "failed",
+        pid: null,
+        completedAt,
+        result: execution.payload,
+        rendered: execution.rendered
+      };
     });
-    upsertJob(job.workspaceRoot, {
-      id: job.id,
-      status: completionStatus,
-      threadId: execution.threadId ?? null,
-      turnId: execution.turnId ?? null,
-      summary: execution.summary,
-      phase: completionStatus === "completed" ? "done" : "failed",
-      pid: null,
-      completedAt
-    });
-    appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
+    publishStoredJob(job.workspaceRoot, job.id, completedJob);
+    if (completedJob.status !== "cancelled") {
+      appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
+    }
     return execution;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
     const completedAt = nowIso();
-    writeJobFile(job.workspaceRoot, job.id, {
-      ...existing,
-      status: "failed",
-      phase: "failed",
-      errorMessage,
-      pid: null,
-      completedAt,
-      logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
+    const failedJob = updateIndexedJob(job.workspaceRoot, job.id, (current) => {
+      if (current.status === "cancelling" || current.status === "cancelled") {
+        return cancellationTerminalPatch(current, completedAt);
+      }
+      return {
+        status: "failed",
+        phase: "failed",
+        pid: null,
+        errorMessage,
+        completedAt,
+        logFile: options.logFile ?? job.logFile ?? current.logFile ?? null
+      };
     });
-    upsertJob(job.workspaceRoot, {
-      id: job.id,
-      status: "failed",
-      phase: "failed",
-      pid: null,
-      errorMessage,
-      completedAt
-    });
+    publishStoredJob(job.workspaceRoot, job.id, failedJob);
     throw error;
   }
 }

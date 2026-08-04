@@ -120,18 +120,63 @@ export function terminateProcessTree(pid, options = {}) {
     return { attempted: true, delivered: true, method: "process-group" };
   } catch (error) {
     if (error?.code !== "ESRCH") {
-      try {
-        killImpl(pid, "SIGTERM");
-        return { attempted: true, delivered: true, method: "process" };
-      } catch (innerError) {
-        if (innerError?.code === "ESRCH") {
-          return { attempted: true, delivered: false, method: "process" };
-        }
-        throw innerError;
-      }
+      throw error;
     }
 
-    return { attempted: true, delivered: false, method: "process-group" };
+    try {
+      killImpl(pid, "SIGTERM");
+      return { attempted: true, delivered: true, method: "process" };
+    } catch (innerError) {
+      if (innerError?.code === "ESRCH") {
+        return { attempted: true, delivered: false, method: "process" };
+      }
+      throw innerError;
+    }
+  }
+}
+
+function processTreeIsAlive(pid, platform, killImpl) {
+  if (platform !== "win32") {
+    try {
+      killImpl(-pid, 0);
+      return true;
+    } catch (error) {
+      if (error?.code !== "ESRCH") {
+        throw error;
+      }
+    }
+  }
+
+  try {
+    killImpl(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+export async function waitForProcessTreeExit(pid, options = {}) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    return { terminal: false, reason: "invalid-pid" };
+  }
+
+  const platform = options.platform ?? process.platform;
+  const killImpl = options.killImpl ?? process.kill.bind(process);
+  const timeoutMs = options.timeoutMs ?? 3000;
+  const pollIntervalMs = options.pollIntervalMs ?? 25;
+  const deadline = Date.now() + timeoutMs;
+
+  for (;;) {
+    if (!processTreeIsAlive(pid, platform, killImpl)) {
+      return { terminal: true, reason: "process-tree-exited" };
+    }
+    if (Date.now() >= deadline) {
+      return { terminal: false, reason: "termination-unconfirmed" };
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
   }
 }
 
