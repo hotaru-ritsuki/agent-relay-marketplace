@@ -90,6 +90,25 @@ test("default policy targets fail closed for a broken link", () => {
   );
 });
 
+test("default policy targets fail closed for a directory link", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "relay-policy-targets-"));
+  fixtureRoots.add(root);
+  const directoryTarget = path.join(root, "cursor-relay-target");
+  const linkTarget = path.join(root, "cursor-relay");
+  fs.mkdirSync(directoryTarget);
+  fs.symlinkSync(
+    directoryTarget,
+    linkTarget,
+    process.platform === "win32" ? "junction" : "dir",
+  );
+  assert.equal(fs.lstatSync(linkTarget).isSymbolicLink(), true);
+
+  assert.throws(
+    () => existingDirectories([linkTarget]),
+    /policy target exists but is not a directory/i,
+  );
+});
+
 test("default policy targets include and scan a future plugin once it exists", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "relay-policy-targets-"));
   fixtureRoots.add(root);
@@ -140,6 +159,44 @@ test("safety scan rejects unsafe default flags", () => {
   assert.equal(violations.length, 1);
   assert.match(violations[0].message, /--force/);
   assert.match(violations[0].message, /--trust/);
+});
+
+test("safety CLI exits 1 for danger-full-access in structured JSON", () => {
+  const root = fixture('const args = ["--sandbox", "enabled"];');
+  writeFixtureFile(
+    root,
+    "config/runtime.json",
+    JSON.stringify({ provider: { sandbox: "danger-full-access" } }),
+  );
+
+  const result = runCli(SAFETY_CLI, root);
+
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /danger-full-access/);
+});
+
+test("safety CLI exits 1 for forbidden launch flags in executable tests", () => {
+  const root = fixture('const args = ["--sandbox", "enabled"];');
+  writeFixtureFile(
+    root,
+    "tests/process-supervisor/launch.test.mjs",
+    'const launchArgs = ["--yolo"];',
+  );
+
+  const result = runCli(SAFETY_CLI, root);
+
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /--yolo/);
+});
+
+test("safety CLI fails closed when structured JSON cannot be parsed", () => {
+  const root = fixture('const args = ["--sandbox", "enabled"];');
+  writeFixtureFile(root, "config/runtime.json", '{"sandbox":');
+
+  const result = runCli(SAFETY_CLI, root);
+
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /structured safety scan/i);
 });
 
 test("safe runtime sources pass both policies", () => {
@@ -306,7 +363,6 @@ test("isolation scan excludes tests and tooling directories", () => {
 test("safety scan excludes approved paths and unsupported extensions", () => {
   const root = fixture('const args = ["--sandbox", "enabled"];');
   for (const relative of [
-    "tests/unsafe.js",
     "tooling/unsafe.md",
     "CHANGELOG.md",
     "NOTICE",

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { listFiles } from "./lib/fs-walk.mjs";
+import { existingDirectories, listFiles } from "./lib/fs-walk.mjs";
 
 function canonicalPath(filePath) {
   const resolved = path.resolve(filePath);
@@ -28,7 +28,7 @@ export function isDirectInvocation({
 export function syncContracts({ rootDir, pluginDirs }) {
   const schemaRoot = path.join(rootDir, "contracts", "schemas");
   const typeFile = path.join(rootDir, "contracts", "types", "relay.d.ts");
-  for (const pluginDir of pluginDirs) {
+  for (const pluginDir of existingDirectories(pluginDirs)) {
     const schemaTarget = path.join(pluginDir, "schemas", "agent-relay");
     const typeTarget = path.join(pluginDir, "types");
     fs.mkdirSync(schemaTarget, { recursive: true });

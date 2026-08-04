@@ -10,22 +10,59 @@ const FORBIDDEN = [
   "--trust",
   "--approve-mcps",
   "--dangerously-bypass-approvals-and-sandbox",
+  "danger-full-access",
 ];
 const DISABLED_SANDBOX = /--sandbox\s*=\s*disabled|["'`]--sandbox["'`]\s*,\s*["'`]disabled["'`]/;
+
+function containsStructuredValue(value, expected) {
+  if (value === expected) return true;
+  if (Array.isArray(value)) {
+    return value.some((item) => containsStructuredValue(item, expected));
+  }
+  if (value && typeof value === "object") {
+    return Object.values(value).some((item) =>
+      containsStructuredValue(item, expected)
+    );
+  }
+  return false;
+}
+
+function isScannable(root, file) {
+  const relative = path.relative(root, file).split(path.sep).join("/");
+  if (relative.startsWith("tooling/")
+      || ["CHANGELOG.md", "NOTICE", "PROVENANCE.md"].includes(relative)) {
+    return false;
+  }
+  if (relative.startsWith("tests/")) {
+    return /\.(?:mjs|js|cjs)$/.test(file);
+  }
+  return /\.(?:md|json|mjs|js|cjs)$/.test(file);
+}
 
 export function checkForbiddenFlags(pluginDir) {
   const root = path.resolve(pluginDir);
   const violations = [];
 
-  for (const file of listFiles(root).filter((item) => {
-    const relative = path.relative(root, item).split(path.sep).join("/");
-    return /\.(?:md|json|mjs|js|cjs)$/.test(item)
-      && !relative.startsWith("tests/")
-      && !relative.startsWith("tooling/")
-      && !["CHANGELOG.md", "NOTICE", "PROVENANCE.md"].includes(relative);
-  })) {
+  for (const file of listFiles(root).filter((item) => isScannable(root, item))) {
     const source = fs.readFileSync(file, "utf8");
-    const found = FORBIDDEN.filter((flag) => source.includes(flag));
+    let structured;
+    if (path.extname(file).toLowerCase() === ".json") {
+      try {
+        structured = JSON.parse(source);
+      } catch (error) {
+        violations.push({
+          file,
+          message: `structured safety scan failed: ${error.message}`,
+        });
+        continue;
+      }
+    }
+
+    const found = FORBIDDEN.filter((flag) =>
+      flag === "danger-full-access" && structured !== undefined
+        ? containsStructuredValue(structured, flag)
+        : source.includes(flag)
+    );
     if (DISABLED_SANDBOX.test(source)) found.push("--sandbox=disabled");
 
     if (found.length) {
