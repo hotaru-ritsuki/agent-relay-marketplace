@@ -13,6 +13,21 @@ const FORBIDDEN = [
   "danger-full-access",
 ];
 const DISABLED_SANDBOX = /--sandbox\s*=\s*disabled|["'`]--sandbox["'`]\s*,\s*["'`]disabled["'`]/;
+const IGNORED_DIRECTORY_NAMES = new Set([
+  ".generated",
+  ".git",
+  ".scratch",
+  ".superpowers",
+  ".tmp",
+  ".worktrees",
+  "build",
+  "coverage",
+  "dist",
+  "node_modules",
+  "temp",
+  "tmp",
+  "vendor",
+]);
 
 function containsStructuredValue(value, expected) {
   if (value === expected) return true;
@@ -39,11 +54,19 @@ function isScannable(root, file) {
   return /\.(?:md|json|mjs|js|cjs)$/.test(file);
 }
 
+function isIgnoredDirectory({ name, relativePath }) {
+  return relativePath === "tooling" || IGNORED_DIRECTORY_NAMES.has(name);
+}
+
 export function checkForbiddenFlags(pluginDir) {
   const root = path.resolve(pluginDir);
   const violations = [];
 
-  for (const file of listFiles(root).filter((item) => isScannable(root, item))) {
+  const files = listFiles(root, {
+    shouldDescend: (directory) => !isIgnoredDirectory(directory),
+  });
+  for (const file of files) {
+    if (!isScannable(root, file)) continue;
     const source = fs.readFileSync(file, "utf8");
     let structured;
     if (path.extname(file).toLowerCase() === ".json") {

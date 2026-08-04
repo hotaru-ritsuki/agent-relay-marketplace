@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,6 +17,15 @@ function createDirectoryLink(target, link) {
     fs.lstatSync(link).isSymbolicLink(),
     true,
     `expected a real directory link at ${link}`,
+  );
+}
+
+function createFileLink(target, link) {
+  fs.symlinkSync(target, link, "file");
+  assert.equal(
+    fs.lstatSync(link).isSymbolicLink(),
+    true,
+    `expected a real file link at ${link}`,
   );
 }
 
@@ -78,11 +88,39 @@ test("walkEntries reports in-root and out-of-root directory links without traver
       ),
       false,
     );
-    assert.throws(
-      () => listFiles(root),
-      /filesystem walk refuses symbolic link/i,
+    assert.deepEqual(
+      listFiles(root),
+      [path.join(inRootTarget, "inside.txt")],
     );
   } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("listFiles skips POSIX socket entries while walkEntries exposes them", {
+  skip: process.platform === "win32",
+}, async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "relay-file-special-"));
+  const socketPath = path.join(temp, "control.sock");
+  const regularFile = path.join(temp, "regular.txt");
+  const server = net.createServer();
+  fs.writeFileSync(regularFile, "regular");
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, resolve);
+  });
+
+  try {
+    assert.deepEqual(
+      fsWalk.walkEntries(temp),
+      [
+        { path: socketPath, type: "other" },
+        { path: regularFile, type: "file" },
+      ],
+    );
+    assert.deepEqual(listFiles(temp), [regularFile]);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
     fs.rmSync(temp, { recursive: true, force: true });
   }
 });
@@ -150,3 +188,65 @@ test("syncContracts updates an existing plugin without creating an absent plugin
     fs.rmSync(temp, { recursive: true, force: true });
   }
 });
+
+for (const linkedComponent of ["schemas", "types"]) {
+  test(`syncContracts refuses an existing ${linkedComponent} directory link`, () => {
+    const temp = fs.mkdtempSync(path.join(os.tmpdir(), "relay-contracts-link-"));
+    try {
+      const rootDir = fileURLToPath(new URL("../..", import.meta.url));
+      const pluginDir = path.join(temp, "cdx-relay");
+      const outside = path.join(temp, "outside");
+      fs.mkdirSync(pluginDir);
+      fs.mkdirSync(outside);
+      createDirectoryLink(outside, path.join(pluginDir, linkedComponent));
+      let failure;
+
+      try {
+        syncContracts({ rootDir, pluginDirs: [pluginDir] });
+      } catch (error) {
+        failure = error;
+      }
+
+      assert.match(
+        failure?.message ?? "",
+        /contract sync refuses linked destination/i,
+      );
+      assert.deepEqual(listFiles(outside), []);
+    } finally {
+      fs.rmSync(temp, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const linkedTarget of [
+  "types/relay.d.ts",
+  "schemas/agent-relay/common.schema.json",
+]) {
+  test(`syncContracts refuses the linked final target ${linkedTarget}`, () => {
+    const temp = fs.mkdtempSync(path.join(os.tmpdir(), "relay-contracts-target-link-"));
+    try {
+      const rootDir = fileURLToPath(new URL("../..", import.meta.url));
+      const pluginDir = path.join(temp, "cdx-relay");
+      const destination = path.join(pluginDir, ...linkedTarget.split("/"));
+      const outsideFile = path.join(temp, "outside-target");
+      fs.mkdirSync(path.dirname(destination), { recursive: true });
+      fs.writeFileSync(outsideFile, "outside-sentinel");
+      createFileLink(outsideFile, destination);
+      let failure;
+
+      try {
+        syncContracts({ rootDir, pluginDirs: [pluginDir] });
+      } catch (error) {
+        failure = error;
+      }
+
+      assert.match(
+        failure?.message ?? "",
+        /contract sync refuses linked destination/i,
+      );
+      assert.equal(fs.readFileSync(outsideFile, "utf8"), "outside-sentinel");
+    } finally {
+      fs.rmSync(temp, { recursive: true, force: true });
+    }
+  });
+}

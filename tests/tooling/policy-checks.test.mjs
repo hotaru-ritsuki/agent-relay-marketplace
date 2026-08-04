@@ -42,6 +42,11 @@ function writeFixtureFile(root, relative, source) {
   fs.writeFileSync(file, source);
 }
 
+function createDirectoryLink(target, link) {
+  fs.symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir");
+  assert.equal(fs.lstatSync(link).isSymbolicLink(), true);
+}
+
 test("default policy targets skip absent planned plugin directories", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "relay-policy-targets-"));
   fixtureRoots.add(root);
@@ -96,12 +101,7 @@ test("default policy targets fail closed for a directory link", () => {
   const directoryTarget = path.join(root, "cursor-relay-target");
   const linkTarget = path.join(root, "cursor-relay");
   fs.mkdirSync(directoryTarget);
-  fs.symlinkSync(
-    directoryTarget,
-    linkTarget,
-    process.platform === "win32" ? "junction" : "dir",
-  );
-  assert.equal(fs.lstatSync(linkTarget).isSymbolicLink(), true);
+  createDirectoryLink(directoryTarget, linkTarget);
 
   assert.throws(
     () => existingDirectories([linkTarget]),
@@ -197,6 +197,48 @@ test("safety CLI fails closed when structured JSON cannot be parsed", () => {
 
   assert.equal(result.status, 1, result.stderr);
   assert.match(result.stderr, /structured safety scan/i);
+});
+
+test("safety CLI ignores forbidden content in generated dependency build and temp trees", () => {
+  const root = fixture('const args = ["--sandbox", "enabled"];');
+  for (const [relative, source] of [
+    [".generated/runtime.mjs", 'const args = ["--force"];'],
+    [".scratch/stale.test.mjs", 'const args = ["--yolo"];'],
+    [".superpowers/cache/runtime.cjs", 'const args = ["--trust"];'],
+    [".tmp/fixture.json", '{"sandbox":"danger-full-access"}'],
+    [".worktrees/stale/runtime.js", 'const args = ["--approve-mcps"];'],
+    ["build/bundle.js", 'const args = ["--force"];'],
+    ["coverage/result.json", '{"sandbox":"danger-full-access"}'],
+    ["dist/bundle.js", 'const args = ["--yolo"];'],
+    ["node_modules/vendor/package.json", '{"sandbox":"danger-full-access"}'],
+    ["temp/fixture.mjs", 'const args = ["--trust"];'],
+    ["tmp/fixture.cjs", 'const args = ["--approve-mcps"];'],
+    ["vendor/dependency.js", 'const args = ["--force"];'],
+  ]) {
+    writeFixtureFile(root, relative, source);
+  }
+
+  const result = runCli(SAFETY_CLI, root);
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, "");
+});
+
+test("safety CLI prunes ignored trees before malformed JSON and links", () => {
+  const root = fixture('const args = ["--sandbox", "enabled"];');
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "relay-policy-outside-"));
+  fixtureRoots.add(outside);
+  writeFixtureFile(root, "node_modules/vendor/package.json", '{"sandbox":');
+  writeFixtureFile(root, ".generated/broken.json", '{"sandbox":');
+  writeFixtureFile(outside, "unsafe.mjs", 'const args = ["--yolo"];');
+  const link = path.join(root, "dist", "linked-vendor");
+  fs.mkdirSync(path.dirname(link), { recursive: true });
+  createDirectoryLink(outside, link);
+
+  const result = runCli(SAFETY_CLI, root);
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, "");
 });
 
 test("safe runtime sources pass both policies", () => {

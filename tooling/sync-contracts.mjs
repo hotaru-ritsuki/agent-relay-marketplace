@@ -12,6 +12,84 @@ function canonicalPath(filePath) {
   }
 }
 
+function isPathWithin(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative === ""
+    || (!path.isAbsolute(relative)
+      && relative !== ".."
+      && !relative.startsWith(`..${path.sep}`));
+}
+
+function linkedDestinationError(target) {
+  return new TypeError(`Contract sync refuses linked destination: ${target}`);
+}
+
+function sameIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function assertSafeDirectory(pluginRoot, target) {
+  const entry = fs.lstatSync(target, { throwIfNoEntry: false });
+  if (entry?.isSymbolicLink()) throw linkedDestinationError(target);
+  if (!entry?.isDirectory()) {
+    throw new TypeError(`Contract sync destination is not a directory: ${target}`);
+  }
+  const canonical = fs.realpathSync.native(target);
+  if (!isPathWithin(pluginRoot, canonical)) {
+    throw new TypeError(`Contract sync destination escapes plugin root: ${target}`);
+  }
+  return canonical;
+}
+
+function ensureSafeDirectory(pluginRoot, segments) {
+  let current = assertSafeDirectory(pluginRoot, pluginRoot);
+  for (const segment of segments) {
+    const target = path.join(current, segment);
+    const entry = fs.lstatSync(target, { throwIfNoEntry: false });
+    if (entry?.isSymbolicLink()) throw linkedDestinationError(target);
+    if (entry === undefined) fs.mkdirSync(target);
+    current = assertSafeDirectory(pluginRoot, target);
+  }
+  return current;
+}
+
+function canonicalPluginRoot(pluginDir) {
+  const before = fs.lstatSync(pluginDir, { throwIfNoEntry: false });
+  if (before?.isSymbolicLink()) throw linkedDestinationError(pluginDir);
+  if (!before?.isDirectory()) {
+    throw new TypeError(`Contract sync plugin root is not a directory: ${pluginDir}`);
+  }
+  const canonical = fs.realpathSync.native(pluginDir);
+  const after = fs.lstatSync(pluginDir, { throwIfNoEntry: false });
+  if (after?.isSymbolicLink()) throw linkedDestinationError(pluginDir);
+  if (!after?.isDirectory() || !sameIdentity(before, after)) {
+    throw new TypeError(`Contract sync plugin root changed during validation: ${pluginDir}`);
+  }
+  return assertSafeDirectory(canonical, canonical);
+}
+
+function assertSafeFileTarget(pluginRoot, target) {
+  const entry = fs.lstatSync(target, { throwIfNoEntry: false });
+  if (entry?.isSymbolicLink()) throw linkedDestinationError(target);
+  if (entry !== undefined && !entry.isFile()) {
+    throw new TypeError(`Contract sync destination is not a file: ${target}`);
+  }
+  if (entry !== undefined) {
+    const canonical = fs.realpathSync.native(target);
+    if (!isPathWithin(pluginRoot, canonical)) {
+      throw new TypeError(`Contract sync destination escapes plugin root: ${target}`);
+    }
+  }
+}
+
+function copyContractFile(source, pluginRoot, directory, filename) {
+  const safeDirectory = assertSafeDirectory(pluginRoot, directory);
+  const target = path.join(safeDirectory, filename);
+  assertSafeFileTarget(pluginRoot, target);
+  fs.copyFileSync(source, target);
+  assertSafeFileTarget(pluginRoot, target);
+}
+
 export function isDirectInvocation({
   argvPath = process.argv[1],
   moduleUrl = import.meta.url,
@@ -29,14 +107,21 @@ export function syncContracts({ rootDir, pluginDirs }) {
   const schemaRoot = path.join(rootDir, "contracts", "schemas");
   const typeFile = path.join(rootDir, "contracts", "types", "relay.d.ts");
   for (const pluginDir of existingDirectories(pluginDirs)) {
-    const schemaTarget = path.join(pluginDir, "schemas", "agent-relay");
-    const typeTarget = path.join(pluginDir, "types");
-    fs.mkdirSync(schemaTarget, { recursive: true });
-    fs.mkdirSync(typeTarget, { recursive: true });
+    const pluginRoot = canonicalPluginRoot(pluginDir);
+    const schemaTarget = ensureSafeDirectory(
+      pluginRoot,
+      ["schemas", "agent-relay"],
+    );
+    const typeTarget = ensureSafeDirectory(pluginRoot, ["types"]);
     for (const source of listFiles(schemaRoot)) {
-      fs.copyFileSync(source, path.join(schemaTarget, path.basename(source)));
+      copyContractFile(
+        source,
+        pluginRoot,
+        schemaTarget,
+        path.basename(source),
+      );
     }
-    fs.copyFileSync(typeFile, path.join(typeTarget, "relay.d.ts"));
+    copyContractFile(typeFile, pluginRoot, typeTarget, "relay.d.ts");
   }
 }
 

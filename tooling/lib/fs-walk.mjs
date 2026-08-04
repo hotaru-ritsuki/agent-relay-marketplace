@@ -18,7 +18,7 @@ function isPathWithin(root, candidate) {
       && !relative.startsWith(`..${path.sep}`));
 }
 
-export function walkEntries(rootDir) {
+export function walkEntries(rootDir, { shouldDescend = () => true } = {}) {
   const root = path.resolve(rootDir);
   const rootStat = fs.lstatSync(root, { throwIfNoEntry: false });
   if (!rootStat?.isDirectory()) {
@@ -45,7 +45,17 @@ export function walkEntries(rootDir) {
           targetWithinRoot: isPathWithin(root, targetPath),
         });
       } else if (entry.isDirectory()) {
-        visit(absolute);
+        const relativePath = path.relative(root, absolute)
+          .split(path.sep)
+          .join("/");
+        if (shouldDescend({
+          name,
+          path: absolute,
+          relativePath,
+          root,
+        })) {
+          visit(absolute);
+        }
       } else if (entry.isFile()) {
         entries.push({ path: absolute, type: "file" });
       } else {
@@ -60,18 +70,8 @@ export function walkEntries(rootDir) {
   );
 }
 
-export function listFiles(rootDir) {
-  const entries = walkEntries(rootDir);
-  const unsupported = entries.find(({ type }) => type !== "file");
-  if (unsupported?.type === "symlink") {
-    throw new TypeError(
-      `Filesystem walk refuses symbolic link: ${unsupported.path}`,
-    );
-  }
-  if (unsupported) {
-    throw new TypeError(
-      `Filesystem walk refuses non-regular entry: ${unsupported.path}`,
-    );
-  }
-  return entries.map(({ path: file }) => file);
+export function listFiles(rootDir, options) {
+  return walkEntries(rootDir, options)
+    .filter(({ type }) => type === "file")
+    .map(({ path: file }) => file);
 }
