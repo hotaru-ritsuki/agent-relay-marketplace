@@ -2,8 +2,11 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-
-import properLockfile from "proper-lockfile";
+import {
+  MessageChannel,
+  Worker,
+  receiveMessageOnPort
+} from "node:worker_threads";
 
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -21,6 +24,13 @@ const MAX_JOBS = 50;
  *   retryDelayMs: number
  * }} StateLockPolicy
  */
+/**
+ * @typedef {{
+ *   worker: Worker,
+ *   port: import("node:worker_threads").MessagePort,
+ *   signal: Int32Array
+ * }} StateLockOwner
+ */
 /** @type {Readonly<StateLockPolicy>} */
 const DEFAULT_STATE_LOCK_POLICY = Object.freeze({
   stale: 30_000,
@@ -28,7 +38,9 @@ const DEFAULT_STATE_LOCK_POLICY = Object.freeze({
   retryTimeoutMs: 35_000,
   retryDelayMs: 25
 });
-const STATE_LOCK_WAIT = new Int32Array(new SharedArrayBuffer(4));
+const STATE_LOCK_WORKER_STARTUP_GRACE_MS = 5_000;
+const STATE_LOCK_WORKER_RELEASE_TIMEOUT_MS = 5_000;
+const STATE_LOCK_WORKER_STATUS_COMPROMISED = 4;
 
 /** @type {StateLockPolicy} */
 let stateLockPolicy = { ...DEFAULT_STATE_LOCK_POLICY };
@@ -51,6 +63,13 @@ class StateIndexCorruptionError extends Error {
     super(`ERR_STATE_INDEX_CORRUPT: ${message}`, options);
     this.code = "ERR_STATE_INDEX_CORRUPT";
     this.stateFile = stateFile;
+  }
+}
+
+class JobArtifactPathError extends Error {
+  constructor(message) {
+    super(`ERR_JOB_ARTIFACT_PATH: ${message}`);
+    this.code = "ERR_JOB_ARTIFACT_PATH";
   }
 }
 
@@ -138,36 +157,125 @@ export function setStateLockPolicyForTests(overrides = {}) {
   };
 }
 
-function acquireStateLock(cwd) {
-  ensureStateDir(cwd);
-  const stateDir = resolveStateDir(cwd);
-  const policy = { ...stateLockPolicy };
-  const deadline = Date.now() + policy.retryTimeoutMs;
+/**
+ * @param {{name?: string, message?: string, code?: string, stack?: string | null} | null} payload
+ * @param {string} fallbackCode
+ */
+function deserializeLockWorkerError(payload, fallbackCode) {
+  const error = Object.assign(new Error(payload?.message ?? fallbackCode), {
+    code: payload?.code ?? fallbackCode
+  });
+  error.name = payload?.name ?? "Error";
+  if (payload?.stack) {
+    error.stack = payload.stack;
+  }
+  return error;
+}
+
+function lockWorkerProtocolError(message, code = "ERR_STATE_LOCK_WORKER_PROTOCOL") {
+  return Object.assign(new Error(message), { code });
+}
+
+/**
+ * @param {StateLockOwner} owner
+ * @param {string} expectedType
+ * @param {number} timeoutMs
+ */
+function waitForLockWorker(owner, expectedType, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
 
   for (;;) {
-    try {
-      return properLockfile.lockSync(stateDir, {
-        realpath: false,
-        retries: 0,
-        stale: policy.stale,
-        update: policy.update,
-        onCompromised(error) {
-          throw error;
-        }
-      });
-    } catch (error) {
-      if (error?.code !== "ELOCKED" || Date.now() >= deadline) {
-        throw error;
+    const sequence = Atomics.load(owner.signal, 0);
+    let packet;
+    while ((packet = receiveMessageOnPort(owner.port))) {
+      const message = packet.message;
+      if (message?.type === expectedType) {
+        return;
       }
-      const remaining = deadline - Date.now();
-      Atomics.wait(
-        STATE_LOCK_WAIT,
-        0,
-        0,
-        Math.min(policy.retryDelayMs, Math.max(remaining, 0))
+      if (message?.type === "error" || message?.type === "compromised") {
+        throw deserializeLockWorkerError(
+          message.error,
+          message.type === "compromised" ? "ECOMPROMISED" : "ERR_STATE_LOCK_WORKER"
+        );
+      }
+      throw lockWorkerProtocolError(
+        `Unexpected state lock worker message: ${String(message?.type ?? "unknown")}.`
       );
     }
+
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      const status = Atomics.load(owner.signal, 1);
+      if (status === STATE_LOCK_WORKER_STATUS_COMPROMISED) {
+        throw lockWorkerProtocolError(
+          "State lock ownership was compromised.",
+          "ECOMPROMISED"
+        );
+      }
+      throw lockWorkerProtocolError(
+        `State lock worker did not report ${expectedType} before the deadline.`,
+        "ERR_STATE_LOCK_WORKER_EXIT"
+      );
+    }
+
+    Atomics.wait(owner.signal, 0, sequence, Math.min(remaining, 50));
   }
+}
+
+/** @param {StateLockOwner} owner */
+function stopLockWorker(owner) {
+  owner.port.close();
+  void owner.worker.terminate().catch(() => {
+    // The worker may already have exited after posting its final response.
+  });
+}
+
+function acquireStateLock(cwd) {
+  ensureStateDir(cwd);
+  const policy = { ...stateLockPolicy };
+  const signalBuffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2);
+  const signal = new Int32Array(signalBuffer);
+  const { port1, port2 } = new MessageChannel();
+  const worker = new Worker(new URL("./state-lock-worker.mjs", import.meta.url), {
+    execArgv: process.execArgv.filter((argument) => !argument.startsWith("--input-type")),
+    workerData: {
+      port: port2,
+      signalBuffer,
+      stateDir: resolveStateDir(cwd),
+      policy
+    },
+    transferList: [port2]
+  });
+  const owner = { worker, port: port1, signal };
+  worker.unref();
+  worker.on("error", () => {
+    // The synchronous waiter observes worker failures through IPC or its deadline.
+  });
+
+  try {
+    waitForLockWorker(
+      owner,
+      "acquired",
+      policy.retryTimeoutMs + STATE_LOCK_WORKER_STARTUP_GRACE_MS
+    );
+  } catch (error) {
+    stopLockWorker(owner);
+    throw error;
+  }
+
+  let released = false;
+  return () => {
+    if (released) {
+      return;
+    }
+    released = true;
+    try {
+      port1.postMessage({ type: "release" });
+      waitForLockWorker(owner, "released", STATE_LOCK_WORKER_RELEASE_TIMEOUT_MS);
+    } finally {
+      stopLockWorker(owner);
+    }
+  };
 }
 
 function withStateLock(cwd, operation) {
@@ -221,13 +329,19 @@ export function loadState(cwd) {
 
 export function readStateIndexStrict(cwd) {
   const stateFile = resolveStateFile(cwd);
-  if (!fs.existsSync(stateFile)) {
-    return null;
+  let contents;
+  try {
+    contents = fs.readFileSync(stateFile, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return null;
+    }
+    throw error;
   }
 
   let parsed;
   try {
-    parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    parsed = JSON.parse(contents);
   } catch (cause) {
     throw new StateIndexCorruptionError(
       `State index ${stateFile} contains malformed JSON.`,
@@ -266,8 +380,20 @@ export function readStateIndexStrict(cwd) {
     typeof parsed !== "object" ||
     Array.isArray(parsed) ||
     (
+      parsed.version !== undefined &&
+      parsed.version !== STATE_VERSION
+    ) ||
+    (
       parsed.revision !== undefined &&
       (!Number.isInteger(parsed.revision) || parsed.revision < 0)
+    ) ||
+    (
+      parsed.config !== undefined &&
+      (
+        parsed.config === null ||
+        typeof parsed.config !== "object" ||
+        Array.isArray(parsed.config)
+      )
     ) ||
     !Array.isArray(parsed.jobs) ||
     !parsed.jobs.every(validJob)
@@ -280,6 +406,24 @@ export function readStateIndexStrict(cwd) {
   return {
     ...parsed,
     revision: normalizeLegacyRevision(parsed.revision)
+  };
+}
+
+function loadStateForMutation(cwd) {
+  const parsed = readStateIndexStrict(cwd);
+  if (parsed === null) {
+    return defaultState();
+  }
+  const defaults = defaultState();
+  return {
+    ...defaults,
+    ...parsed,
+    revision: normalizeLegacyRevision(parsed.revision),
+    config: {
+      ...defaults.config,
+      ...(parsed.config ?? {})
+    },
+    jobs: parsed.jobs
   };
 }
 
@@ -384,7 +528,7 @@ function publishState(cwd, state, revision) {
 export function saveState(cwd, snapshot) {
   const expectedRevision = snapshotRevision(snapshot);
   return withStateLock(cwd, () => {
-    const current = loadState(cwd);
+    const current = loadStateForMutation(cwd);
     if (current.revision !== expectedRevision) {
       throw new StateConflictError(expectedRevision, current.revision);
     }
@@ -394,7 +538,7 @@ export function saveState(cwd, snapshot) {
 
 export function updateState(cwd, mutate) {
   return withStateLock(cwd, () => {
-    const state = loadState(cwd);
+    const state = loadStateForMutation(cwd);
     const currentRevision = state.revision;
     mutate(state);
     return publishState(cwd, state, currentRevision + 1);
@@ -415,7 +559,7 @@ export function removeJobs(cwd, ids) {
   }
 
   return withStateLock(cwd, () => {
-    const state = loadState(cwd);
+    const state = loadStateForMutation(cwd);
     const removedJobs = state.jobs.filter((job) => explicitIds.has(job.id));
     if (removedJobs.length === 0) {
       return [];
@@ -431,14 +575,48 @@ export function removeJobs(cwd, ids) {
 }
 
 export function pruneJobArtifacts(cwd, removedJobs) {
-  for (const job of removedJobs ?? []) {
-    if (!job || typeof job !== "object" || typeof job.id !== "string") {
-      continue;
+  const jobs = removedJobs ?? [];
+  if (typeof jobs[Symbol.iterator] !== "function") {
+    throw new JobArtifactPathError("Removed jobs must be an iterable.");
+  }
+
+  const jobsDir = resolveJobsDir(cwd);
+  const resolvedJobsDir = path.resolve(jobsDir);
+  const targets = Array.from(jobs, (job) => {
+    if (!job || typeof job !== "object" || Array.isArray(job)) {
+      throw new JobArtifactPathError("Removed job records must be objects.");
     }
-    removeFileIfExists(resolveJobFile(cwd, job.id));
-    if (typeof job.logFile === "string") {
-      removeFileIfExists(job.logFile);
+    if (
+      typeof job.id !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(job.id)
+    ) {
+      throw new JobArtifactPathError("Removed job ids must be safe filename segments.");
     }
+
+    const jobFile = path.join(jobsDir, `${job.id}.json`);
+    const expectedLogFile = path.join(jobsDir, `${job.id}.log`);
+    if (
+      path.dirname(path.resolve(jobFile)) !== resolvedJobsDir ||
+      path.basename(jobFile) !== `${job.id}.json`
+    ) {
+      throw new JobArtifactPathError("Removed job JSON paths must be direct job-directory children.");
+    }
+    if (
+      typeof job.logFile !== "string" ||
+      job.logFile !== expectedLogFile ||
+      path.dirname(path.resolve(expectedLogFile)) !== resolvedJobsDir ||
+      path.basename(expectedLogFile) !== `${job.id}.log`
+    ) {
+      throw new JobArtifactPathError(
+        "Removed job log paths must exactly match their direct job-directory child."
+      );
+    }
+    return { jobFile, logFile: expectedLogFile };
+  });
+
+  for (const target of targets) {
+    removeFileIfExists(target.jobFile);
+    removeFileIfExists(target.logFile);
   }
 }
 

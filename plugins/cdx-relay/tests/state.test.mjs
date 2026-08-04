@@ -20,6 +20,7 @@ import {
   readJobFile,
   resolveJobFile,
   resolveJobLogFile,
+  resolveJobsDir,
   resolveStateDir,
   resolveStateFile,
   saveState,
@@ -346,6 +347,111 @@ test("saveState rejects a stale snapshot without changing newer state or job art
   );
 });
 
+for (const control of [
+  {
+    name: "updateState rejects malformed JSON",
+    contents: "{ definitely-not-json",
+    invoke(workspace) {
+      return updateState(workspace, (state) => {
+        state.config.mustNotPublish = true;
+      });
+    }
+  },
+  {
+    name: "saveState rejects an invalid persisted revision",
+    contents: JSON.stringify({
+      version: 1,
+      revision: 1.5,
+      config: { stopReviewGate: false },
+      jobs: [{ id: "corrupt-preserved" }]
+    }),
+    invoke(workspace) {
+      return saveState(workspace, {
+        version: 1,
+        revision: 0,
+        config: { stopReviewGate: true },
+        jobs: []
+      });
+    }
+  },
+  {
+    name: "removeJobs rejects a corrupt persisted job schema",
+    contents: JSON.stringify({
+      version: 1,
+      revision: 4,
+      config: { stopReviewGate: false },
+      jobs: [null]
+    }),
+    invoke(workspace) {
+      return stateApi.removeJobs(workspace, ["corrupt-preserved"]);
+    }
+  }
+]) {
+  test(`${control.name} without overwriting state or artifacts`, () => {
+    const workspace = makeTempDir();
+    const stateFile = resolveStateFile(workspace);
+    const jobFile = writeJobFile(workspace, "corrupt-preserved", {
+      id: "corrupt-preserved",
+      status: "completed"
+    });
+    const logFile = resolveJobLogFile(workspace, "corrupt-preserved");
+    fs.writeFileSync(logFile, "preserve corrupt-state artifacts\n", "utf8");
+    fs.writeFileSync(stateFile, control.contents, "utf8");
+    const expected = {
+      state: fs.readFileSync(stateFile, "utf8"),
+      job: fs.readFileSync(jobFile, "utf8"),
+      log: fs.readFileSync(logFile, "utf8")
+    };
+    let error = null;
+
+    try {
+      control.invoke(workspace);
+    } catch (caught) {
+      error = caught;
+    }
+
+    assert.deepEqual(
+      {
+        errorCode: error?.code ?? null,
+        state: fs.readFileSync(stateFile, "utf8"),
+        job: fs.readFileSync(jobFile, "utf8"),
+        log: fs.readFileSync(logFile, "utf8")
+      },
+      {
+        errorCode: "ERR_STATE_INDEX_CORRUPT",
+        ...expected
+      }
+    );
+  });
+}
+
+test("state mutation surfaces non-ENOENT read errors without publishing", () => {
+  const workspace = makeTempDir();
+  const snapshot = saveState(workspace, loadState(workspace));
+  const stateFile = resolveStateFile(workspace);
+  const stateBefore = fs.readFileSync(stateFile, "utf8");
+  const originalReadFileSync = fs.readFileSync;
+  let error = null;
+  fs.readFileSync = (filePath, ...args) => {
+    if (filePath === stateFile) {
+      throw Object.assign(new Error("injected state read failure"), { code: "EIO" });
+    }
+    return originalReadFileSync(filePath, ...args);
+  };
+  try {
+    updateState(workspace, (state) => {
+      state.config.mustNotPublish = snapshot.revision;
+    });
+  } catch (caught) {
+    error = caught;
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+  }
+
+  assert.equal(error?.code, "EIO");
+  assert.equal(fs.readFileSync(stateFile, "utf8"), stateBefore);
+});
+
 test("concurrent upserts and config writes preserve every acknowledged mutation", async () => {
   const workspace = makeTempDir();
   const stateFile = resolveStateFile(workspace);
@@ -457,6 +563,92 @@ test("concurrent upserts and config writes preserve every acknowledged mutation"
     if (!fs.existsSync(releaseFile)) {
       fs.writeFileSync(releaseFile, "release", "utf8");
     }
+    await cleanupTrackedChildren();
+    assertSupervisorHealthy();
+  }
+});
+
+test("a blocking synchronous mutator cannot starve the lock heartbeat or lose a writer", async () => {
+  const workspace = makeTempDir();
+  const markerFile = path.join(workspace, "blocking-mutator-active");
+  const slowAckFile = path.join(workspace, "blocking-mutator-slow-ack");
+  const fastAckFile = path.join(workspace, "blocking-mutator-fast-ack");
+  const stateModule = new URL("../scripts/lib/state.mjs", import.meta.url).href;
+  const policy = {
+    stale: 2_000,
+    update: 1_000,
+    retryTimeoutMs: 8_000,
+    retryDelayMs: 25
+  };
+  const slowSource = `
+    import fs from "node:fs";
+    const { setStateLockPolicyForTests, updateState } = await import(${JSON.stringify(stateModule)});
+    setStateLockPolicyForTests(${JSON.stringify(policy)});
+    const snapshot = updateState(${JSON.stringify(workspace)}, (state) => {
+      fs.writeFileSync(${JSON.stringify(markerFile)}, "active", "utf8");
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 4_000);
+      state.config.slowWriter = "acknowledged";
+    });
+    fs.writeFileSync(
+      ${JSON.stringify(slowAckFile)},
+      JSON.stringify({ revision: snapshot.revision }),
+      "utf8"
+    );
+  `;
+  const fastSource = `
+    import fs from "node:fs";
+    const { setStateLockPolicyForTests, updateState } = await import(${JSON.stringify(stateModule)});
+    setStateLockPolicyForTests(${JSON.stringify(policy)});
+    const snapshot = updateState(${JSON.stringify(workspace)}, (state) => {
+      state.config.fastWriter = "acknowledged";
+    });
+    fs.writeFileSync(
+      ${JSON.stringify(fastAckFile)},
+      JSON.stringify({ revision: snapshot.revision }),
+      "utf8"
+    );
+  `;
+  const children = [];
+  const stderr = [];
+
+  try {
+    const slowChild = await spawnTracked(
+      process.execPath,
+      ["--input-type=module", "-e", slowSource],
+      { stdio: ["ignore", "ignore", "pipe"], shell: false }
+    );
+    slowChild.stderr.setEncoding("utf8");
+    slowChild.stderr.on("data", (chunk) => stderr.push(String(chunk)));
+    children.push(slowChild);
+    await waitForFile(markerFile);
+
+    const fastChild = await spawnTracked(
+      process.execPath,
+      ["--input-type=module", "-e", fastSource],
+      { stdio: ["ignore", "ignore", "pipe"], shell: false }
+    );
+    fastChild.stderr.setEncoding("utf8");
+    fastChild.stderr.on("data", (chunk) => stderr.push(String(chunk)));
+    children.push(fastChild);
+
+    const completions = await Promise.all(children.map((child) => child.completion));
+    assert.deepEqual(
+      completions.map((completion) => completion.status),
+      [0, 0],
+      stderr.join("\n")
+    );
+    assertSupervisorHealthy();
+    const revisions = [slowAckFile, fastAckFile]
+      .map((filePath) => JSON.parse(fs.readFileSync(filePath, "utf8")).revision)
+      .sort((left, right) => left - right);
+    const state = loadState(workspace);
+
+    assert.deepEqual(revisions, [1, 2]);
+    assert.equal(state.revision, 2);
+    assert.equal(state.config.slowWriter, "acknowledged");
+    assert.equal(state.config.fastWriter, "acknowledged");
+    assert.equal(fs.existsSync(`${resolveStateDir(workspace)}.lock`), false);
+  } finally {
     await cleanupTrackedChildren();
     assertSupervisorHealthy();
   }
@@ -644,47 +836,131 @@ test("removeJobs publishes explicit removals before idempotent artifact pruning"
   assert.doesNotThrow(() => stateApi.pruneJobArtifacts(workspace, removed));
 });
 
-test("state lock acquisition does not retry non-contention errors", () => {
+for (const invalidRecord of [
+  {
+    name: "a traversal id",
+    build({ externalSentinel }) {
+      return { id: "../external-sentinel", logFile: externalSentinel };
+    }
+  },
+  {
+    name: "an id containing a path separator",
+    build({ jobsDir }) {
+      return { id: "nested/job", logFile: path.join(jobsDir, "nested", "job.log") };
+    }
+  },
+  {
+    name: "an alternate absolute log path",
+    build({ externalSentinel }) {
+      return { id: "alternate", logFile: externalSentinel };
+    }
+  },
+  {
+    name: "a mismatched direct-child log path",
+    build({ jobsDir }) {
+      return { id: "mismatched", logFile: path.join(jobsDir, "different.log") };
+    }
+  },
+  {
+    name: "a malformed record without a log path",
+    build() {
+      return { id: "missing-log" };
+    }
+  }
+]) {
+  test(`artifact pruning rejects ${invalidRecord.name} before deleting valid files`, () => {
+    const workspace = makeTempDir();
+    const jobsDir = resolveJobsDir(workspace);
+    const validId = "valid-captured";
+    const validJobFile = writeJobFile(workspace, validId, { id: validId });
+    const validLogFile = resolveJobLogFile(workspace, validId);
+    fs.writeFileSync(validLogFile, "valid log\n", "utf8");
+    const externalSentinel = path.join(workspace, "external-sentinel.txt");
+    fs.writeFileSync(externalSentinel, "external sentinel\n", "utf8");
+    const validRecord = { id: validId, logFile: validLogFile };
+    const invalid = invalidRecord.build({ jobsDir, externalSentinel });
+    const expected = {
+      job: fs.readFileSync(validJobFile, "utf8"),
+      log: fs.readFileSync(validLogFile, "utf8"),
+      external: fs.readFileSync(externalSentinel, "utf8")
+    };
+    let error = null;
+
+    try {
+      stateApi.pruneJobArtifacts(workspace, [validRecord, invalid]);
+    } catch (caught) {
+      error = caught;
+    }
+
+    assert.deepEqual(
+      {
+        errorCode: error?.code ?? null,
+        job: fs.existsSync(validJobFile) ? fs.readFileSync(validJobFile, "utf8") : null,
+        log: fs.existsSync(validLogFile) ? fs.readFileSync(validLogFile, "utf8") : null,
+        external: fs.existsSync(externalSentinel)
+          ? fs.readFileSync(externalSentinel, "utf8")
+          : null
+      },
+      {
+        errorCode: "ERR_JOB_ARTIFACT_PATH",
+        ...expected
+      }
+    );
+  });
+}
+
+test("state lock contention fails closed without publishing", () => {
   const workspace = makeTempDir();
   const stateFile = resolveStateFile(workspace);
-  const originalLockSync = properLockfile.lockSync;
-  properLockfile.lockSync = () => {
-    throw Object.assign(new Error("state storage denied"), { code: "EACCES" });
-  };
-  let outcome;
+  const stateDir = resolveStateDir(workspace);
+  const lockPath = `${stateDir}.lock`;
+  stateApi.ensureStateDir(workspace);
+  fs.writeFileSync(lockPath, "not a lock directory", "utf8");
+  const restorePolicy = stateApi.setStateLockPolicyForTests({
+    stale: 2_000,
+    update: 1_000,
+    retryTimeoutMs: 100,
+    retryDelayMs: 25
+  });
+  let outcome = null;
 
   try {
     updateState(workspace, (state) => {
       state.config.marker = "must-not-publish";
     });
-    outcome = null;
   } catch (error) {
     outcome = error;
   } finally {
-    properLockfile.lockSync = originalLockSync;
+    restorePolicy();
   }
 
-  assert.equal(outcome?.code, "EACCES");
+  assert.notEqual(outcome, null);
+  assert.equal(outcome?.code, "ELOCKED");
   assert.equal(fs.existsSync(stateFile), false);
+  assert.equal(fs.readFileSync(lockPath, "utf8"), "not a lock directory");
 });
 
 test("state lock compromise errors are surfaced after publication", () => {
   const workspace = makeTempDir();
-  const originalLockSync = properLockfile.lockSync;
-  properLockfile.lockSync = () => () => {
-    throw Object.assign(new Error("state lock compromised"), { code: "ECOMPROMISED" });
-  };
-  let outcome;
+  const lockDir = `${resolveStateDir(workspace)}.lock`;
+  const restorePolicy = stateApi.setStateLockPolicyForTests({
+    stale: 2_000,
+    update: 1_000,
+    retryTimeoutMs: 5_000,
+    retryDelayMs: 25
+  });
+  let outcome = null;
 
   try {
     updateState(workspace, (state) => {
+      fs.rmdirSync(lockDir);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2_500);
       state.config.marker = "published-before-release";
     });
-    outcome = null;
   } catch (error) {
     outcome = error;
   } finally {
-    properLockfile.lockSync = originalLockSync;
+    restorePolicy();
   }
 
   assert.equal(outcome?.code, "ECOMPROMISED");
@@ -706,21 +982,27 @@ test("a crashed child lock becomes stale and a later update recovers", async () 
   });
   const source = `
     import fs from "node:fs";
-    import properLockfile from "proper-lockfile";
-    const { ensureStateDir, resolveStateDir } = await import(${JSON.stringify(stateModule)});
-    ensureStateDir(${JSON.stringify(workspace)});
-    const stateDir = resolveStateDir(${JSON.stringify(workspace)});
-    properLockfile.lockSync(stateDir, {
-      realpath: false,
+    const {
+      resolveStateDir,
+      setStateLockPolicyForTests,
+      updateState
+    } = await import(${JSON.stringify(stateModule)});
+    setStateLockPolicyForTests({
       stale: 2_000,
-      update: 1_000
+      update: 1_000,
+      retryTimeoutMs: 5_000,
+      retryDelayMs: 25
     });
-    fs.writeFileSync(
-      ${JSON.stringify(markerFile)},
-      String(fs.statSync(stateDir + ".lock").mtimeMs),
-      "utf8"
-    );
-    setInterval(() => {}, 1_000);
+    updateState(${JSON.stringify(workspace)}, (state) => {
+      const lockDir = resolveStateDir(${JSON.stringify(workspace)}) + ".lock";
+      fs.writeFileSync(
+        ${JSON.stringify(markerFile)},
+        String(fs.statSync(lockDir).mtimeMs),
+        "utf8"
+      );
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60_000);
+      state.config.mustNeverPublish = true;
+    });
   `;
   const child = await spawnTracked(process.execPath, ["--input-type=module", "-e", source], {
     stdio: ["ignore", "ignore", "pipe"],

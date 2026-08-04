@@ -3175,9 +3175,9 @@ test("session end fully cleans up jobs for the ending session", async () => {
   const jobsDir = path.join(stateDir, "jobs");
   fs.mkdirSync(jobsDir, { recursive: true });
 
-  const completedLog = path.join(jobsDir, "completed.log");
-  const runningLog = path.join(jobsDir, "running.log");
-  const otherSessionLog = path.join(jobsDir, "other.log");
+  const completedLog = path.join(jobsDir, "review-completed.log");
+  const runningLog = path.join(jobsDir, "review-running.log");
+  const otherSessionLog = path.join(jobsDir, "review-other.log");
   const completedJobFile = path.join(jobsDir, "review-completed.json");
   const runningJobFile = path.join(jobsDir, "review-running.json");
   const otherJobFile = path.join(jobsDir, "review-other.json");
