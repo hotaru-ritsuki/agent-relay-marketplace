@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { existingDirectories, listFiles } from "./lib/fs-walk.mjs";
 
@@ -28,17 +29,36 @@ function sameIdentity(left, right) {
   return left.dev === right.dev && left.ino === right.ino;
 }
 
-function assertSafeDirectory(pluginRoot, target) {
-  const entry = fs.lstatSync(target, { throwIfNoEntry: false });
-  if (entry?.isSymbolicLink()) throw linkedDestinationError(target);
-  if (!entry?.isDirectory()) {
+function snapshotSafeDirectory(pluginRoot, target) {
+  const before = fs.lstatSync(target, { throwIfNoEntry: false });
+  if (before?.isSymbolicLink()) throw linkedDestinationError(target);
+  if (!before?.isDirectory()) {
     throw new TypeError(`Contract sync destination is not a directory: ${target}`);
   }
   const canonical = fs.realpathSync.native(target);
   if (!isPathWithin(pluginRoot, canonical)) {
     throw new TypeError(`Contract sync destination escapes plugin root: ${target}`);
   }
-  return canonical;
+  const after = fs.lstatSync(target, { throwIfNoEntry: false });
+  if (after?.isSymbolicLink()) throw linkedDestinationError(target);
+  if (!after?.isDirectory() || !sameIdentity(before, after)) {
+    throw new TypeError(`Contract sync destination changed during validation: ${target}`);
+  }
+  return { path: canonical, identity: after };
+}
+
+function assertSafeDirectory(pluginRoot, target) {
+  return snapshotSafeDirectory(pluginRoot, target).path;
+}
+
+function assertUnchangedDirectory(pluginRoot, expected) {
+  const current = snapshotSafeDirectory(pluginRoot, expected.path);
+  if (!sameIdentity(expected.identity, current.identity)) {
+    throw new TypeError(
+      `Contract sync destination changed during publication: ${expected.path}`,
+    );
+  }
+  return current;
 }
 
 function ensureSafeDirectory(pluginRoot, segments) {
@@ -80,14 +100,56 @@ function assertSafeFileTarget(pluginRoot, target) {
       throw new TypeError(`Contract sync destination escapes plugin root: ${target}`);
     }
   }
+  return entry;
+}
+
+function assertUnchangedFileTarget(pluginRoot, target, expected) {
+  const current = assertSafeFileTarget(pluginRoot, target);
+  if (!current || !sameIdentity(expected, current)) {
+    throw new TypeError(`Contract sync destination changed during publication: ${target}`);
+  }
+  return current;
 }
 
 function copyContractFile(source, pluginRoot, directory, filename) {
-  const safeDirectory = assertSafeDirectory(pluginRoot, directory);
-  const target = path.join(safeDirectory, filename);
+  const parent = snapshotSafeDirectory(pluginRoot, directory);
+  const target = path.join(parent.path, filename);
+  const staged = path.join(
+    parent.path,
+    `.${filename}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  let stagedIdentity;
+
   assertSafeFileTarget(pluginRoot, target);
-  fs.copyFileSync(source, target);
-  assertSafeFileTarget(pluginRoot, target);
+  try {
+    assertUnchangedDirectory(pluginRoot, parent);
+    fs.copyFileSync(source, staged, fs.constants.COPYFILE_EXCL);
+    stagedIdentity = assertSafeFileTarget(pluginRoot, staged);
+    if (!stagedIdentity) {
+      throw new TypeError(`Contract sync staging file disappeared: ${staged}`);
+    }
+
+    assertUnchangedDirectory(pluginRoot, parent);
+    assertUnchangedFileTarget(pluginRoot, staged, stagedIdentity);
+    assertSafeFileTarget(pluginRoot, target);
+    assertUnchangedDirectory(pluginRoot, parent);
+    fs.renameSync(staged, target);
+    assertUnchangedDirectory(pluginRoot, parent);
+    assertUnchangedFileTarget(pluginRoot, target, stagedIdentity);
+  } finally {
+    if (stagedIdentity) {
+      assertUnchangedDirectory(pluginRoot, parent);
+      const remaining = fs.lstatSync(staged, { throwIfNoEntry: false });
+      if (remaining !== undefined) {
+        if (!remaining.isFile() || !sameIdentity(stagedIdentity, remaining)) {
+          throw new TypeError(
+            `Contract sync staging file changed during publication: ${staged}`,
+          );
+        }
+        fs.unlinkSync(staged);
+      }
+    }
+  }
 }
 
 export function isDirectInvocation({

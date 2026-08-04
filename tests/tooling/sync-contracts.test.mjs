@@ -189,6 +189,91 @@ test("syncContracts updates an existing plugin without creating an absent plugin
   }
 });
 
+test("syncContracts replaces existing regular contract files", () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "relay-contracts-update-"));
+  try {
+    const rootDir = fileURLToPath(new URL("../..", import.meta.url));
+    const pluginDir = path.join(temp, "cdx-relay");
+    const schemaTarget = path.join(
+      pluginDir,
+      "schemas",
+      "agent-relay",
+      "common.schema.json",
+    );
+    const typeTarget = path.join(pluginDir, "types", "relay.d.ts");
+    fs.mkdirSync(path.dirname(schemaTarget), { recursive: true });
+    fs.mkdirSync(path.dirname(typeTarget), { recursive: true });
+    fs.writeFileSync(schemaTarget, "stale-schema");
+    fs.writeFileSync(typeTarget, "stale-types");
+
+    syncContracts({ rootDir, pluginDirs: [pluginDir] });
+
+    assert.deepEqual(
+      fs.readFileSync(schemaTarget),
+      fs.readFileSync(path.join(rootDir, "contracts", "schemas", "common.schema.json")),
+    );
+    assert.deepEqual(
+      fs.readFileSync(typeTarget),
+      fs.readFileSync(path.join(rootDir, "contracts", "types", "relay.d.ts")),
+    );
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("syncContracts never follows a final target swapped to an outside link", (t) => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "relay-contracts-swap-"));
+  try {
+    const rootDir = fileURLToPath(new URL("../..", import.meta.url));
+    const pluginDir = path.join(temp, "cdx-relay");
+    const target = path.join(pluginDir, "types", "relay.d.ts");
+    const outsideFile = path.join(temp, "outside-target");
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, "stale-types");
+    fs.writeFileSync(outsideFile, "outside-sentinel");
+
+    const originalCopyFileSync = fs.copyFileSync.bind(fs);
+    const originalRenameSync = fs.renameSync.bind(fs);
+    let injected = false;
+    function injectTargetSwap(destination) {
+      if (injected || path.resolve(destination) !== path.resolve(target)) return;
+      fs.rmSync(target);
+      createFileLink(outsideFile, target);
+      injected = true;
+    }
+    t.mock.method(fs, "copyFileSync", (source, destination, mode) => {
+      injectTargetSwap(destination);
+      return originalCopyFileSync(source, destination, mode);
+    });
+    t.mock.method(fs, "renameSync", (source, destination) => {
+      injectTargetSwap(destination);
+      return originalRenameSync(source, destination);
+    });
+
+    let failure;
+    try {
+      syncContracts({ rootDir, pluginDirs: [pluginDir] });
+    } catch (error) {
+      failure = error;
+    }
+
+    assert.equal(injected, true, "the test must inject the final-target swap");
+    assert.equal(fs.readFileSync(outsideFile, "utf8"), "outside-sentinel");
+    assert.equal(failure, undefined);
+    assert.equal(fs.lstatSync(target).isSymbolicLink(), false);
+    assert.deepEqual(
+      fs.readFileSync(target),
+      fs.readFileSync(path.join(rootDir, "contracts", "types", "relay.d.ts")),
+    );
+    assert.deepEqual(
+      listFiles(path.dirname(target)).map((file) => path.basename(file)),
+      ["relay.d.ts"],
+    );
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
 for (const linkedComponent of ["schemas", "types"]) {
   test(`syncContracts refuses an existing ${linkedComponent} directory link`, () => {
     const temp = fs.mkdtempSync(path.join(os.tmpdir(), "relay-contracts-link-"));

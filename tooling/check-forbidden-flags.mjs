@@ -14,8 +14,11 @@ const FORBIDDEN = [
 ];
 const DISABLED_SANDBOX = /--sandbox\s*=\s*disabled|["'`]--sandbox["'`]\s*,\s*["'`]disabled["'`]/;
 const IGNORED_DIRECTORY_NAMES = new Set([
-  ".generated",
   ".git",
+  "node_modules",
+]);
+const IGNORED_ROOT_DIRECTORY_PATHS = new Set([
+  ".generated",
   ".scratch",
   ".superpowers",
   ".tmp",
@@ -23,7 +26,6 @@ const IGNORED_DIRECTORY_NAMES = new Set([
   "build",
   "coverage",
   "dist",
-  "node_modules",
   "temp",
   "tmp",
   "vendor",
@@ -55,7 +57,9 @@ function isScannable(root, file) {
 }
 
 function isIgnoredDirectory({ name, relativePath }) {
-  return relativePath === "tooling" || IGNORED_DIRECTORY_NAMES.has(name);
+  return relativePath === "tooling"
+    || IGNORED_DIRECTORY_NAMES.has(name)
+    || IGNORED_ROOT_DIRECTORY_PATHS.has(relativePath);
 }
 
 export function checkForbiddenFlags(pluginDir) {

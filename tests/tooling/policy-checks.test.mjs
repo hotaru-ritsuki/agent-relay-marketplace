@@ -224,6 +224,36 @@ test("safety CLI ignores forbidden content in generated dependency build and tem
   assert.equal(result.stderr, "");
 });
 
+test("safety CLI scans authoritative nested paths with generated-looking basenames", () => {
+  const root = fixture('const args = ["--sandbox", "enabled"];');
+  for (const [relative, source] of [
+    ["scripts/vendor/launcher.mjs", 'const args = ["--force"];'],
+    ["tests/tmp/launcher.test.mjs", 'const args = ["--yolo"];'],
+    ["config/build/runtime.json", '{"sandbox":"danger-full-access"}'],
+    ["scripts/dist/launcher.cjs", 'const args = ["--trust"];'],
+    ["config/.generated/runtime.json", '{"args":["--approve-mcps"]}'],
+  ]) {
+    writeFixtureFile(root, relative, source);
+  }
+
+  const result = runCli(SAFETY_CLI, root);
+
+  assert.equal(result.status, 1, result.stderr);
+  for (const relative of [
+    "scripts/vendor/launcher.mjs",
+    "tests/tmp/launcher.test.mjs",
+    "config/build/runtime.json",
+    "scripts/dist/launcher.cjs",
+    "config/.generated/runtime.json",
+  ]) {
+    assert.match(
+      result.stderr,
+      new RegExp(relative.replaceAll("/", "[\\\\/]")),
+      `expected the safety CLI to scan ${relative}`,
+    );
+  }
+});
+
 test("safety CLI prunes ignored trees before malformed JSON and links", () => {
   const root = fixture('const args = ["--sandbox", "enabled"];');
   const outside = fs.mkdtempSync(path.join(os.tmpdir(), "relay-policy-outside-"));
