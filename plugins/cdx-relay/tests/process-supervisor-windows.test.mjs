@@ -21,6 +21,17 @@ const {
   getBackendLeaseCount,
   runWindowsJobForTest: runBackend
 } = windowsBackend.test;
+
+function createWindowsBackendHarness(options) {
+  const backend = createWindowsBackend(options);
+  return {
+    backend,
+    cleanupBackendLaunch: backend.test.cleanupWindowsJobForTest,
+    getBackendLeaseCount: backend.test.getBackendLeaseCount,
+    runBackend: backend.test.runWindowsJobForTest
+  };
+}
+
 installSupervisorTeardown(after);
 after(async () => {
   await windowsBackend.shutdown();
@@ -31,7 +42,8 @@ const COMPANION_SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs"
 
 test("cold-start post-assignment failure has strict zero-to-zero native census", {
   skip: process.platform !== "win32"
-}, () => {
+}, async () => {
+  const harness = createWindowsBackendHarness();
   const countSliceProcesses = () => {
     const result = spawnSync("pwsh.exe", [
       "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
@@ -43,7 +55,7 @@ test("cold-start post-assignment failure has strict zero-to-zero native census",
   const cwd = makeTempDir("cold-assignment-failure-");
   const shimPidFile = path.join(cwd, "shim.pid");
   assert.throws(
-    () => runBackend(process.execPath, ["-e", "setInterval(()=>{},1000)"], {
+    () => harness.runBackend(process.execPath, ["-e", "setInterval(()=>{},1000)"], {
       controllerFault: "fail-after-assign",
       faultPidFile: shimPidFile,
       controlTimeout: 2000,
@@ -57,6 +69,8 @@ test("cold-start post-assignment failure has strict zero-to-zero native census",
     (error) => error?.code === "ESRCH"
   );
   assert.equal(countSliceProcesses(), 0, "POST must return to a strict zero baseline");
+  assert.equal(harness.getBackendLeaseCount(), 0);
+  await harness.backend.shutdown();
 });
 
 test("Windows run retains a Job lease until global cleanup terminates descendants", {
@@ -142,19 +156,20 @@ test("Windows global cleanup terminalizes multiple retained run leases", {
 test("Windows global cleanup failure poisons its controller and fails the test", {
   skip: process.platform !== "win32"
 }, async () => {
+  const harness = createWindowsBackendHarness();
   const cwd = makeTempDir("run-cleanup-failure-");
   const controllerPidFile = path.join(cwd, "controller.pid");
-  const result = runBackend(process.execPath, ["-e", ""], {
+  harness.runBackend(process.execPath, ["-e", ""], {
     controllerFault: "drop-cleanup-ack",
     controllerPidFile,
     controlTimeout: 500,
     timeout: 2000
   });
   await assert.rejects(
-    windowsBackend.cleanup(),
+    harness.backend.cleanup(),
     /Windows Job lease|cleanup.*deadline|poison/i
   );
-  assert.equal(getBackendLeaseCount(), 0);
+  assert.equal(harness.getBackendLeaseCount(), 0);
   const oldControllerPid = Number(fs.readFileSync(controllerPidFile, "utf8"));
   assert.throws(
     () => process.kill(oldControllerPid, 0),
@@ -178,6 +193,7 @@ test("Windows global cleanup failure poisons its controller and fails the test",
   );
   await cleanupTrackedChildren();
   assert.equal(getBackendLeaseCount(), 0);
+  await harness.backend.shutdown();
 });
 
 test("Windows spawnTracked exposes actual target PID, streams, and exit semantics", {
@@ -243,7 +259,92 @@ test("Windows spawnTracked exposes actual target PID, streams, and exit semantic
   assert.equal(child.exitCode, 7);
   assert.equal(child.signalCode, null);
   await supervisor.shutdown();
-  assert.equal(getBackendLeaseCount(), 0);
+});
+
+test("Windows async wait failure terminalizes once, clears its lease, and poisons future work", {
+  skip: process.platform !== "win32"
+}, async () => {
+  const backend = createWindowsBackend({
+    faults: {
+      controllerFault: "drop-wait-ack",
+      controlTimeout: 300,
+      timeout: 300
+    }
+  });
+  const supervisor = createProcessSupervisor({
+    platform: "win32",
+    minimumGuarantee: "host-strict",
+    backendFactories: [() => backend]
+  });
+  let child;
+  try {
+    child = await supervisor.spawnTracked({
+      command: process.execPath,
+      args: ["-e", "setInterval(()=>{},1000)"],
+      shell: false,
+      stdio: "ignore",
+      windowsHide: true
+    });
+    const events = [];
+    const publicErrors = [];
+    child.on("error", (error) => {
+      publicErrors.push(error);
+      events.push("error");
+    });
+    child.on("exit", () => events.push("exit"));
+    const closed = new Promise((resolve) => child.once("close", () => {
+      events.push("close");
+      resolve();
+    }));
+    const completion = child.completion.then(
+      () => assert.fail("controller wait failure completion must reject"),
+      (error) => {
+        events.push("completion");
+        return error;
+      }
+    );
+
+    const terminalError = await Promise.race([
+      completion,
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error("Windows wait failure completion timed out")),
+        5000
+      ))
+    ]);
+    await Promise.race([
+      closed,
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error("Windows wait failure close timed out")),
+        1000
+      ))
+    ]);
+
+    assert.equal(terminalError.code, "ROOT_PROCESS_ERROR");
+    assert.match(terminalError.message, /controller.*wait.*deadline|wait.*controller/i);
+    assert.equal(publicErrors.length, 1);
+    assert.equal(publicErrors[0], terminalError);
+    assert.deepEqual(events, ["error", "completion", "close"]);
+    assert.equal(backend.test.getBackendLeaseCount(), 0);
+    assert.throws(() => supervisor.assertHealthy(), (error) => error === terminalError);
+    await assert.rejects(
+      supervisor.spawnTracked({
+        command: process.execPath,
+        args: ["-e", ""],
+        shell: false
+      }),
+      (error) => error === terminalError
+    );
+    assert.throws(
+      () => backend.test.runWindowsJobForTest(process.execPath, ["-e", ""], {
+        timeout: 1000
+      }),
+      /poison|controller.*wait.*deadline/i
+    );
+  } finally {
+    child?.completion?.catch(() => {});
+    await supervisor.shutdown().catch(() => {});
+    await backend.shutdown().catch(() => {});
+  }
 });
 
 test("Windows spawnTracked detached sleeper unref remains owned until cleanup", {
@@ -283,23 +384,26 @@ test("Windows PID handshake retries sharing locks and validates retained members
 test("Windows PID handshake rejects shim, nonmember, and stale PID publications", {
   skip: process.platform !== "win32"
 }, async () => {
+  const wrongPidHarness = createWindowsBackendHarness();
   assert.throws(
-    () => runBackend(
+    () => wrongPidHarness.runBackend(
       process.execPath,
       ["-e", "setInterval(()=>{},1000)"],
       { controllerFault: "pid-handshake-wrong-pid", controlTimeout: 5000 }
     ),
     /direct child|member/i
   );
-  assert.equal(getBackendLeaseCount(), 0);
+  assert.equal(wrongPidHarness.getBackendLeaseCount(), 0);
+  await wrongPidHarness.backend.shutdown();
 
   const outsider = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"]);
   await new Promise((resolve, reject) => {
     outsider.once("spawn", resolve);
     outsider.once("error", reject);
   });
+  const outsiderHarness = createWindowsBackendHarness();
   assert.throws(
-    () => runBackend(
+    () => outsiderHarness.runBackend(
       process.execPath,
       ["-e", "setInterval(()=>{},1000)"],
       {
@@ -313,15 +417,17 @@ test("Windows PID handshake rejects shim, nonmember, and stale PID publications"
   process.kill(outsider.pid, 0);
   outsider.kill("SIGKILL");
   await new Promise((resolve) => outsider.once("exit", resolve));
-  assert.equal(getBackendLeaseCount(), 0);
+  assert.equal(outsiderHarness.getBackendLeaseCount(), 0);
+  await outsiderHarness.backend.shutdown();
 
   const stale = spawn(process.execPath, ["-e", ""]);
   await new Promise((resolve, reject) => {
     stale.once("error", reject);
     stale.once("exit", resolve);
   });
+  const staleHarness = createWindowsBackendHarness();
   assert.throws(
-    () => runBackend(
+    () => staleHarness.runBackend(
       process.execPath,
       ["-e", "setInterval(()=>{},1000)"],
       {
@@ -332,40 +438,46 @@ test("Windows PID handshake rejects shim, nonmember, and stale PID publications"
     ),
     /OpenProcess|process snapshot|member|direct child/i
   );
-  assert.equal(getBackendLeaseCount(), 0);
+  assert.equal(staleHarness.getBackendLeaseCount(), 0);
+  await staleHarness.backend.shutdown();
 });
 
 test("Windows PID handshake malformed, early-exit, and timeout faults fail closed", {
   skip: process.platform !== "win32"
-}, () => {
+}, async () => {
+  const malformedHarness = createWindowsBackendHarness();
   const malformedStarted = Date.now();
   assert.throws(
-    () => runBackend(process.execPath, ["-e", ""], {
+    () => malformedHarness.runBackend(process.execPath, ["-e", ""], {
       controllerFault: "pid-handshake-malformed",
       controlTimeout: 5000
     }),
     /JSON|invalid|malformed/i
   );
   assert.ok(Date.now() - malformedStarted < 2500);
-  assert.equal(getBackendLeaseCount(), 0);
+  assert.equal(malformedHarness.getBackendLeaseCount(), 0);
+  await malformedHarness.backend.shutdown();
 
   for (const fault of ["pid-handshake-early-exit", "pid-handshake-timeout"]) {
+    const harness = createWindowsBackendHarness();
     assert.throws(
-      () => runBackend(process.execPath, ["-e", ""], {
+      () => harness.runBackend(process.execPath, ["-e", ""], {
         controllerFault: fault,
         controlTimeout: 5000
       }),
       /PID publication deadline expired/i
     );
-    assert.equal(getBackendLeaseCount(), 0);
+    assert.equal(harness.getBackendLeaseCount(), 0);
+    await harness.backend.shutdown();
   }
 });
 
 test("Windows PID handshake fails closed when the target handle cannot prove absence", {
   skip: process.platform !== "win32"
-}, () => {
+}, async () => {
+  const harness = createWindowsBackendHarness();
   assert.throws(
-    () => runBackend(
+    () => harness.runBackend(
       process.execPath,
       ["-e", "setTimeout(()=>{},1000)"],
       {
@@ -375,7 +487,8 @@ test("Windows PID handshake fails closed when the target handle cannot prove abs
     ),
     /OpenProcess.*target PID handshake/i
   );
-  assert.equal(getBackendLeaseCount(), 0);
+  assert.equal(harness.getBackendLeaseCount(), 0);
+  await harness.backend.shutdown();
 });
 
 test("Windows spawnTracked orders exit, stream closure, and close while preserving unread output", {
@@ -494,6 +607,8 @@ test("Windows spawnTracked reports real ENOENT with native error and close seman
     windowsHide: true
   });
   let exitEmitted = false;
+  const publicErrors = [];
+  child.on("error", (error) => publicErrors.push(error));
   child.once("exit", () => {
     exitEmitted = true;
   });
@@ -511,7 +626,8 @@ test("Windows spawnTracked reports real ENOENT with native error and close seman
 
   assert.equal(child.pid, undefined);
   assert.equal(child.kill(), false);
-  assert.equal(exitEmitted, true);
+  assert.equal(exitEmitted, false);
+  assert.deepEqual(publicErrors, [infrastructureError]);
   assert.equal(infrastructureError.result.error.path, missing);
   assert.deepEqual(infrastructureError.result.error.spawnargs, ["argument"]);
   assert.match(infrastructureError.result.error.syscall, /^spawn /);
@@ -901,11 +1017,12 @@ test("Windows job cleanup is idempotent with correlated tombstone proof", {
   assert.equal(second.launchId, first.launchId);
 });
 
-test("lost Windows launch acknowledgement aborts the controller and next launch restarts cleanly", {
+test("lost Windows launch acknowledgement poisons its backend and a fresh backend launches", {
   skip: process.platform !== "win32"
-}, () => {
+}, async () => {
+  const failed = createWindowsBackendHarness();
   assert.throws(
-    () => runBackend(process.execPath, ["-e", "setInterval(()=>{},1000)"], {
+    () => failed.runBackend(process.execPath, ["-e", "setInterval(()=>{},1000)"], {
       encoding: "utf8",
       shell: false,
       windowsHide: true,
@@ -915,8 +1032,14 @@ test("lost Windows launch acknowledgement aborts the controller and next launch 
     }),
     /launch acknowledgement|controller.*deadline/i
   );
+  assert.equal(failed.getBackendLeaseCount(), 0);
+  assert.throws(
+    () => failed.runBackend(process.execPath, ["-e", ""], { timeout: 2000 }),
+    /launch acknowledgement|controller.*deadline/i
+  );
 
-  const next = runBackend(process.execPath, ["-e", "process.stdout.write('restarted')"], {
+  const fresh = createWindowsBackendHarness();
+  const next = fresh.runBackend(process.execPath, ["-e", "process.stdout.write('restarted')"], {
     encoding: "utf8",
     shell: false,
     windowsHide: true,
@@ -924,32 +1047,43 @@ test("lost Windows launch acknowledgement aborts the controller and next launch 
   });
   assert.equal(next.status, 0);
   assert.equal(next.stdout, "restarted");
-  assert.equal(cleanupBackendLaunch(next.lease).activeProcesses, 0);
+  assert.equal(fresh.cleanupBackendLaunch(next.lease).activeProcesses, 0);
+  await failed.backend.shutdown();
+  await fresh.backend.shutdown();
 });
 
-test("Windows controller exit resets the Worker client and next launch restarts cleanly", {
+test("Windows controller exit poisons its backend and a fresh backend launches", {
   skip: process.platform !== "win32"
-}, () => {
+}, async () => {
+  const failed = createWindowsBackendHarness();
   assert.throws(
-    () => runBackend(process.execPath, ["-e", "setInterval(()=>{},1000)"], {
+    () => failed.runBackend(process.execPath, ["-e", "setInterval(()=>{},1000)"], {
       controllerFault: "exit-after-launch",
       controlTimeout: 2000,
       timeout: 1000
     }),
     /controller exited|terminal proof/i
   );
+  assert.equal(failed.getBackendLeaseCount(), 0);
+  assert.throws(
+    () => failed.runBackend(process.execPath, ["-e", ""], { timeout: 2000 }),
+    /controller exited|terminal proof/i
+  );
 
-  const next = runBackend(process.execPath, ["-e", "process.stdout.write('restarted')"], {
+  const fresh = createWindowsBackendHarness();
+  const next = fresh.runBackend(process.execPath, ["-e", "process.stdout.write('restarted')"], {
     timeout: 3000
   });
   assert.equal(next.status, 0);
   assert.equal(next.stdout, "restarted");
-  assert.equal(cleanupBackendLaunch(next.lease).activeProcesses, 0);
+  assert.equal(fresh.cleanupBackendLaunch(next.lease).activeProcesses, 0);
+  await failed.backend.shutdown();
+  await fresh.backend.shutdown();
 });
 
 test("Windows assignment failure terminates the retained suspended shim", {
   skip: process.platform !== "win32"
-}, () => {
+}, async () => {
   const countShimProcesses = () => {
     const result = spawnSync("pwsh.exe", [
       "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
@@ -966,9 +1100,10 @@ test("Windows assignment failure terminates the retained suspended shim", {
     ["fail-after-assign", /post-AssignProcessToJobObject/]
   ]);
   for (const [fault, expectedOperation] of faults) {
+    const harness = createWindowsBackendHarness();
     const shimPidFile = path.join(cwd, `${fault}.pid`);
     assert.throws(
-      () => runBackend(process.execPath, ["-e", "setInterval(()=>{},1000)"], {
+      () => harness.runBackend(process.execPath, ["-e", "setInterval(()=>{},1000)"], {
         controllerFault: fault,
         faultPidFile: shimPidFile,
         controlTimeout: 2000,
@@ -987,49 +1122,74 @@ test("Windows assignment failure terminates the retained suspended shim", {
       );
     }
     assert.equal(countShimProcesses(), 0);
+    assert.equal(harness.getBackendLeaseCount(), 0);
+    assert.throws(
+      () => harness.runBackend(process.execPath, ["-e", ""], { timeout: 2000 }),
+      expectedOperation
+    );
+    await harness.backend.shutdown();
   }
 });
 
-test("Windows cleanup timeout poisons the controller and permits a fresh launch", {
+test("Windows cleanup timeout poisons its backend and a fresh backend launches", {
   skip: process.platform !== "win32"
-}, () => {
-  const stuck = runBackend(process.execPath, ["-e", ""], {
+}, async () => {
+  const failed = createWindowsBackendHarness();
+  const stuck = failed.runBackend(process.execPath, ["-e", ""], {
     controllerFault: "drop-cleanup-ack",
     controlTimeout: 500,
     timeout: 1000
   });
   assert.throws(
-    () => cleanupBackendLaunch(stuck.lease),
+    () => failed.cleanupBackendLaunch(stuck.lease),
     /cleanup.*deadline|poison/i
   );
-  const next = runBackend(process.execPath, ["-e", "process.stdout.write('fresh')"], {
+  assert.equal(failed.getBackendLeaseCount(), 0);
+  assert.throws(
+    () => failed.runBackend(process.execPath, ["-e", ""], { timeout: 2000 }),
+    /cleanup.*deadline|poison/i
+  );
+  const fresh = createWindowsBackendHarness();
+  const next = fresh.runBackend(process.execPath, ["-e", "process.stdout.write('fresh')"], {
     timeout: 2000
   });
   assert.equal(next.stdout, "fresh");
-  cleanupBackendLaunch(next.lease);
-  assert.equal(cleanupBackendLaunch(next.lease).activeProcesses, 0);
+  fresh.cleanupBackendLaunch(next.lease);
+  assert.equal(fresh.cleanupBackendLaunch(next.lease).activeProcesses, 0);
+  await failed.backend.shutdown();
+  await fresh.backend.shutdown();
 });
 
-test("Windows response-port loss poisons the controller and permits a fresh launch", {
+test("Windows response-port loss poisons its backend and a fresh backend launches", {
   skip: process.platform !== "win32"
-}, () => {
+}, async () => {
+  const failed = createWindowsBackendHarness();
   assert.throws(
-    () => runBackend(process.execPath, ["-e", "setInterval(()=>{},1000)"], {
+    () => failed.runBackend(process.execPath, ["-e", "setInterval(()=>{},1000)"], {
       workerFault: "drop-response-port",
       controlTimeout: 500,
       timeout: 1000
     }),
     /launch.*deadline|poison/i
   );
-  const next = runBackend(process.execPath, ["-e", "process.stdout.write('fresh')"], {
+  assert.equal(failed.getBackendLeaseCount(), 0);
+  assert.throws(
+    () => failed.runBackend(process.execPath, ["-e", ""], { timeout: 2000 }),
+    /launch.*deadline|poison/i
+  );
+  const fresh = createWindowsBackendHarness();
+  const next = fresh.runBackend(process.execPath, ["-e", "process.stdout.write('fresh')"], {
     timeout: 2000
   });
   assert.equal(next.stdout, "fresh");
+  fresh.cleanupBackendLaunch(next.lease);
+  await failed.backend.shutdown();
+  await fresh.backend.shutdown();
 });
 
-test("malformed and oversized Windows controller frames poison and restart cleanly", {
+test("malformed and oversized Windows controller frames poison only their backend", {
   skip: process.platform !== "win32"
-}, () => {
+}, async () => {
   const cwd = makeTempDir("protocol-faults-");
   for (const controllerFault of [
     "malformed-wait-frame",
@@ -1040,32 +1200,41 @@ test("malformed and oversized Windows controller frames poison and restart clean
     "mismatched-chunk-action",
     "noncanonical-chunk-base64"
   ]) {
+    const failed = createWindowsBackendHarness();
     const controllerPidFile = path.join(cwd, `${controllerFault}.pid`);
     assert.throws(
-      () => runBackend(process.execPath, ["-e", ""], {
+      () => failed.runBackend(process.execPath, ["-e", ""], {
         controllerFault,
         controllerPidFile,
         controlTimeout: 500,
         timeout: 1000
       }),
-      /cleanup proof missing|invalid|oversized|unknown|duplicate|sequence|instance|action|canonical|poison/i
+      /cleanup proof missing|invalid|oversized|unknown|duplicate|sequence|instance|action|canonical|poison|JSON|property name/i
     );
     const oldControllerPid = Number(fs.readFileSync(controllerPidFile, "utf8"));
     assert.throws(
       () => process.kill(oldControllerPid, 0),
       (error) => error?.code === "ESRCH"
     );
-    const next = runBackend(process.execPath, ["-e", "process.stdout.write('fresh')"], {
+    assert.equal(failed.getBackendLeaseCount(), 0);
+    assert.throws(
+      () => failed.runBackend(process.execPath, ["-e", ""], { timeout: 2000 }),
+      /cleanup proof missing|invalid|oversized|unknown|duplicate|sequence|instance|action|canonical|poison|JSON|property name/i
+    );
+    const fresh = createWindowsBackendHarness();
+    const next = fresh.runBackend(process.execPath, ["-e", "process.stdout.write('fresh')"], {
       timeout: 2000
     });
     assert.equal(next.stdout, "fresh");
-    cleanupBackendLaunch(next.lease);
+    fresh.cleanupBackendLaunch(next.lease);
+    await failed.backend.shutdown();
+    await fresh.backend.shutdown();
   }
 });
 
 test("framed output corruption faults terminate the entire controller epoch", {
   skip: process.platform !== "win32"
-}, () => {
+}, async () => {
   const cwd = makeTempDir("output-proof-faults-");
   for (const controllerFault of [
     "raw-oversize-output-chunk",
@@ -1076,12 +1245,13 @@ test("framed output corruption faults terminate the entire controller epoch", {
     "corrupt-stdout-chunk-count",
     "corrupt-stderr-chunk-count"
   ]) {
-    const sibling = runBackend(process.execPath, ["-e", ""], {
+    const failed = createWindowsBackendHarness();
+    const sibling = failed.runBackend(process.execPath, ["-e", ""], {
       timeout: 2000
     });
     const controllerPidFile = path.join(cwd, `${controllerFault}.pid`);
     assert.throws(
-      () => runBackend(
+      () => failed.runBackend(
         process.execPath,
         ["-e", "process.stdout.write('proof')"],
         { controllerFault, controllerPidFile, timeout: 2000 }
@@ -1093,28 +1263,37 @@ test("framed output corruption faults terminate the entire controller epoch", {
       () => process.kill(oldControllerPid, 0),
       (error) => error?.code === "ESRCH"
     );
-    assert.throws(
-      () => cleanupBackendLaunch(sibling.lease),
-      /Unknown Windows job launch/
+    assert.equal(failed.getBackendLeaseCount(), 0);
+    assert.equal(
+      failed.cleanupBackendLaunch(sibling.lease).activeProcesses,
+      0
     );
-    const fresh = runBackend(
+    assert.throws(
+      () => failed.runBackend(process.execPath, ["-e", ""], { timeout: 2000 }),
+      /chunk|proof|length|sha256|count|poison|terminal/i
+    );
+    const replacement = createWindowsBackendHarness();
+    const fresh = replacement.runBackend(
       process.execPath,
       ["-e", "process.stdout.write('fresh')"],
       { timeout: 2000 }
     );
     assert.notEqual(fresh.controllerInstanceId, sibling.controllerInstanceId);
     assert.notEqual(fresh.controllerPid, oldControllerPid);
-    cleanupBackendLaunch(fresh.lease);
+    replacement.cleanupBackendLaunch(fresh.lease);
+    await failed.backend.shutdown();
+    await replacement.backend.shutdown();
   }
 });
 
 test("oversized controller error reason closes its epoch without an oversized frame", {
   skip: process.platform !== "win32"
-}, () => {
+}, async () => {
+  const failed = createWindowsBackendHarness();
   const cwd = makeTempDir("oversized-error-reason-");
   const controllerPidFile = path.join(cwd, "controller.pid");
   assert.throws(
-    () => runBackend(process.execPath, ["-e", ""], {
+    () => failed.runBackend(process.execPath, ["-e", ""], {
       controllerFault: "oversized-error-reason",
       controllerPidFile,
       timeout: 2000
@@ -1126,9 +1305,17 @@ test("oversized controller error reason closes its epoch without an oversized fr
     () => process.kill(oldControllerPid, 0),
     (error) => error?.code === "ESRCH"
   );
-  const fresh = runBackend(process.execPath, ["-e", ""], { timeout: 2000 });
+  assert.equal(failed.getBackendLeaseCount(), 0);
+  assert.throws(
+    () => failed.runBackend(process.execPath, ["-e", ""], { timeout: 2000 }),
+    /controller|terminal|poison|frame/i
+  );
+  const replacement = createWindowsBackendHarness();
+  const fresh = replacement.runBackend(process.execPath, ["-e", ""], { timeout: 2000 });
   assert.notEqual(fresh.controllerPid, oldControllerPid);
-  cleanupBackendLaunch(fresh.lease);
+  replacement.cleanupBackendLaunch(fresh.lease);
+  await failed.backend.shutdown();
+  await replacement.backend.shutdown();
 });
 
 test("concurrent Windows cleanup callers replay one terminal proof", {
@@ -1250,25 +1437,26 @@ test("Windows output quota remains active for a descendant delayed beyond root c
   assert.equal(proof.errorCode, "ENOBUFS");
 });
 
-test("invalid cleanup proof poisons the exact old controller before restart", {
+test("invalid cleanup proof poisons the exact old backend before replacement", {
   skip: process.platform !== "win32"
-}, () => {
+}, async () => {
+  const failed = createWindowsBackendHarness();
   const cwd = makeTempDir("invalid-cleanup-proof-");
   const controllerPidFile = path.join(cwd, "controller.pid");
-  const invalid = runBackend(process.execPath, ["-e", ""], {
+  const invalid = failed.runBackend(process.execPath, ["-e", ""], {
     controllerFault: "invalid-cleanup-proof",
     controllerPidFile,
     controlTimeout: 1000,
     timeout: 2000
   });
-  const sibling = runBackend(
+  const sibling = failed.runBackend(
     process.execPath,
     ["-e", "setInterval(()=>{},1000)"],
     { timeout: 5000 }
   );
   assert.equal(sibling.controllerInstanceId, invalid.controllerInstanceId);
   assert.throws(
-    () => cleanupBackendLaunch(invalid.lease),
+    () => failed.cleanupBackendLaunch(invalid.lease),
     /invalid (?:ownership )?terminal proof/i
   );
   const oldControllerPid = Number(fs.readFileSync(controllerPidFile, "utf8"));
@@ -1276,16 +1464,24 @@ test("invalid cleanup proof poisons the exact old controller before restart", {
     () => process.kill(oldControllerPid, 0),
     (error) => error?.code === "ESRCH"
   );
-  assert.throws(
-    () => cleanupBackendLaunch(sibling.lease),
-    /Unknown Windows job launch/
+  assert.equal(failed.getBackendLeaseCount(), 0);
+  assert.equal(
+    failed.cleanupBackendLaunch(sibling.lease).activeProcesses,
+    0
   );
-  const next = runBackend(process.execPath, ["-e", "process.stdout.write('fresh')"], {
+  assert.throws(
+    () => failed.runBackend(process.execPath, ["-e", ""], { timeout: 2000 }),
+    /invalid (?:ownership )?terminal proof/i
+  );
+  const replacement = createWindowsBackendHarness();
+  const next = replacement.runBackend(process.execPath, ["-e", "process.stdout.write('fresh')"], {
     timeout: 2000
   });
   assert.notEqual(next.controllerPid, oldControllerPid);
-  cleanupBackendLaunch(next.lease);
-  assert.equal(getBackendLeaseCount(), 0);
+  replacement.cleanupBackendLaunch(next.lease);
+  assert.equal(replacement.getBackendLeaseCount(), 0);
+  await failed.backend.shutdown();
+  await replacement.backend.shutdown();
 });
 
 test("cleanup proof controller PID is diagnostic rather than ownership", {
@@ -1310,8 +1506,9 @@ test("cleanup proof controller PID is diagnostic rather than ownership", {
 test("idle acknowledged controller crash terminates Worker epoch and purges two leases", {
   skip: process.platform !== "win32"
 }, async () => {
-  const first = runBackend(process.execPath, ["-e", ""], { timeout: 2000 });
-  const second = runBackend(process.execPath, ["-e", ""], { timeout: 2000 });
+  const failed = createWindowsBackendHarness();
+  const first = failed.runBackend(process.execPath, ["-e", ""], { timeout: 2000 });
+  const second = failed.runBackend(process.execPath, ["-e", ""], { timeout: 2000 });
   assert.equal(first.controllerInstanceId, second.controllerInstanceId);
   assert.equal(first.controllerPid, second.controllerPid);
   const oldControllerPid = first.controllerPid;
@@ -1327,26 +1524,34 @@ test("idle acknowledged controller crash terminates Worker epoch and purges two 
     }
   }
   await new Promise((resolve) => setTimeout(resolve, 100));
-  const fresh = runBackend(
+  assert.throws(
+    () => failed.runBackend(process.execPath, ["-e", ""], { timeout: 2000 }),
+    /terminated unexpectedly|controller|poison/i
+  );
+  assert.equal(failed.getBackendLeaseCount(), 0);
+  assert.equal(
+    failed.cleanupBackendLaunch(first.lease).activeProcesses,
+    0
+  );
+  assert.equal(
+    failed.cleanupBackendLaunch(second.lease).activeProcesses,
+    0
+  );
+  const replacement = createWindowsBackendHarness();
+  const fresh = replacement.runBackend(
     process.execPath,
     ["-e", "process.stdout.write('fresh')"],
     { timeout: 2000 }
   );
   assert.notEqual(fresh.controllerInstanceId, first.controllerInstanceId);
   assert.notEqual(fresh.controllerPid, oldControllerPid);
-  assert.throws(
-    () => cleanupBackendLaunch(first.lease),
-    /Unknown Windows job launch/
-  );
-  assert.throws(
-    () => cleanupBackendLaunch(second.lease),
-    /Unknown Windows job launch/
-  );
   assert.equal(fresh.stdout, "fresh");
-  cleanupBackendLaunch(fresh.lease);
+  replacement.cleanupBackendLaunch(fresh.lease);
+  await failed.backend.shutdown();
+  await replacement.backend.shutdown();
 });
 
-test("replacement Windows Worker still performs repeatable explicit shutdown", {
+test("fresh Windows backend after poison performs repeatable explicit shutdown", {
   skip: process.platform !== "win32"
 }, () => {
   const countSliceProcesses = () => {
@@ -1364,13 +1569,17 @@ test("replacement Windows Worker still performs repeatable explicit shutdown", {
     new URL("./process-supervisor/backends/windows.mjs", import.meta.url).href;
   const source = [
     `import { createWindowsBackend } from ${JSON.stringify(backendUrl)};`,
-    "const backend=createWindowsBackend();",
-    "const {runWindowsJobForTest:runBackend,cleanupWindowsJobForTest:cleanupBackendLaunch}=backend.test;",
-    `const invalid=runBackend(process.execPath,['-e',''],{controllerFault:'invalid-cleanup-proof',controllerPidFile:${JSON.stringify(oldControllerPidFile)},timeout:2000});`,
-    "try{cleanupBackendLaunch(invalid.lease)}catch{}",
-    `const replacement=runBackend(process.execPath,['-e',"process.stdout.write('fresh')"],{controllerPidFile:${JSON.stringify(replacementControllerPidFile)},timeout:2000});`,
-    "cleanupBackendLaunch(replacement.lease);",
-    "await backend.shutdown();"
+    "const failed=createWindowsBackend();",
+    "const {runWindowsJobForTest:runFailed,cleanupWindowsJobForTest:cleanupFailed}=failed.test;",
+    `const invalid=runFailed(process.execPath,['-e',''],{controllerFault:'invalid-cleanup-proof',controllerPidFile:${JSON.stringify(oldControllerPidFile)},timeout:2000});`,
+    "try{cleanupFailed(invalid.lease)}catch{}",
+    "try{runFailed(process.execPath,['-e',''],{timeout:2000});process.exitCode=91}catch{}",
+    "await failed.shutdown();",
+    "const replacementBackend=createWindowsBackend();",
+    "const {runWindowsJobForTest:runReplacement,cleanupWindowsJobForTest:cleanupReplacement}=replacementBackend.test;",
+    `const replacement=runReplacement(process.execPath,['-e',"process.stdout.write('fresh')"],{controllerPidFile:${JSON.stringify(replacementControllerPidFile)},timeout:2000});`,
+    "cleanupReplacement(replacement.lease);",
+    "await replacementBackend.shutdown();"
   ].join("\n");
   const child = spawnSync(process.execPath, ["--input-type=module", "-e", source], {
     encoding: "utf8",
@@ -1566,7 +1775,7 @@ test("Windows backend shutdown stops infrastructure after cleanup failure", {
   );
 });
 
-test("Windows backend resets shutdown state after infrastructure stop failure", {
+test("Windows backend remains stopped after infrastructure stop failure", {
   skip: process.platform !== "win32"
 }, async () => {
   const faults = { shutdownStopFailure: true };
@@ -1577,12 +1786,13 @@ test("Windows backend resets shutdown state after infrastructure stop failure", 
     /injected Windows backend infrastructure stop failure/i
   );
   faults.shutdownStopFailure = false;
-  const result = backend.test.runWindowsJobForTest(
-    process.execPath,
-    ["-e", "process.stdout.write('fresh-after-stop-fault')"],
-    { timeout: 2000 }
+  assert.throws(
+    () => backend.test.runWindowsJobForTest(
+      process.execPath,
+      ["-e", "process.stdout.write('must-not-launch')"],
+      { timeout: 2000 }
+    ),
+    /backend has stopped/i
   );
-  assert.equal(result.stdout, "fresh-after-stop-fault");
-  backend.test.cleanupWindowsJobForTest(result.lease);
   await backend.shutdown();
 });

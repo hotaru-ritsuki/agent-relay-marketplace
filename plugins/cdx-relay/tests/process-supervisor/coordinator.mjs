@@ -14,7 +14,11 @@ import {
   validateRoot,
   validateStop
 } from "./protocol.mjs";
-import { assertCleanupProven, createTerminalResult } from "./result.mjs";
+import {
+  assertCleanupProven,
+  createChildTerminalizer,
+  createTerminalResult
+} from "./result.mjs";
 import { runSynchronous } from "./worker.mjs";
 import { decodeSupervisorToken } from "./backends/posix-process-group.mjs";
 
@@ -490,6 +494,7 @@ export function createProcessSupervisor({
     child.stderr = lease.launch.stderr ?? lease.launch.child?.stderr ?? null;
     child.exitCode = null;
     child.signalCode = null;
+    const terminal = createChildTerminalizer(child);
     child.ref = () => {
       (lease.launch.ref ?? lease.launch.child?.ref)?.call(
         lease.launch.child ?? lease.launch
@@ -543,13 +548,11 @@ export function createProcessSupervisor({
       try {
         rawRoot = await lease.launch.root;
         const root = validateRoot(envelope("root", lease, rawRoot), lease);
-        child.exitCode = root.status;
-        child.signalCode = root.signal;
-        child.emit("exit", child.exitCode, child.signalCode);
+        if (!root.error) terminal.exit(root.status, root.signal);
         const result = await settleLease(lease, root);
         resolveCompletion(result);
         queueMicrotask(() =>
-          child.emit("close", child.exitCode, child.signalCode));
+          terminal.close());
       } catch (error) {
         let terminalError = error;
         if (leases.has(lease.runId)) {
@@ -560,9 +563,12 @@ export function createProcessSupervisor({
           }
         }
         const normalized = latch(terminalError, "TRANSPORT_FAILED");
-        rejectCompletion(normalized);
-        queueMicrotask(() =>
-          child.emit("close", child.exitCode, child.signalCode));
+        try {
+          terminal.error(normalized);
+        } finally {
+          rejectCompletion(normalized);
+          queueMicrotask(() => terminal.close());
+        }
       } finally {
         clearTimeout(timeoutTimer);
       }

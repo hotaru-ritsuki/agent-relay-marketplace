@@ -3,6 +3,8 @@
 import { spawn } from "node:child_process";
 import net from "node:net";
 import process from "node:process";
+import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 
 const token = JSON.parse(
   Buffer.from(process.env.CDX_RELAY_SUPERVISOR_TOKEN ?? "", "base64url")
@@ -99,10 +101,39 @@ const child = spawn(target.command, target.args, {
   shell: false,
   stdio: ["pipe", "pipe", "pipe"]
 });
-process.stdin.pipe(child.stdin);
+const describeError = (error) => ({
+  name: String(error?.name ?? "Error").slice(0, 128),
+  code: String(error?.code ?? "STDIN_FORWARDING_FAILED").slice(0, 128),
+  message: String(error?.message ?? error ?? "stdin forwarding failed")
+    .slice(0, 4096)
+});
+let stdinEscalationTimer;
+let stopEscalationTimer;
+let stdinBytesForwarded = 0;
+const countForwardedStdin = new Transform({
+  transform(chunk, encoding, callback) {
+    stdinBytesForwarded += chunk.length;
+    callback(null, chunk);
+  }
+});
+const stdinForwarding = pipeline(
+  process.stdin,
+  countForwardedStdin,
+  child.stdin
+).then(
+  () => undefined,
+  (error) => {
+    if (stdinBytesForwarded === 0 &&
+        ["EPIPE", "EOF", "ERR_STREAM_PREMATURE_CLOSE"].includes(error?.code)) {
+      return undefined;
+    }
+    child.kill("SIGTERM");
+    stdinEscalationTimer = setTimeout(() => child.kill("SIGKILL"), 1000);
+    return describeError(error);
+  }
+);
 child.stdout.pipe(process.stdout);
 child.stderr.pipe(process.stderr);
-let escalationTimer;
 void (async () => {
   for (;;) {
     const message = await nextFrame();
@@ -118,22 +149,30 @@ void (async () => {
     }
     child.kill(message.signal);
     if (message.signal !== "SIGKILL") {
-      escalationTimer = setTimeout(() => child.kill("SIGKILL"), 1000);
+      stopEscalationTimer = setTimeout(() => child.kill("SIGKILL"), 1000);
     }
     return;
   }
 })().catch((error) => socket.destroy(error));
 
-const [status, signal, rootError] = await new Promise((resolve) => {
+const childTerminal = new Promise((resolve) => {
   child.once("error", (error) => resolve([
     null,
     null,
-    { name: error.name, code: error.code, message: error.message }
+    describeError(error)
   ]));
   child.once("exit", (exitStatus, exitSignal) =>
     resolve([exitStatus, exitSignal, undefined]));
 });
-clearTimeout(escalationTimer);
+const [[childStatus, childSignal, childError], stdinError] = await Promise.all([
+  childTerminal,
+  stdinForwarding
+]);
+const rootError = childError ?? stdinError;
+const status = rootError ? null : childStatus;
+const signal = rootError ? null : childSignal;
+clearTimeout(stdinEscalationTimer);
+clearTimeout(stopEscalationTimer);
 await new Promise((resolve, reject) => {
   socket.once("error", reject);
   socket.write(`${JSON.stringify({
@@ -150,4 +189,4 @@ await new Promise((resolve, reject) => {
   })}\n`, resolve);
 });
 socket.end();
-process.exitCode = status ?? (signal ? 1 : 0);
+process.exitCode = rootError ? 1 : status ?? (signal ? 1 : 0);

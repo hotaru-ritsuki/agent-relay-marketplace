@@ -1756,6 +1756,84 @@ test("real launch shim reports root exit while a descendant holds stdout open", 
   }
 });
 
+test("real launch shim reports bounded stdin forwarding failure when the target closes its pipe", async () => {
+  const rootCredential = "B".repeat(43);
+  let resolveRoot;
+  const rootMessage = new Promise((resolve) => {
+    resolveRoot = resolve;
+  });
+  const channel = await listenOnTestPipe((message, socket) => {
+    if (message.type === "hello") {
+      socket.write(`${JSON.stringify({ type: "release", version: 1 })}\n`);
+    } else if (message.type === "root") {
+      resolveRoot(message);
+    }
+  });
+  const token = Buffer.from(JSON.stringify({
+    version: 1,
+    epoch: "epoch-stdin-pipe",
+    runId: "run-stdin-pipe",
+    nonce: "nonce-stdin-pipe",
+    endpoint: channel.endpoint
+  })).toString("base64url");
+  const target = Buffer.from(JSON.stringify({
+    command: process.execPath,
+    args: [
+      "-e",
+      "process.stdin.resume();process.stdin.destroy();setTimeout(()=>process.exit(0),250)"
+    ]
+  })).toString("base64url");
+  const shim = spawn(process.execPath, [launchShimPath, target], {
+    env: {
+      ...process.env,
+      CDX_RELAY_SUPERVISOR_TOKEN: token,
+      CDX_RELAY_ROOT_REPORT_CREDENTIAL: rootCredential
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true
+  });
+  let stderr = "";
+  shim.stderr.setEncoding("utf8");
+  shim.stderr.on("data", (chunk) => {
+    if (stderr.length < 64 * 1024) {
+      stderr += chunk.slice(0, 64 * 1024 - stderr.length);
+    }
+  });
+  shim.stdin.on("error", () => {});
+  const exited = new Promise((resolve) => shim.once("exit", (status, signal) =>
+    resolve({ status, signal })));
+  shim.stdin.end(Buffer.alloc(4 * 1024 * 1024, "x"));
+
+  try {
+    const message = await Promise.race([
+      rootMessage,
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error(`stdin forwarding root message timed out: ${stderr}`)),
+        3000
+      ))
+    ]);
+    assert.equal(message.status, null);
+    assert.equal(message.signal, null);
+    assert.match(message.error?.code ?? "", /EPIPE|EOF|ERR_STREAM_PREMATURE_CLOSE/);
+    assert.ok(message.error.name.length <= 128);
+    assert.ok(message.error.code.length <= 128);
+    assert.ok(message.error.message.length <= 4096);
+    const terminal = await Promise.race([
+      exited,
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error("stdin forwarding shim exit timed out")),
+        1000
+      ))
+    ]);
+    assert.notEqual(terminal.status, 0);
+    assert.ok(Buffer.byteLength(stderr) <= 64 * 1024);
+    assert.doesNotMatch(stderr, /Unhandled 'error' event/);
+  } finally {
+    shim.kill();
+    await channel.close();
+  }
+});
+
 test("real clean socket close while registered process is live latches protocol loss", async () => {
   let endpoint;
   let registrationChannel;

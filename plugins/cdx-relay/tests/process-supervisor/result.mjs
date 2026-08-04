@@ -1,5 +1,68 @@
 import { SupervisorInfrastructureError } from "./errors.mjs";
 
+export function createChildTerminalizer(child, { backend } = {}) {
+  if (!child || typeof child.emit !== "function") {
+    throw new TypeError("A child-like EventEmitter is required.");
+  }
+  let terminalEvent = null;
+  let closeEmitted = false;
+  let resolveRoot;
+  const root = backend === undefined
+    ? undefined
+    : new Promise((resolve) => {
+        resolveRoot = resolve;
+      });
+  const resolveTerminalRoot = ({ status, signal, error }) => {
+    resolveRoot?.({
+      backend,
+      status,
+      signal,
+      stdout: undefined,
+      stderr: undefined,
+      error
+    });
+  };
+  const emitError = (error) => {
+    if (typeof child.listenerCount === "function" &&
+        child.listenerCount("error") === 0) {
+      child.once("error", () => {});
+    }
+    child.emit("error", error);
+  };
+  return {
+    root,
+    get terminalEvent() {
+      return terminalEvent;
+    },
+    error(error) {
+      if (terminalEvent !== null) return false;
+      terminalEvent = "error";
+      resolveTerminalRoot({ status: null, signal: null, error });
+      emitError(error);
+      return true;
+    },
+    exit(status, signal) {
+      if (terminalEvent !== null) return false;
+      terminalEvent = "exit";
+      child.exitCode = status;
+      child.signalCode = signal;
+      resolveTerminalRoot({ status, signal, error: undefined });
+      child.emit("exit", status, signal);
+      return true;
+    },
+    close() {
+      if (closeEmitted) return false;
+      closeEmitted = true;
+      child.emit(
+        "close",
+        child.exitCode ?? null,
+        child.signalCode ?? null
+      );
+      return true;
+    }
+  };
+}
+
 export function createTerminalResult({
   root,
   backend,

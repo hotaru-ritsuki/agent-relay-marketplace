@@ -8,6 +8,8 @@ import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { MessageChannel, receiveMessageOnPort, Worker } from "node:worker_threads";
 
+import { createChildTerminalizer } from "../result.mjs";
+
 const NATIVE_ROOT = fileURLToPath(new URL("../native/windows/", import.meta.url));
 const WORKER_FILE = path.join(NATIVE_ROOT, "worker.mjs");
 const CONTROLLER_FILE = path.join(NATIVE_ROOT, "controller.ps1");
@@ -21,6 +23,7 @@ const WINDOWS_CAPABILITIES = Object.freeze({
   supportsDetachedDescendants: true
 });
 const LEASE = Symbol("windows-job-lease");
+const TERMINAL = Symbol("windows-job-terminal");
 const OWNERSHIP_FIELDS = Object.freeze(["epoch", "runId", "nonce", "backend"]);
 
 export function createWindowsBackend({ faults = {} } = {}) {
@@ -32,9 +35,28 @@ let windowsJobPoisonSignal = null;
 let windowsJobWorkerExitSignal = null;
 let windowsJobControllerInstanceId = null;
 let windowsJobControllerPid = null;
-let windowsJobShuttingDown = false;
+let windowsJobBackendFailure = null;
+let windowsJobStopped = false;
 const windowsJobLeases = new Map();
 const completedWindowsJobProofs = new Map();
+
+function latchWindowsJobBackendFailure(error) {
+  const normalized = error instanceof Error
+    ? error
+    : new Error(error?.message ?? String(error));
+  normalized.code ??= "WINDOWS_JOB_BACKEND_POISONED";
+  windowsJobBackendFailure ??= normalized;
+  return windowsJobBackendFailure;
+}
+
+function assertWindowsJobBackendAccepting() {
+  if (windowsJobBackendFailure) throw windowsJobBackendFailure;
+  if (windowsJobStopped) {
+    const error = new Error("The Windows job backend has stopped.");
+    error.code = "WINDOWS_JOB_BACKEND_STOPPED";
+    throw error;
+  }
+}
 
 function validateOwnership(ownership, label = "Windows job ownership") {
   if (!ownership || typeof ownership !== "object" || Array.isArray(ownership) ||
@@ -92,15 +114,37 @@ function clearWindowsJobWorkerRefs() {
   windowsJobControllerPid = null;
 }
 
-function purgeWindowsJobEpoch(instanceId) {
+function rememberCompletedWindowsJobProof(lease, proof) {
+  completedWindowsJobProofs.set(lease.launchId, {
+    backendInstanceId: lease.backendInstanceId,
+    controllerInstanceId: lease.controllerInstanceId,
+    ownership: lease.ownership,
+    proof
+  });
+  while (completedWindowsJobProofs.size > 128) {
+    completedWindowsJobProofs.delete(completedWindowsJobProofs.keys().next().value);
+  }
+}
+
+function poisonTerminalProof(lease) {
+  return {
+    ...lease.ownership,
+    controllerInstanceId: lease.controllerInstanceId,
+    controllerPid: lease.controllerPid,
+    launchId: lease.launchId,
+    status: "stopped",
+    activeProcesses: 0,
+    tombstone: true
+  };
+}
+
+function purgeWindowsJobEpoch(instanceId, { cleanupProven = false } = {}) {
   for (const [launchId, lease] of windowsJobLeases) {
     if (!instanceId || lease.controllerInstanceId === instanceId) {
       windowsJobLeases.delete(launchId);
-    }
-  }
-  for (const [launchId, entry] of completedWindowsJobProofs) {
-    if (!instanceId || entry.controllerInstanceId === instanceId) {
-      completedWindowsJobProofs.delete(launchId);
+      if (cleanupProven) {
+        rememberCompletedWindowsJobProof(lease, poisonTerminalProof(lease));
+      }
     }
   }
 }
@@ -140,36 +184,82 @@ function finalizeUnexpectedWindowsJobWorker() {
   if (Atomics.load(state, 0) !== 3) return false;
   const instanceId = windowsJobControllerInstanceId;
   const controllerPid = windowsJobControllerPid;
-  awaitWindowsJobWorkerExit();
-  const ack = consumeWindowsJobTerminalAck(instanceId, controllerPid);
-  purgeWindowsJobEpoch(ack.controllerInstanceId);
-  clearWindowsJobWorkerRefs();
-  return true;
+  let workerStopped = false;
+  let cleanupProven = false;
+  try {
+    awaitWindowsJobWorkerExit();
+    workerStopped = true;
+    const ack = consumeWindowsJobTerminalAck(instanceId, controllerPid);
+    cleanupProven = true;
+    latchWindowsJobBackendFailure(new Error(
+      ack.reason || "Windows job controller terminated unexpectedly."
+    ));
+    return true;
+  } finally {
+    purgeWindowsJobEpoch(instanceId, { cleanupProven });
+    if (workerStopped) clearWindowsJobWorkerRefs();
+  }
 }
 
-function poisonWindowsJobWorker(timeoutMs = 3000) {
-  if (!windowsJobWorker || !windowsJobPoisonSignal) return;
+function poisonWindowsJobWorker(timeoutMs = 3000, cause, { latch = true } = {}) {
+  if (latch) {
+    latchWindowsJobBackendFailure(
+      cause ?? new Error("Windows job backend transport was poisoned.")
+    );
+  }
+  if (!windowsJobWorker || !windowsJobPoisonSignal) {
+    purgeWindowsJobEpoch(null);
+    return;
+  }
   if (finalizeUnexpectedWindowsJobWorker()) return;
   const poisonedInstanceId = windowsJobControllerInstanceId;
   const poisonedControllerPid = windowsJobControllerPid;
   const state = new Int32Array(windowsJobPoisonSignal);
-  Atomics.store(state, 0, 1);
-  Atomics.notify(state, 0);
-  const wait = Atomics.wait(state, 0, 1, timeoutMs);
-  const controllerConfirmed = wait !== "timed-out" && Atomics.load(state, 0) === 2;
-  if (!controllerConfirmed) {
-    throw new Error("Windows job transport poison shutdown was not confirmed.");
+  let workerStopped = false;
+  let cleanupProven = false;
+  try {
+    Atomics.store(state, 0, 1);
+    Atomics.notify(state, 0);
+    const wait = Atomics.wait(state, 0, 1, timeoutMs);
+    const controllerConfirmed = wait !== "timed-out" &&
+      Atomics.load(state, 0) === 2;
+    if (!controllerConfirmed) {
+      throw new Error("Windows job transport poison shutdown was not confirmed.");
+    }
+    awaitWindowsJobWorkerExit();
+    workerStopped = true;
+    consumeWindowsJobTerminalAck(
+      poisonedInstanceId, poisonedControllerPid
+    );
+    cleanupProven = true;
+  } finally {
+    purgeWindowsJobEpoch(poisonedInstanceId, { cleanupProven });
+    if (workerStopped) clearWindowsJobWorkerRefs();
   }
-  awaitWindowsJobWorkerExit();
-  const ack = consumeWindowsJobTerminalAck(
-    poisonedInstanceId, poisonedControllerPid
-  );
-  purgeWindowsJobEpoch(ack.controllerInstanceId);
-  clearWindowsJobWorkerRefs();
+}
+
+function poisonForFailure(error, timeoutMs = 3000) {
+  const failure = latchWindowsJobBackendFailure(error);
+  try {
+    if (!finalizeUnexpectedWindowsJobWorker()) {
+      poisonWindowsJobWorker(timeoutMs, failure, { latch: false });
+    }
+  } catch (poisonError) {
+    failure.message += `; poison cleanup failed: ${poisonError.message}`;
+  }
+  return failure;
 }
 
 function getWindowsJobWorker() {
-  finalizeUnexpectedWindowsJobWorker();
+  if (windowsJobBackendFailure) throw windowsJobBackendFailure;
+  if (!windowsJobStopped) {
+    try {
+      finalizeUnexpectedWindowsJobWorker();
+    } catch (error) {
+      throw poisonForFailure(error);
+    }
+  }
+  assertWindowsJobBackendAccepting();
   if (!windowsJobWorker) {
     windowsJobWorkerReady = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
     windowsJobPoisonSignal = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
@@ -203,79 +293,109 @@ function getWindowsJobWorker() {
   if (Atomics.load(readyState, 0) === 0) {
     const readyResult = Atomics.wait(readyState, 0, 0, 5000);
     if (readyResult === "timed-out") {
-      poisonWindowsJobWorker();
-      throw new Error("Windows job controller Worker startup deadline expired.");
+      throw poisonForFailure(new Error(
+        "Windows job controller Worker startup deadline expired."
+      ));
     }
   }
   return windowsJobWorker;
 }
 
+function unwrapWindowsJobWorkerResponse(message, operation) {
+  if (!message || typeof message !== "object" || Array.isArray(message)) {
+    throw new Error(
+      `Windows job controller ${operation} returned an invalid response.`
+    );
+  }
+  const keys = Object.keys(message);
+  if (keys.length !== 1 || (keys[0] !== "error" && keys[0] !== "value")) {
+    throw new Error(
+      `Windows job controller ${operation} returned an invalid response.`
+    );
+  }
+  if (keys[0] === "error") {
+    if (typeof message.error !== "string" || !message.error) {
+      throw new Error(
+        `Windows job controller ${operation} returned an invalid error response.`
+      );
+    }
+    throw new Error(message.error);
+  }
+  return message.value;
+}
+
 function requestWindowsJobWorker(operation, payload, timeoutMs) {
+  getWindowsJobWorker();
   const shared = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 4);
   const state = new Int32Array(shared);
   const { port1, port2 } = new MessageChannel();
-  getWindowsJobWorker();
-  windowsJobWorkerChannel.port2.postMessage(
-    { operation, payload, port: port1, shared },
-    [port1]
-  );
-  const waitResult = Atomics.wait(state, 0, 0, timeoutMs);
-  if (waitResult === "timed-out") {
-    port2.close();
-    if (!finalizeUnexpectedWindowsJobWorker()) poisonWindowsJobWorker();
-    throw new Error(
-      `Windows job controller ${operation} deadline expired at stages ` +
-      `${Atomics.load(state, 1)}/${Atomics.load(state, 2)}/${Atomics.load(state, 3)}.`
-    );
-  }
-  const received = receiveMessageOnPort(port2);
-  port2.close();
-  if (!received) {
-    if (!finalizeUnexpectedWindowsJobWorker()) poisonWindowsJobWorker();
-    throw new Error(`Windows job controller ${operation} returned no response.`);
-  }
-  if (received.message.error) {
-    if (!finalizeUnexpectedWindowsJobWorker()) poisonWindowsJobWorker();
-    throw new Error(received.message.error);
-  }
-  return received.message.value;
-}
-
-function requestWindowsJobWorkerAsync(operation, payload, timeoutMs) {
-  const shared = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 4);
-  const { port1, port2 } = new MessageChannel();
-  getWindowsJobWorker();
-  let timer;
-  const promise = new Promise((resolve, reject) => {
-    timer = setTimeout(() => {
-      port2.close();
-      try {
-        if (!finalizeUnexpectedWindowsJobWorker()) poisonWindowsJobWorker();
-      } catch (error) {
-        reject(error);
-        return;
-      }
-      reject(new Error(`Windows job controller ${operation} deadline expired.`));
-    }, timeoutMs);
-    port2.once("message", (message) => {
-      clearTimeout(timer);
-      port2.close();
-      if (message.error) {
-        try {
-          if (!finalizeUnexpectedWindowsJobWorker()) poisonWindowsJobWorker();
-        } catch (error) {
-          reject(error);
-          return;
-        }
-        reject(new Error(message.error));
-      } else {
-        resolve(message.value);
-      }
-    });
+  try {
     windowsJobWorkerChannel.port2.postMessage(
       { operation, payload, port: port1, shared },
       [port1]
     );
+  } catch (error) {
+    port1.close();
+    port2.close();
+    throw poisonForFailure(error);
+  }
+  const waitResult = Atomics.wait(state, 0, 0, timeoutMs);
+  if (waitResult === "timed-out") {
+    port2.close();
+    const error = new Error(
+      `Windows job controller ${operation} deadline expired at stages ` +
+      `${Atomics.load(state, 1)}/${Atomics.load(state, 2)}/${Atomics.load(state, 3)}.`
+    );
+    throw poisonForFailure(error);
+  }
+  const received = receiveMessageOnPort(port2);
+  port2.close();
+  if (!received) {
+    const error = new Error(
+      `Windows job controller ${operation} returned no response.`
+    );
+    throw poisonForFailure(error);
+  }
+  try {
+    return unwrapWindowsJobWorkerResponse(received.message, operation);
+  } catch (error) {
+    throw poisonForFailure(error);
+  }
+}
+
+function requestWindowsJobWorkerAsync(operation, payload, timeoutMs) {
+  getWindowsJobWorker();
+  const shared = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 4);
+  const { port1, port2 } = new MessageChannel();
+  let timer;
+  const promise = new Promise((resolve, reject) => {
+    timer = setTimeout(() => {
+      port2.close();
+      const error = new Error(
+        `Windows job controller ${operation} deadline expired.`
+      );
+      reject(poisonForFailure(error));
+    }, timeoutMs);
+    port2.once("message", (message) => {
+      clearTimeout(timer);
+      port2.close();
+      try {
+        resolve(unwrapWindowsJobWorkerResponse(message, operation));
+      } catch (error) {
+        reject(poisonForFailure(error));
+      }
+    });
+    try {
+      windowsJobWorkerChannel.port2.postMessage(
+        { operation, payload, port: port1, shared },
+        [port1]
+      );
+    } catch (error) {
+      clearTimeout(timer);
+      port1.close();
+      port2.close();
+      reject(poisonForFailure(error));
+    }
   });
   return {
     promise,
@@ -328,8 +448,9 @@ function launchWindowsJob(command, args, options = {}) {
     controlTimeout + 1000
   );
   if (!sameOwnership(lease.ownership, ownership)) {
-    poisonWindowsJobWorker();
-    throw new Error("Windows job launch ownership changed in transit.");
+    const error = new Error("Windows job launch ownership changed in transit.");
+    poisonForFailure(error);
+    throw error;
   }
   lease.backendInstanceId = backendInstanceId;
   lease.ownership = Object.freeze({ ...lease.ownership });
@@ -456,8 +577,9 @@ function runWindowsJobForTest(command, args, options = {}) {
       (options.controlTimeout ?? 7000) + 1000
     );
     if (!sameOwnership(lease.ownership, ownership)) {
-      poisonWindowsJobWorker();
-      throw new Error("Windows job launch ownership changed in transit.");
+      const error = new Error("Windows job launch ownership changed in transit.");
+      poisonForFailure(error);
+      throw error;
     }
     lease.backendInstanceId = backendInstanceId;
     lease.ownership = Object.freeze({ ...lease.ownership });
@@ -577,20 +699,13 @@ function cleanupWindowsJobForTest(leaseOrLaunchId) {
     proof.activeProcesses !== 0 ||
     proof.tombstone !== true
   ) {
-    poisonWindowsJobWorker();
+    const error = new Error("Windows job cleanup returned invalid terminal proof.");
+    poisonForFailure(error);
     windowsJobLeases.delete(launchId);
-    throw new Error("Windows job cleanup returned invalid terminal proof.");
+    throw error;
   }
   windowsJobLeases.delete(launchId);
-  completedWindowsJobProofs.set(launchId, {
-    backendInstanceId: lease.backendInstanceId,
-    controllerInstanceId: lease.controllerInstanceId,
-    ownership: lease.ownership,
-    proof
-  });
-  while (completedWindowsJobProofs.size > 128) {
-    completedWindowsJobProofs.delete(completedWindowsJobProofs.keys().next().value);
-  }
+  rememberCompletedWindowsJobProof(lease, proof);
   return proof;
 }
 
@@ -611,8 +726,9 @@ function replayNativeWindowsJobTombstoneForTest(lease) {
     proof.activeProcesses !== 0 ||
     proof.tombstone !== true
   ) {
-    poisonWindowsJobWorker();
-    throw new Error("Windows native tombstone replay returned invalid proof.");
+    const error = new Error("Windows native tombstone replay returned invalid proof.");
+    poisonForFailure(error);
+    throw error;
   }
   return proof;
 }
@@ -671,6 +787,8 @@ async function legacySpawnTracked(command, args, options = {}) {
   child.signalCode = null;
   child.stdout = stdoutPiped ? new PassThrough({ emitClose: false }) : null;
   child.stderr = stderrPiped ? new PassThrough({ emitClose: false }) : null;
+  const terminal = createChildTerminalizer(child, { backend: "windows-job" });
+  child[TERMINAL] = terminal;
   let requestedSignal = null;
   const waitRequest = requestWindowsJobWorkerAsync(
     "wait",
@@ -694,7 +812,7 @@ async function legacySpawnTracked(command, args, options = {}) {
   };
   child.kill = (signal = "SIGTERM") => {
     if (lease.spawnError) return false;
-    if (child.exitCode !== null || child.signalCode !== null) return false;
+    if (terminal.terminalEvent !== null) return false;
     const normalized = normalizeWindowsChildSignal(signal);
     if (normalized.probe) {
       try {
@@ -709,7 +827,7 @@ async function legacySpawnTracked(command, args, options = {}) {
       cleanupWindowsJobForTest(lease);
       return true;
     } catch (error) {
-      queueMicrotask(() => child.emit("error", error));
+      queueMicrotask(() => terminal.error(error));
       return false;
     }
   };
@@ -732,30 +850,39 @@ async function legacySpawnTracked(command, args, options = {}) {
       const error = createWindowsSpawnError(result.error ?? lease.spawnError, {
         synchronous: false
       });
-      child.emit("error", error);
+      try {
+        terminal.error(error);
+      } finally {
+        await closeStreams([
+          { stream: child.stdout, output: Buffer.alloc(0) },
+          { stream: child.stderr, output: Buffer.alloc(0) }
+        ]);
+        terminal.close();
+      }
+      return;
+    }
+    try {
+      terminal.exit(
+        requestedSignal ? null : result.status,
+        requestedSignal ?? result.signal
+      );
+    } finally {
+      await closeStreams([
+        { stream: child.stdout, output: stdout },
+        { stream: child.stderr, output: stderr }
+      ]);
+      terminal.close();
+    }
+  }, async (error) => {
+    try {
+      terminal.error(error);
+    } finally {
       await closeStreams([
         { stream: child.stdout, output: Buffer.alloc(0) },
         { stream: child.stderr, output: Buffer.alloc(0) }
       ]);
-      child.emit("close", null, null);
-      return;
+      terminal.close();
     }
-    child.exitCode = requestedSignal ? null : result.status;
-    child.signalCode = requestedSignal ?? result.signal;
-    child.emit("exit", child.exitCode, child.signalCode);
-    await closeStreams([
-      { stream: child.stdout, output: stdout },
-      { stream: child.stderr, output: stderr }
-    ]);
-    child.emit("close", child.exitCode, child.signalCode);
-  }, (error) => {
-    if (windowsJobShuttingDown) {
-      return;
-    }
-    child.stdout?.destroy(error);
-    child.stderr?.destroy(error);
-    child.emit("error", error);
-    child.emit("close", null, null);
   });
   return child;
 }
@@ -830,16 +957,17 @@ function cleanupProof(spec, proof) {
 }
 
 function stopInfrastructure(faults = {}) {
-  windowsJobShuttingDown = true;
   try {
-    if (windowsJobWorker) poisonWindowsJobWorker(4_000);
+    if (windowsJobWorker) {
+      poisonWindowsJobWorker(4_000, undefined, { latch: false });
+    }
     if (faults.shutdownStopFailure === true) {
       throw new Error(
         "Injected Windows backend infrastructure stop failure."
       );
     }
   } finally {
-    windowsJobShuttingDown = false;
+    windowsJobStopped = true;
   }
 }
 
@@ -850,38 +978,13 @@ function stopInfrastructure(faults = {}) {
       launchOptions(spec, faults)
     );
     const lease = child[LEASE];
-    let rootError;
-    const root = new Promise((resolve) => {
-      child.once("error", (error) => {
-        rootError = error;
-        if (!lease || lease.spawnError) {
-          resolve({
-            backend: "windows-job",
-            status: null,
-            signal: null,
-            stdout: undefined,
-            stderr: undefined,
-            error
-          });
-        }
-      });
-      child.once("exit", (status, signal) => {
-        resolve({
-          backend: "windows-job",
-          status,
-          signal,
-          stdout: undefined,
-          stderr: undefined,
-          error: rootError
-        });
-      });
-    });
+    const terminal = child[TERMINAL];
     return {
       child,
       pid: child.pid,
       stdout: child.stdout,
       stderr: child.stderr,
-      root,
+      root: terminal.root,
       kill(signal) {
         return {
           backend: "windows-job",

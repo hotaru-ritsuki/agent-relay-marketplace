@@ -172,6 +172,67 @@ test("exit precedes completion settlement and close follows it", async () => {
   assert.deepEqual(events, ["exit", "completion", "close"]);
 });
 
+test("backend failure emits error, rejects completion, and closes without waiting for exit", async () => {
+  const backendError = new SupervisorInfrastructureError(
+    "PROTOCOL_LOST",
+    "backend terminal transport failed"
+  );
+  let cleaned = 0;
+  const supervisor = createFakeSupervisor({
+    launch(_spec, context) {
+      return context.createFakeLaunch({
+        root: Promise.reject(backendError),
+        cleanup: async () => {
+          cleaned += 1;
+          return { level: "registered-drained" };
+        }
+      });
+    }
+  });
+  const child = await supervisor.spawnTracked({ command: "tool", args: [] });
+  const events = [];
+  const publicErrors = [];
+  child.on("error", (error) => {
+    publicErrors.push(error);
+    events.push("error");
+  });
+  child.on("exit", () => events.push("exit"));
+  const closed = new Promise((resolve) => child.once("close", () => {
+    events.push("close");
+    resolve();
+  }));
+  const completion = child.completion.then(
+    () => assert.fail("backend failure completion must reject"),
+    (error) => {
+      events.push("completion");
+      throw error;
+    }
+  );
+
+  await assert.rejects(
+    Promise.race([
+      completion,
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error("backend failure completion timed out")),
+        1000
+      ))
+    ]),
+    (error) => error.code === "PROTOCOL_LOST"
+  );
+  await Promise.race([
+    closed,
+    new Promise((_, reject) => setTimeout(
+      () => reject(new Error("backend failure close timed out")),
+      1000
+    ))
+  ]);
+
+  assert.equal(cleaned, 1);
+  assert.equal(publicErrors.length, 1);
+  assert.equal(publicErrors[0], backendError);
+  assert.deepEqual(events, ["error", "completion", "close"]);
+});
+
 test("kill is idempotent and records requested versus observed signal", async () => {
   const supervisor = createFakeSupervisor({
     root: {
