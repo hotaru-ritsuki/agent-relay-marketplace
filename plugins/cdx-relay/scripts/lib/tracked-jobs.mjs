@@ -2,11 +2,8 @@ import fs from "node:fs";
 import process from "node:process";
 
 import {
-  readJobFile,
-  resolveJobFile,
+  mutateJob,
   resolveJobLogFile,
-  updateState,
-  writeJobFile
 } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
@@ -107,12 +104,10 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
 
     const indexedJob = updateIndexedJob(workspaceRoot, jobId, (current) => {
       if (current.status === "cancelling" || current.status === "cancelled") {
-        const { phase: _ignoredPhase, ...terminalSafePatch } = patch;
-        return terminalSafePatch;
+        return null;
       }
       return patch;
     });
-    publishStoredJob(workspaceRoot, jobId, indexedJob);
   };
 }
 
@@ -133,42 +128,14 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
   };
 }
 
-function readStoredJobOrNull(workspaceRoot, jobId) {
-  const jobFile = resolveJobFile(workspaceRoot, jobId);
-  if (!fs.existsSync(jobFile)) {
-    return null;
-  }
-  return readJobFile(jobFile);
-}
-
 function updateIndexedJob(workspaceRoot, jobId, mutate) {
-  let publishedJob = null;
-  updateState(workspaceRoot, (state) => {
-    const timestamp = nowIso();
-    const index = state.jobs.findIndex((job) => job.id === jobId);
-    const current = index === -1
-      ? { id: jobId, createdAt: timestamp }
-      : state.jobs[index];
-    publishedJob = {
-      ...current,
-      ...mutate(current, timestamp),
-      id: jobId,
-      updatedAt: timestamp
-    };
-    if (index === -1) {
-      state.jobs.unshift(publishedJob);
-    } else {
-      state.jobs[index] = publishedJob;
+  return mutateJob(workspaceRoot, jobId, (storedJob, timestamp) => {
+    const current = storedJob ?? { id: jobId, createdAt: timestamp };
+    const patch = mutate(current, timestamp);
+    if (patch == null) {
+      return null;
     }
-  });
-  return publishedJob;
-}
-
-function publishStoredJob(workspaceRoot, jobId, indexedJob) {
-  const existing = readStoredJobOrNull(workspaceRoot, jobId) ?? {};
-  writeJobFile(workspaceRoot, jobId, {
-    ...existing,
-    ...indexedJob
+    return { ...current, ...patch };
   });
 }
 
@@ -204,7 +171,6 @@ export async function cancelTrackedJob(workspaceRoot, jobId, requestTermination)
       cancelRequestedAt: current.cancelRequestedAt ?? timestamp
     };
   });
-  publishStoredJob(workspaceRoot, jobId, cancellingJob);
 
   if (alreadyCancelled) {
     return {
@@ -227,7 +193,7 @@ export async function cancelTrackedJob(workspaceRoot, jobId, requestTermination)
     const detail = error instanceof Error ? error.message : String(error);
     const failedJob = updateIndexedJob(workspaceRoot, jobId, (current, timestamp) => {
       if (current.status === "cancelled") {
-        return {};
+        return null;
       }
       if (current.status !== "cancelling") {
         throw error;
@@ -239,13 +205,12 @@ export async function cancelTrackedJob(workspaceRoot, jobId, requestTermination)
         lastCancelAttemptAt: timestamp
       };
     });
-    publishStoredJob(workspaceRoot, jobId, failedJob);
     throw error;
   }
 
   const cancelledJob = updateIndexedJob(workspaceRoot, jobId, (current, timestamp) => {
     if (current.status === "cancelled") {
-      return {};
+      return null;
     }
     if (current.status !== "cancelling") {
       throw new Error(
@@ -257,7 +222,6 @@ export async function cancelTrackedJob(workspaceRoot, jobId, requestTermination)
       lastCancelAttemptAt: timestamp
     };
   });
-  publishStoredJob(workspaceRoot, jobId, cancelledJob);
   return {
     job: cancelledJob,
     termination,
@@ -268,7 +232,7 @@ export async function cancelTrackedJob(workspaceRoot, jobId, requestTermination)
 export async function runTrackedJob(job, runner, options = {}) {
   const runningRecord = updateIndexedJob(job.workspaceRoot, job.id, (current, timestamp) => {
     if (current.status === "cancelling" || current.status === "cancelled") {
-      return {};
+      return null;
     }
     return {
       ...job,
@@ -279,7 +243,6 @@ export async function runTrackedJob(job, runner, options = {}) {
       logFile: options.logFile ?? job.logFile ?? null
     };
   });
-  publishStoredJob(job.workspaceRoot, job.id, runningRecord);
   if (runningRecord.status === "cancelling" || runningRecord.status === "cancelled") {
     throw Object.assign(new Error(`Cancellation was requested for job ${job.id}.`), {
       code: "ERR_JOB_CANCELLING"
@@ -292,11 +255,7 @@ export async function runTrackedJob(job, runner, options = {}) {
     const completedAt = nowIso();
     const completedJob = updateIndexedJob(job.workspaceRoot, job.id, (current) => {
       if (current.status === "cancelling" || current.status === "cancelled") {
-        return {
-          ...cancellationTerminalPatch(current, completedAt),
-          threadId: execution.threadId ?? current.threadId ?? null,
-          turnId: execution.turnId ?? current.turnId ?? null
-        };
+        return null;
       }
       return {
         status: completionStatus,
@@ -310,7 +269,6 @@ export async function runTrackedJob(job, runner, options = {}) {
         rendered: execution.rendered
       };
     });
-    publishStoredJob(job.workspaceRoot, job.id, completedJob);
     if (completedJob.status !== "cancelled") {
       appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
     }
@@ -320,7 +278,7 @@ export async function runTrackedJob(job, runner, options = {}) {
     const completedAt = nowIso();
     const failedJob = updateIndexedJob(job.workspaceRoot, job.id, (current) => {
       if (current.status === "cancelling" || current.status === "cancelled") {
-        return cancellationTerminalPatch(current, completedAt);
+        return null;
       }
       return {
         status: "failed",
@@ -331,7 +289,6 @@ export async function runTrackedJob(job, runner, options = {}) {
         logFile: options.logFile ?? job.logFile ?? current.logFile ?? null
       };
     });
-    publishStoredJob(job.workspaceRoot, job.id, failedJob);
     throw error;
   }
 }

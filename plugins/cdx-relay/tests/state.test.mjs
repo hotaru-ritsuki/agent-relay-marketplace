@@ -74,6 +74,64 @@ test("strict state-index reads distinguish absence from malformed content", () =
   );
 });
 
+test("locked job mutation publishes one fresh generation to the index and job file", () => {
+  const workspace = makeTempDir();
+  const jobId = "locked-job-mutation";
+  upsertJob(workspace, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    pid: 4321
+  });
+  const initial = loadState(workspace);
+  writeJobFile(workspace, jobId, initial.jobs[0]);
+
+  assert.equal(typeof stateApi.mutateJob, "function");
+  const published = stateApi.mutateJob(workspace, jobId, (current) => ({
+    ...current,
+    status: "cancelling",
+    phase: "cancelling",
+    cancelRequestedAt: "2026-08-04T12:00:00.000Z"
+  }));
+
+  const state = loadState(workspace);
+  const stored = readJobFile(resolveJobFile(workspace, jobId));
+  assert.equal(state.revision, initial.revision + 1);
+  assert.equal(published.status, "cancelling");
+  assert.equal(published.generation, 1);
+  assert.deepEqual(stored, published);
+  assert.deepEqual(state.jobs[0], published);
+});
+
+test("locked job mutation does not acknowledge an index update when job publication fails", () => {
+  const workspace = makeTempDir();
+  const jobId = "failed-locked-job-mutation";
+  upsertJob(workspace, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    pid: 4321
+  });
+  const stateFile = resolveStateFile(workspace);
+  const jobFile = resolveJobFile(workspace, jobId);
+  writeJobFile(workspace, jobId, loadState(workspace).jobs[0]);
+  const stateBefore = fs.readFileSync(stateFile, "utf8");
+  fs.unlinkSync(jobFile);
+  fs.mkdirSync(jobFile);
+
+  assert.equal(typeof stateApi.mutateJob, "function");
+  assert.throws(
+    () => stateApi.mutateJob(workspace, jobId, (current) => ({
+      ...current,
+      status: "cancelling",
+      phase: "cancelling"
+    })),
+    (error) => error?.code === "EEXIST" || error?.code === "EPERM" || error?.code === "EACCES"
+  );
+  assert.equal(fs.readFileSync(stateFile, "utf8"), stateBefore);
+  assert.equal(fs.statSync(jobFile).isDirectory(), true);
+});
+
 test("state index and job JSON publish atomically while a concurrent reader polls", async () => {
   const workspace = makeTempDir();
   const jobId = "atomic-publication";

@@ -545,6 +545,62 @@ export function updateState(cwd, mutate) {
   });
 }
 
+export function mutateJob(cwd, jobId, mutate) {
+  if (typeof jobId !== "string" || jobId.length === 0) {
+    throw new TypeError("Job id must be a non-empty string.");
+  }
+  if (typeof mutate !== "function") {
+    throw new TypeError("Job mutation must be a function.");
+  }
+
+  return withStateLock(cwd, () => {
+    const state = loadStateForMutation(cwd);
+    const index = state.jobs.findIndex((job) => job.id === jobId);
+    const current = index === -1 ? null : state.jobs[index];
+    const timestamp = nowIso();
+    const patch = mutate(current, timestamp);
+    if (patch == null) {
+      if (current === null) {
+        throw new Error(`Job ${jobId} does not exist.`);
+      }
+      return current;
+    }
+    if (typeof patch !== "object" || Array.isArray(patch)) {
+      throw new TypeError("Job mutation must return an object or null.");
+    }
+
+    const currentGeneration = Number.isInteger(current?.generation) && current.generation >= 0
+      ? current.generation
+      : 0;
+    const nextJob = {
+      createdAt: current?.createdAt ?? timestamp,
+      ...(current ?? {}),
+      ...patch,
+      id: jobId,
+      generation: currentGeneration + 1,
+      updatedAt: timestamp
+    };
+    const nextJobs = [...state.jobs];
+    if (index === -1) {
+      nextJobs.unshift(nextJob);
+    } else {
+      nextJobs[index] = nextJob;
+    }
+
+    atomicWriteJson(resolveJobFile(cwd, jobId), nextJob);
+    const published = publishState(
+      cwd,
+      { ...state, jobs: nextJobs },
+      state.revision + 1
+    );
+    const publishedJob = published.jobs.find((job) => job.id === jobId);
+    if (!publishedJob) {
+      throw new Error(`Job ${jobId} was not retained in the state index.`);
+    }
+    return publishedJob;
+  });
+}
+
 export function removeJobs(cwd, ids) {
   const values = typeof ids === "string" ? [ids] : ids;
   if (!values || typeof values[Symbol.iterator] !== "function") {

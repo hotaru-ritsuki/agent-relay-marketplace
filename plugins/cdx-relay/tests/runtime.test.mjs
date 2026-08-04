@@ -31,7 +31,11 @@ import { createBrokerEndpoint, parseBrokerEndpoint } from "../scripts/lib/broker
 import { captureProcessIdentity } from "../scripts/lib/process-identity.mjs";
 import { DEFAULT_CONTINUE_PROMPT, getSessionRuntimeStatus } from "../scripts/lib/codex.mjs";
 import { resolveStateDir, upsertJob, writeJobFile } from "../scripts/lib/state.mjs";
-import { cancelTrackedJob, runTrackedJob } from "../scripts/lib/tracked-jobs.mjs";
+import {
+  cancelTrackedJob,
+  createJobProgressUpdater,
+  runTrackedJob
+} from "../scripts/lib/tracked-jobs.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = ROOT;
@@ -2937,52 +2941,121 @@ test("result for a finished write-capable task returns the raw Codex final respo
   assert.match(result.stdout, /Resume in Codex: codex resume thr_[a-z0-9]+/i);
 });
 
-test("a tracked job terminal result completes an already-requested cancellation", async () => {
-  const workspace = makeTempDir();
-  const stateDir = resolveStateDir(workspace);
-  let releaseRunner;
-  const runnerGate = new Promise((resolve) => {
-    releaseRunner = resolve;
-  });
-  const executionPromise = runTrackedJob(
-    {
-      id: "task-cancelling",
-      workspaceRoot: workspace,
-      title: "Codex Task"
-    },
-    async () => {
-      await runnerGate;
-      return {
-        exitStatus: 0,
-        threadId: "thr_cancel",
-        turnId: "turn_cancel",
-        summary: "Finished after cancellation intent",
-        payload: { ok: true },
-        rendered: "Finished after cancellation intent.\n"
-      };
+for (const runnerOutcome of ["success", "failure"]) {
+  test(`stale worker ${runnerOutcome} and progress preserve cancelling until independent proof`, async () => {
+    const workspace = makeTempDir();
+    const stateDir = resolveStateDir(workspace);
+    const jobId = `task-cancelling-${runnerOutcome}`;
+    let releaseRunner;
+    const runnerGate = new Promise((resolve) => {
+      releaseRunner = resolve;
+    });
+    const progress = createJobProgressUpdater(workspace, jobId);
+    const executionOutcome = runTrackedJob(
+      {
+        id: jobId,
+        workspaceRoot: workspace,
+        title: "Codex Task"
+      },
+      async () => {
+        await runnerGate;
+        if (runnerOutcome === "failure") {
+          throw new Error("runner failed after cancellation intent");
+        }
+        return {
+          exitStatus: 0,
+          threadId: "thr_cancel",
+          turnId: "turn_cancel",
+          summary: "Finished after cancellation intent",
+          payload: { ok: true },
+          rendered: "Finished after cancellation intent.\n"
+        };
+      }
+    ).then(
+      (value) => ({ value, error: null }),
+      (error) => ({ value: null, error })
+    );
+
+    await waitFor(() => {
+      const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+      return state.jobs[0]?.status === "running";
+    });
+
+    await assert.rejects(
+      cancelTrackedJob(workspace, jobId, async () => {
+        throw new Error("first termination attempt failed");
+      }),
+      /first termination attempt failed/
+    );
+
+    let releaseProof;
+    const proofGate = new Promise((resolve) => {
+      releaseProof = resolve;
+    });
+    let markProofRequested;
+    const proofRequested = new Promise((resolve) => {
+      markProofRequested = resolve;
+    });
+    const cancellationPromise = cancelTrackedJob(workspace, jobId, async () => {
+      markProofRequested();
+      await proofGate;
+      return { terminal: true, proof: "independent-terminal-proof" };
+    });
+    await proofRequested;
+
+    const cancellingState = JSON.parse(
+      fs.readFileSync(path.join(stateDir, "state.json"), "utf8")
+    );
+    const cancelling = cancellingState.jobs[0];
+    const cancellingJobFile = fs.readFileSync(path.join(stateDir, "jobs", `${jobId}.json`), "utf8");
+    assert.equal(cancelling.status, "cancelling");
+    assert.equal(cancelling.cancellationError, "first termination attempt failed");
+    assert.match(cancelling.cancelRequestedAt, /^\d{4}-\d{2}-\d{2}T/);
+
+    progress({
+      phase: "verifying",
+      threadId: "thr_stale_progress",
+      turnId: "turn_stale_progress"
+    });
+    releaseRunner();
+    const execution = await executionOutcome;
+    if (runnerOutcome === "failure") {
+      assert.match(execution.error?.message ?? "", /runner failed after cancellation intent/);
+    } else {
+      assert.equal(execution.error, null);
     }
-  );
 
-  await waitFor(() => {
-    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
-    return state.jobs[0]?.status === "running";
-  });
-  const cancelRequestedAt = "2026-08-04T10:00:00.000Z";
-  upsertJob(workspace, {
-    id: "task-cancelling",
-    status: "cancelling",
-    phase: "cancelling",
-    cancelRequestedAt
-  });
-  releaseRunner();
-  await executionPromise;
+    const afterWorkerState = JSON.parse(
+      fs.readFileSync(path.join(stateDir, "state.json"), "utf8")
+    );
+    const afterWorker = afterWorkerState.jobs[0];
+    const afterWorkerJobFile = fs.readFileSync(
+      path.join(stateDir, "jobs", `${jobId}.json`),
+      "utf8"
+    );
+    assert.equal(afterWorker.status, "cancelling");
+    assert.equal(afterWorker.phase, "cancelling");
+    assert.equal(afterWorker.pid, cancelling.pid);
+    assert.equal(afterWorker.cancelRequestedAt, cancelling.cancelRequestedAt);
+    assert.equal(afterWorker.cancellationError, cancelling.cancellationError);
+    assert.equal(afterWorkerState.revision, cancellingState.revision);
+    assert.equal(afterWorker.generation, cancelling.generation);
+    assert.equal(afterWorkerJobFile, cancellingJobFile);
+    assert.deepEqual(JSON.parse(afterWorkerJobFile), afterWorker);
 
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
-  assert.equal(state.jobs[0].status, "cancelled");
-  assert.equal(state.jobs[0].phase, "cancelled");
-  assert.equal(state.jobs[0].pid, null);
-  assert.equal(state.jobs[0].cancelRequestedAt, cancelRequestedAt);
-});
+    releaseProof();
+    const cancellation = await cancellationPromise;
+    const finalState = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+    const finalStored = JSON.parse(
+      fs.readFileSync(path.join(stateDir, "jobs", `${jobId}.json`), "utf8")
+    );
+    assert.equal(cancellation.job.status, "cancelled");
+    assert.equal(finalState.jobs[0].status, "cancelled");
+    assert.equal(finalState.jobs[0].pid, null);
+    assert.equal(finalState.jobs[0].generation, cancelling.generation + 1);
+    assert.deepEqual(finalStored, finalState.jobs[0]);
+  });
+}
 
 test("cancel durably publishes cancelling before requesting termination", async () => {
   const workspace = makeTempDir();
