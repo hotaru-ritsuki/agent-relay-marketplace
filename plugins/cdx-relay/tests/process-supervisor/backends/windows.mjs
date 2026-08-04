@@ -301,7 +301,83 @@ function getWindowsJobWorker() {
   return windowsJobWorker;
 }
 
-function unwrapWindowsJobWorkerResponse(message, operation) {
+function hasExactKeys(value, keys) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length &&
+    actual.every((key, index) => key === expected[index]);
+}
+
+function validWindowsSpawnErrorDescriptor(error) {
+  if (!error || typeof error !== "object" || Array.isArray(error) ||
+      typeof error.message !== "string" ||
+      typeof error.code !== "string") {
+    return false;
+  }
+  if (hasExactKeys(error, ["message", "code"])) return true;
+  return hasExactKeys(error, [
+    "message", "code", "errno", "syscall", "path", "spawnargs"
+  ]) &&
+    (error.errno === null || Number.isInteger(error.errno)) &&
+    (error.syscall === null || typeof error.syscall === "string") &&
+    typeof error.path === "string" &&
+    Array.isArray(error.spawnargs) &&
+    error.spawnargs.every((arg) => typeof arg === "string");
+}
+
+function decodeCanonicalBoundedBase64(value, label, maxBuffer) {
+  if (typeof value !== "string" || value.length % 4 !== 0) {
+    throw new Error(`Windows job Worker returned non-canonical ${label} base64.`);
+  }
+  const maxEncodedLength = Math.ceil(maxBuffer / 3) * 4;
+  if (value.length > maxEncodedLength) {
+    throw new Error(`Windows job Worker returned ${label} beyond maxBuffer.`);
+  }
+  const decoded = Buffer.from(value, "base64");
+  if (decoded.toString("base64") !== value) {
+    throw new Error(`Windows job Worker returned non-canonical ${label} base64.`);
+  }
+  if (decoded.length > maxBuffer) {
+    throw new Error(`Windows job Worker returned ${label} beyond maxBuffer.`);
+  }
+  return decoded.length;
+}
+
+function validateWindowsJobWaitValue(value, payload) {
+  const lease = payload?.lease;
+  if (!lease || !hasExactKeys(value, [
+    "epoch", "runId", "nonce", "backend", "status", "signal", "error",
+    "stdoutBase64", "stderrBase64"
+  ]) ||
+      !sameOwnership(value, lease.ownership) ||
+      !(
+        (
+          Number.isSafeInteger(value.status) &&
+          value.status >= 0 && value.status <= 0xffffffff &&
+          value.error === null
+        ) ||
+        (
+          value.status === null &&
+          validWindowsSpawnErrorDescriptor(value.error)
+        )
+      ) ||
+      value.signal !== null) {
+    throw new Error("Windows job Worker returned an invalid wait result.");
+  }
+  const stdoutLength = decodeCanonicalBoundedBase64(
+    value.stdoutBase64, "stdout", lease.maxBuffer
+  );
+  const stderrLength = decodeCanonicalBoundedBase64(
+    value.stderrBase64, "stderr", lease.maxBuffer
+  );
+  if (stdoutLength + stderrLength > lease.maxBuffer) {
+    throw new Error("Windows job Worker returned output beyond maxBuffer.");
+  }
+  return value;
+}
+
+function unwrapWindowsJobWorkerResponse(message, operation, payload) {
   if (!message || typeof message !== "object" || Array.isArray(message)) {
     throw new Error(
       `Windows job controller ${operation} returned an invalid response.`
@@ -321,7 +397,9 @@ function unwrapWindowsJobWorkerResponse(message, operation) {
     }
     throw new Error(message.error);
   }
-  return message.value;
+  return operation === "wait"
+    ? validateWindowsJobWaitValue(message.value, payload)
+    : message.value;
 }
 
 function requestWindowsJobWorker(operation, payload, timeoutMs) {
@@ -357,7 +435,7 @@ function requestWindowsJobWorker(operation, payload, timeoutMs) {
     throw poisonForFailure(error);
   }
   try {
-    return unwrapWindowsJobWorkerResponse(received.message, operation);
+    return unwrapWindowsJobWorkerResponse(received.message, operation, payload);
   } catch (error) {
     throw poisonForFailure(error);
   }
@@ -380,7 +458,7 @@ function requestWindowsJobWorkerAsync(operation, payload, timeoutMs) {
       clearTimeout(timer);
       port2.close();
       try {
-        resolve(unwrapWindowsJobWorkerResponse(message, operation));
+        resolve(unwrapWindowsJobWorkerResponse(message, operation, payload));
       } catch (error) {
         reject(poisonForFailure(error));
       }
@@ -796,7 +874,8 @@ async function legacySpawnTracked(command, args, options = {}) {
       lease,
       controlTimeout: options.timeout === undefined
         ? 24 * 60 * 60 * 1000
-        : options.timeout + lease.controlTimeout
+        : options.timeout + lease.controlTimeout,
+      workerFault: options.workerFault
     },
     (options.timeout === undefined
       ? 24 * 60 * 60 * 1000
@@ -842,47 +921,55 @@ async function legacySpawnTracked(command, args, options = {}) {
       stream.end(output);
     })));
   };
-  waitRequest.promise.then(async (result) => {
-    const stdout = Buffer.from(result.stdoutBase64, "base64");
-    const stderr = Buffer.from(result.stderrBase64, "base64");
-    if (lease.spawnError) {
-      cleanupWindowsJobForTest(lease);
-      const error = createWindowsSpawnError(result.error ?? lease.spawnError, {
-        synchronous: false
-      });
-      try {
-        terminal.error(error);
-      } finally {
-        await closeStreams([
-          { stream: child.stdout, output: Buffer.alloc(0) },
-          { stream: child.stderr, output: Buffer.alloc(0) }
-        ]);
-        terminal.close();
-      }
-      return;
-    }
+  const emptyOutputs = [
+    { stream: child.stdout, output: Buffer.alloc(0) },
+    { stream: child.stderr, output: Buffer.alloc(0) }
+  ];
+  const terminalSettlement = (async () => {
+    let outputs = emptyOutputs;
     try {
+      const result = await waitRequest.promise;
+      if (lease.spawnError) {
+        const spawnError = createWindowsSpawnError(
+          result.error ?? lease.spawnError,
+          { synchronous: false }
+        );
+        try {
+          cleanupWindowsJobForTest(lease);
+        } catch (cleanupError) {
+          cleanupError.cause ??= spawnError;
+          throw cleanupError;
+        }
+        throw spawnError;
+      }
+      outputs = [
+        {
+          stream: child.stdout,
+          output: Buffer.from(result.stdoutBase64, "base64")
+        },
+        {
+          stream: child.stderr,
+          output: Buffer.from(result.stderrBase64, "base64")
+        }
+      ];
       terminal.exit(
         requestedSignal ? null : result.status,
         requestedSignal ?? result.signal
       );
-    } finally {
-      await closeStreams([
-        { stream: child.stdout, output: stdout },
-        { stream: child.stderr, output: stderr }
-      ]);
-      terminal.close();
-    }
-  }, async (error) => {
-    try {
+    } catch (error) {
       terminal.error(error);
     } finally {
-      await closeStreams([
-        { stream: child.stdout, output: Buffer.alloc(0) },
-        { stream: child.stderr, output: Buffer.alloc(0) }
-      ]);
+      await closeStreams(outputs);
       terminal.close();
     }
+  })();
+  void terminalSettlement.catch((error) => {
+    try {
+      terminal.error(error);
+    } catch {}
+    try {
+      terminal.close();
+    } catch {}
   });
   return child;
 }

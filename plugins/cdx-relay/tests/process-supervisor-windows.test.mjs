@@ -347,6 +347,215 @@ test("Windows async wait failure terminalizes once, clears its lease, and poison
   }
 });
 
+test("Windows spawn error plus cleanup transport failure terminalizes once without an unhandled rejection", {
+  skip: process.platform !== "win32"
+}, async () => {
+  const missing = path.join(makeTempDir("spawn-cleanup-failure-"), "missing.exe");
+  const backend = createWindowsBackend({
+    faults: {
+      controllerFault: "drop-cleanup-ack",
+      controlTimeout: 300,
+      timeout: 300
+    }
+  });
+  const supervisor = createProcessSupervisor({
+    platform: "win32",
+    minimumGuarantee: "host-strict",
+    backendFactories: [() => backend]
+  });
+  const unhandled = [];
+  const onUnhandled = (error) => unhandled.push(error);
+  process.on("unhandledRejection", onUnhandled);
+  let child;
+  try {
+    child = await supervisor.spawnTracked({
+      command: missing,
+      args: ["argument"],
+      shell: false,
+      stdio: "ignore",
+      windowsHide: true
+    });
+    const events = [];
+    const publicErrors = [];
+    child.on("error", (error) => {
+      publicErrors.push(error);
+      events.push("error");
+    });
+    child.on("exit", () => events.push("exit"));
+    const closed = new Promise((resolve) => child.once("close", () => {
+      events.push("close");
+      resolve();
+    }));
+    const completion = child.completion.then(
+      () => assert.fail("spawn plus cleanup failure completion must reject"),
+      (error) => {
+        events.push("completion");
+        return error;
+      }
+    );
+
+    const terminalError = await Promise.race([
+      completion,
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error("spawn plus cleanup failure completion timed out")),
+        5000
+      ))
+    ]);
+    await Promise.race([
+      closed,
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error("spawn plus cleanup failure close timed out")),
+        1000
+      ))
+    ]);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(terminalError.code, "ROOT_PROCESS_ERROR");
+    assert.match(terminalError.message, /cleanup.*deadline/i);
+    assert.equal(terminalError.cause?.code, "WINDOWS_JOB_BACKEND_POISONED");
+    assert.equal(terminalError.cause?.cause?.code, "ENOENT");
+    assert.equal(publicErrors.length, 1);
+    assert.equal(publicErrors[0], terminalError);
+    assert.deepEqual(events, ["error", "completion", "close"]);
+    assert.deepEqual(unhandled, []);
+    assert.equal(backend.test.getBackendLeaseCount(), 0);
+    assert.throws(() => supervisor.assertHealthy(), (error) => error === terminalError);
+    await assert.rejects(
+      supervisor.spawnTracked({
+        command: process.execPath,
+        args: ["-e", ""],
+        shell: false
+      }),
+      (error) => error === terminalError
+    );
+    assert.throws(
+      () => backend.test.runWindowsJobForTest(process.execPath, ["-e", ""], {
+        timeout: 1000
+      }),
+      (error) => error === terminalError.cause
+    );
+  } finally {
+    child?.completion?.catch(() => {});
+    process.removeListener("unhandledRejection", onUnhandled);
+    await supervisor.shutdown().catch(() => {});
+    await backend.shutdown().catch(() => {});
+  }
+});
+
+test("malformed Windows Worker wait success values poison only their backend", {
+  skip: process.platform !== "win32"
+}, async () => {
+  const cases = [
+    ["malformed-wait-value", /invalid wait result/i],
+    ["noncanonical-wait-value", /non-canonical stdout base64/i],
+    ["oversized-wait-value", /maxBuffer/i]
+  ];
+  const unhandled = [];
+  const onUnhandled = (error) => unhandled.push(error);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    for (const [workerFault, expected] of cases) {
+      const backend = createWindowsBackend({
+        faults: { workerFault, controlTimeout: 500, maxBuffer: 64 }
+      });
+      const supervisor = createProcessSupervisor({
+        platform: "win32",
+        minimumGuarantee: "host-strict",
+        backendFactories: [() => backend]
+      });
+      let child;
+      try {
+        child = await supervisor.spawnTracked({
+          command: process.execPath,
+          args: ["-e", "setTimeout(()=>{},100)"],
+          shell: false,
+          stdio: ["ignore", "pipe", "pipe"],
+          windowsHide: true,
+          maxBuffer: 64
+        });
+        const events = [];
+        const publicErrors = [];
+        child.on("error", (error) => {
+          publicErrors.push(error);
+          events.push("error");
+        });
+        child.on("exit", () => events.push("exit"));
+        const closed = new Promise((resolve) => child.once("close", () => {
+          events.push("close");
+          resolve();
+        }));
+        const completion = child.completion.then(
+          () => assert.fail(`${workerFault} completion must reject`),
+          (error) => {
+            events.push("completion");
+            return error;
+          }
+        );
+
+        const terminalError = await Promise.race([
+          completion,
+          new Promise((_, reject) => setTimeout(
+            () => reject(new Error(`${workerFault} completion timed out`)),
+            5000
+          ))
+        ]);
+        await Promise.race([
+          closed,
+          new Promise((_, reject) => setTimeout(
+            () => reject(new Error(`${workerFault} close timed out`)),
+            1000
+          ))
+        ]);
+
+        assert.equal(terminalError.code, "ROOT_PROCESS_ERROR");
+        assert.match(terminalError.message, expected);
+        assert.equal(terminalError.cause?.code, "WINDOWS_JOB_BACKEND_POISONED");
+        assert.equal(publicErrors.length, 1);
+        assert.equal(publicErrors[0], terminalError);
+        assert.deepEqual(events, ["error", "completion", "close"]);
+        assert.equal(backend.test.getBackendLeaseCount(), 0);
+        assert.throws(() => supervisor.assertHealthy(), (error) => error === terminalError);
+        await assert.rejects(
+          supervisor.spawnTracked({
+            command: process.execPath,
+            args: ["-e", ""],
+            shell: false
+          }),
+          (error) => error === terminalError
+        );
+        assert.throws(
+          () => backend.test.runWindowsJobForTest(process.execPath, ["-e", ""], {
+            timeout: 1000
+          }),
+          (error) => error === terminalError.cause
+        );
+      } finally {
+        child?.completion?.catch(() => {});
+        await supervisor.shutdown().catch(() => {});
+        await backend.shutdown().catch(() => {});
+      }
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(unhandled, []);
+
+    const fresh = createWindowsBackendHarness();
+    try {
+      const result = fresh.runBackend(
+        process.execPath,
+        ["-e", "process.stdout.write('fresh')"],
+        { timeout: 2000 }
+      );
+      assert.equal(result.status, 0);
+      assert.equal(result.stdout, "fresh");
+      assert.equal(fresh.cleanupBackendLaunch(result.lease).activeProcesses, 0);
+    } finally {
+      await fresh.backend.shutdown();
+    }
+  } finally {
+    process.removeListener("unhandledRejection", onUnhandled);
+  }
+});
+
 test("Windows spawnTracked detached sleeper unref remains owned until cleanup", {
   skip: process.platform !== "win32"
 }, async () => {

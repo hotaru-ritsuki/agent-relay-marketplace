@@ -589,6 +589,24 @@ requestPort.on("message", async ({ operation, payload, port, shared }) => {
           { maxBuffer: lease.maxBuffer }
         );
         validateWaitResult(response.result, lease.ownership);
+        if (payload.workerFault === "malformed-wait-value") {
+          settlePort(port, shared, { status: "invalid" });
+          return;
+        }
+        if (payload.workerFault === "noncanonical-wait-value") {
+          settlePort(port, shared, {
+            ...response.result,
+            stdoutBase64: "AA"
+          });
+          return;
+        }
+        if (payload.workerFault === "oversized-wait-value") {
+          settlePort(port, shared, {
+            ...response.result,
+            stdoutBase64: Buffer.alloc(lease.maxBuffer + 1).toString("base64")
+          });
+          return;
+        }
         settlePort(port, shared, response.result);
       } catch (error) {
         try {
