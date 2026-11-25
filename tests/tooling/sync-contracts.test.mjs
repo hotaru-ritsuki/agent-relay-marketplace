@@ -221,7 +221,43 @@ test("syncContracts replaces existing regular contract files", () => {
   }
 });
 
-test("syncContracts never follows a final target swapped to an outside link", (t) => {
+test("syncContracts preserves unrelated directory entries without following links", () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "relay-contracts-preserve-"));
+  try {
+    const rootDir = fileURLToPath(new URL("../..", import.meta.url));
+    const pluginDir = path.join(temp, "cdx-relay");
+    const typesDir = path.join(pluginDir, "types");
+    const schemasDir = path.join(pluginDir, "schemas");
+    const outsideFile = path.join(temp, "outside-target");
+    fs.mkdirSync(path.join(typesDir, "nested"), { recursive: true });
+    fs.mkdirSync(path.join(schemasDir, "custom"), { recursive: true });
+    fs.writeFileSync(path.join(typesDir, "notes.txt"), "keep-types");
+    fs.writeFileSync(path.join(typesDir, "nested", "notes.txt"), "keep-nested");
+    fs.writeFileSync(path.join(schemasDir, "custom", "keep.json"), "keep-schema");
+    fs.writeFileSync(outsideFile, "outside-sentinel");
+    const preservedLink = path.join(typesDir, "outside-link");
+    createFileLink(outsideFile, preservedLink);
+
+    syncContracts({ rootDir, pluginDirs: [pluginDir] });
+
+    assert.equal(fs.readFileSync(path.join(typesDir, "notes.txt"), "utf8"), "keep-types");
+    assert.equal(
+      fs.readFileSync(path.join(typesDir, "nested", "notes.txt"), "utf8"),
+      "keep-nested",
+    );
+    assert.equal(
+      fs.readFileSync(path.join(schemasDir, "custom", "keep.json"), "utf8"),
+      "keep-schema",
+    );
+    assert.equal(fs.lstatSync(preservedLink).isSymbolicLink(), true);
+    assert.equal(fs.readlinkSync(preservedLink), outsideFile);
+    assert.equal(fs.readFileSync(outsideFile, "utf8"), "outside-sentinel");
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("syncContracts never follows a staged target swapped to an outside link", (t) => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "relay-contracts-swap-"));
   try {
     const rootDir = fileURLToPath(new URL("../..", import.meta.url));
@@ -233,21 +269,19 @@ test("syncContracts never follows a final target swapped to an outside link", (t
     fs.writeFileSync(outsideFile, "outside-sentinel");
 
     const originalCopyFileSync = fs.copyFileSync.bind(fs);
-    const originalRenameSync = fs.renameSync.bind(fs);
     let injected = false;
     function injectTargetSwap(destination) {
-      if (injected || path.resolve(destination) !== path.resolve(target)) return;
-      fs.rmSync(target);
-      createFileLink(outsideFile, target);
+      const destinationPath = path.resolve(destination);
+      const isStagedTypeTarget = path.basename(destinationPath) === "relay.d.ts"
+        && path.dirname(destinationPath) !== path.dirname(path.resolve(target))
+        && destinationPath.startsWith(`${path.resolve(pluginDir)}${path.sep}`);
+      if (injected || !isStagedTypeTarget) return;
+      createFileLink(outsideFile, destinationPath);
       injected = true;
     }
     t.mock.method(fs, "copyFileSync", (source, destination, mode) => {
       injectTargetSwap(destination);
       return originalCopyFileSync(source, destination, mode);
-    });
-    t.mock.method(fs, "renameSync", (source, destination) => {
-      injectTargetSwap(destination);
-      return originalRenameSync(source, destination);
     });
 
     let failure;
@@ -259,20 +293,74 @@ test("syncContracts never follows a final target swapped to an outside link", (t
 
     assert.equal(injected, true, "the test must inject the final-target swap");
     assert.equal(fs.readFileSync(outsideFile, "utf8"), "outside-sentinel");
-    assert.equal(failure, undefined);
+    assert.match(failure?.message ?? "", /contract sync/i);
     assert.equal(fs.lstatSync(target).isSymbolicLink(), false);
-    assert.deepEqual(
-      fs.readFileSync(target),
-      fs.readFileSync(path.join(rootDir, "contracts", "types", "relay.d.ts")),
-    );
+    assert.equal(fs.readFileSync(target, "utf8"), "stale-types");
     assert.deepEqual(
       listFiles(path.dirname(target)).map((file) => path.basename(file)),
       ["relay.d.ts"],
     );
+    assert.deepEqual(fs.readdirSync(pluginDir).sort(), ["schemas", "types"]);
   } finally {
     fs.rmSync(temp, { recursive: true, force: true });
   }
 });
+
+for (const [childName, contractRelative] of [
+  ["schemas", "agent-relay/common.schema.json"],
+  ["types", "relay.d.ts"],
+]) {
+  test(`syncContracts never publishes through a swapped ${childName} parent`, (t) => {
+    const temp = fs.mkdtempSync(path.join(os.tmpdir(), "relay-contracts-parent-swap-"));
+    try {
+      const rootDir = fileURLToPath(new URL("../..", import.meta.url));
+      const pluginDir = path.join(temp, "cdx-relay");
+      const childDir = path.join(pluginDir, childName);
+      const contractTarget = path.join(childDir, ...contractRelative.split("/"));
+      const outsideDir = path.join(temp, `outside-${childName}`);
+      const outsideTarget = path.join(outsideDir, ...contractRelative.split("/"));
+      fs.mkdirSync(path.dirname(contractTarget), { recursive: true });
+      fs.writeFileSync(contractTarget, "outside-sentinel");
+      fs.writeFileSync(path.join(childDir, "keep.txt"), "keep-entry");
+
+      const originalRenameSync = fs.renameSync.bind(fs);
+      let injected = false;
+      t.mock.method(fs, "renameSync", (source, destination) => {
+        const sourcePath = path.resolve(source);
+        const destinationPath = path.resolve(destination);
+        const sourceIsChildEntry = sourcePath === path.resolve(childDir);
+        const sourceIsCurrentStagingFile = sourcePath.startsWith(
+          `${path.resolve(childDir)}${path.sep}`,
+        ) && destinationPath === path.resolve(contractTarget);
+        if (!injected && (sourceIsChildEntry || sourceIsCurrentStagingFile)) {
+          originalRenameSync(childDir, outsideDir);
+          createDirectoryLink(outsideDir, childDir);
+          injected = true;
+        }
+        return originalRenameSync(source, destination);
+      });
+
+      let failure;
+      try {
+        syncContracts({ rootDir, pluginDirs: [pluginDir] });
+      } catch (error) {
+        failure = error;
+      }
+
+      assert.equal(injected, true, "the test must inject the destination-parent swap");
+      assert.equal(fs.readFileSync(outsideTarget, "utf8"), "outside-sentinel");
+      assert.equal(fs.readFileSync(path.join(outsideDir, "keep.txt"), "utf8"), "keep-entry");
+      assert.match(failure?.message ?? "", /contract sync/i);
+      assert.equal(fs.lstatSync(childDir).isSymbolicLink(), true);
+      assert.deepEqual(
+        fs.readdirSync(pluginDir).sort(),
+        childName === "schemas" ? ["schemas"] : ["schemas", "types"],
+      );
+    } finally {
+      fs.rmSync(temp, { recursive: true, force: true });
+    }
+  });
+}
 
 for (const linkedComponent of ["schemas", "types"]) {
   test(`syncContracts refuses an existing ${linkedComponent} directory link`, () => {

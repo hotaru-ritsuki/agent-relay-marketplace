@@ -51,9 +51,9 @@ function isScannable(root, file) {
     return false;
   }
   if (relative.startsWith("tests/")) {
-    return /\.(?:mjs|js|cjs)$/.test(file);
+    return /\.(?:mjs|js|cjs)$/i.test(file);
   }
-  return /\.(?:md|json|mjs|js|cjs)$/.test(file);
+  return /\.(?:md|json|mjs|js|cjs)$/i.test(file);
 }
 
 function isIgnoredDirectory({ name, relativePath }) {

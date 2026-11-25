@@ -189,6 +189,34 @@ test("safety CLI exits 1 for forbidden launch flags in executable tests", () => 
   assert.match(result.stderr, /--yolo/);
 });
 
+test("safety CLI scans supported extensions without filename-case bypasses", () => {
+  const root = fixture('const args = ["--sandbox", "enabled"];');
+  for (const [relative, source] of [
+    ["config/runtime.JSON", '{"sandbox":"danger-full-access"}'],
+    ["scripts/launcher.MjS", 'const args = ["--force"];'],
+    ["tests/process/launch.test.CjS", 'const args = ["--yolo"];'],
+    ["Tooling/authoritative.Js", 'const args = ["--trust"];'],
+  ]) {
+    writeFixtureFile(root, relative, source);
+  }
+
+  const result = runCli(SAFETY_CLI, root);
+
+  assert.equal(result.status, 1, result.stderr);
+  for (const relative of [
+    "config/runtime.JSON",
+    "scripts/launcher.MjS",
+    "tests/process/launch.test.CjS",
+    "Tooling/authoritative.Js",
+  ]) {
+    assert.match(
+      result.stderr,
+      new RegExp(relative.replaceAll("/", "[\\\\/]")),
+      `expected the safety CLI to scan ${relative}`,
+    );
+  }
+});
+
 test("safety CLI fails closed when structured JSON cannot be parsed", () => {
   const root = fixture('const args = ["--sandbox", "enabled"];');
   writeFixtureFile(root, "config/runtime.json", '{"sandbox":');
