@@ -1,0 +1,31 @@
+{
+  "name": "@hotaru-ritsuki/agent-relay-marketplace",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Claude Code marketplace for independent Codex Relay and Cursor Relay plugins.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "plugins/cdx-relay",
+    "plugins/cursor-relay"
+  ],
+  "scripts": {
+    "test": "node tooling/run-tests.mjs",
+    "sync-contracts": "node tooling/sync-contracts.mjs",
+    "check:isolation": "node tooling/check-plugin-isolation.mjs",
+    "check:safety": "node tooling/check-forbidden-flags.mjs",
+    "check": "npm test && npm run check:isolation && npm run check:safety"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "typescript": "^6.0.2"
+  },
+  "dependencies": {
+    "proper-lockfile": "4.1.2"
+  }
+}

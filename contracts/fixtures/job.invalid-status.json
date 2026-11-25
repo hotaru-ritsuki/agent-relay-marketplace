@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "provider": "codex",
+  "pluginVersion": "1.2.0",
+  "jobId": "job-00000001",
+  "claudeSessionId": "claude-1",
+  "workspaceHash": "0123456789abcdef",
+  "transport": "app-server",
+  "model": "gpt-5.6-sol",
+  "safety": {
+    "sandbox": "workspace-write",
+    "readOnly": false,
+    "network": false,
+    "mcp": false,
+    "approvals": "prompt",
+    "allowConcurrentWrites": false
+  },
+  "status": "done",
+  "providerStatus": "turn/completed",
+  "createdAt": "2026-07-23T00:00:00.000Z",
+  "updatedAt": "2026-07-23T00:01:00.000Z",
+  "startedAt": "2026-07-23T00:00:01.000Z",
+  "finishedAt": "2026-07-23T00:01:00.000Z"
+}

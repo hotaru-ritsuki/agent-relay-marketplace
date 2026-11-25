@@ -1,0 +1,8 @@
+{
+  "name": "cdx-relay",
+  "version": "1.1.6",
+  "description": "Relay Claude Code tasks and reviews to Codex with GPT-5.6 routing.",
+  "author": {
+    "name": "hotaru-ritsuki"
+  }
+}

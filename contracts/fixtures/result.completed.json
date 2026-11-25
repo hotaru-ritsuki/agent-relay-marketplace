@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "provider": "cursor",
+  "pluginVersion": "1.0.0",
+  "jobId": "job-00000002",
+  "status": "completed",
+  "retrySafety": "unknown",
+  "summary": "",
+  "finalOutput": "",
+  "changedFiles": [],
+  "error": null
+}

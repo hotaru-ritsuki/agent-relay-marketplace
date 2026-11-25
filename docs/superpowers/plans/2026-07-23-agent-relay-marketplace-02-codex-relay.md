@@ -331,7 +331,7 @@ node --test plugins/cdx-relay/tests/build-tooling.test.mjs
 npm --prefix plugins/cdx-relay test
 ```
 
-Expected: the generation test passes; the aggregate imported suite exits within 120 seconds with 0 failures and no surviving plugin-owned child process.
+Expected: the generation test passes; on native Windows, the full-coverage aggregate imported suite exits within 600 seconds with 0 failures and no surviving plugin-owned child process. Faster platforms may retain a lower local timeout when reliable. If the 600-second gate fails, diagnose a functional or lifecycle defect rather than increasing the timeout again.
 
 - [ ] **Step 6: Commit**
 

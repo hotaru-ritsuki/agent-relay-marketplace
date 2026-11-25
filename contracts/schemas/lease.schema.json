@@ -1,0 +1,18 @@
+{
+  "$id": "https://agent-relay.dev/schemas/v1/lease",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "provider", "jobId", "workspaceHash", "pid", "processStartedAt", "nonce", "createdAt", "expiresAt"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "provider": { "$ref": "https://agent-relay.dev/schemas/v1/common#/$defs/provider" },
+    "jobId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{7,127}$" },
+    "workspaceHash": { "type": "string", "pattern": "^[a-f0-9]{16}$" },
+    "pid": { "type": "integer", "minimum": 1 },
+    "processStartedAt": { "type": "string", "format": "date-time" },
+    "nonce": { "type": "string", "minLength": 16 },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "expiresAt": { "type": "string", "format": "date-time" }
+  }
+}
